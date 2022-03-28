@@ -77,7 +77,7 @@ impl Plugin for Amp {
         self.synth.gain_envelope.decay_time = *ports.vol_decay;
         self.synth.gain_envelope.sustain_level = *ports.vol_sustain;
         self.synth.gain_envelope.release_time = *ports.vol_release;
-        self.synth.gain_envelope.slope = *ports.vol_slope;
+        self.synth.gain_envelope.slope = 2.0_f32.powf(*ports.vol_slope);
         //self.synth.gain_envelope.limits();
         println!("release is ({})", self.synth.gain_envelope.release_time);
         println!("slope is ({})", self.synth.gain_envelope.slope);
