@@ -6,6 +6,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
+use self::oscillator::BasicOscillator;
 
 const DEFAULT_SRATE: f32 = 44100.0;
 
@@ -14,6 +15,7 @@ pub struct ThreeOsc {
     pub gain_envelope: AdsrEnvelope,
     pub sample_rate: f64,
     pub output_volume: f32,
+    pub oscillators: [BasicOscillator; 1],
 }
 
 impl ThreeOsc {
@@ -23,6 +25,7 @@ impl ThreeOsc {
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
             sample_rate,
             output_volume: 0.3,
+            oscillators: [BasicOscillator::default()]
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -47,11 +50,15 @@ impl ThreeOsc {
             for voice in self.voices.iter_mut() {
                 let phase = voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
-                let out = if let Some(release_time) = voice.release_time {
+                let mut out = 0.0;
+                for oscillator in self.oscillators.iter() {
+                    out += phase.sin();
+                }
+                out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
-                    phase.sin() * self.gain_envelope.sample_released(release_index, envelope_index)
+                    out * self.gain_envelope.sample_released(release_index, envelope_index)
                 } else {
-                    phase.sin() * self.gain_envelope.sample_held(envelope_index)
+                    out * self.gain_envelope.sample_held(envelope_index)
                 } * self.output_volume;
                 *out_l += out;
                 *out_r += out;
@@ -60,6 +67,7 @@ impl ThreeOsc {
     }
 }
 
+/// An individual note press. 
 pub struct Voice {
     id: u32, // from hashing note index
     delta: f32,
@@ -105,6 +113,31 @@ fn samples_to_time(samples: u32, delta: f64) -> f64 {
 }
 fn time_to_samples(time: f64, delta: f64) -> u32 {
     (time / delta) as u32
+}
+
+mod oscillator {
+    /// A single instance of a playing oscillator. Maintains phase for fm / pm stuff 
+    pub struct OscVoice {
+        pub phase: f32,
+        pub delta: f32,
+    }
+    pub struct BasicOscillator {
+        amp: f32,
+        semitone: f32,
+        exponent: i32,
+    }
+    impl BasicOscillator {
+        pub fn sine(&self, voice: &mut OscVoice) -> f32 {
+            let delta = voice.delta.powi(self.exponent) * 2.0_f32.powf(self.semitone);
+            voice.phase += delta;
+            voice.phase.sin() * self.amp
+        }
+    }
+    impl Default for BasicOscillator {
+        fn default() -> Self {
+        Self { amp: 100.0, semitone: Default::default(), exponent: Default::default() }
+        }
+    }
 }
 
 mod envelopes {
