@@ -5,6 +5,8 @@ use std::f32::consts::PI;
 use std::hash::Hash;
 use std::hash::Hasher;
 
+use self::envelopes::AdsrEnvelope;
+
 const DEFAULT_SRATE: f32 = 44100.0;
 
 pub struct ThreeOsc {
@@ -93,52 +95,6 @@ impl Voice {
     }
 }
 
-pub struct AdsrEnvelope {
-    pub attack_time: f32,
-    pub decay_time: f32,
-    pub release_time: f32,
-    pub sustain_level: f32,
-    pub slope: f32,
-}
-impl AdsrEnvelope {
-    pub fn new(attack_time: f32, decay_time: f32, release_time: f32, sustain_level: f32, slope: f32) -> Self {
-        Self {
-            attack_time,
-            decay_time,
-            release_time,
-            sustain_level,
-            slope,
-        }
-    }
-    /// Returns a point between 0.0 and 1.0
-    pub fn sample_held(&self, index: f32) -> f32 {
-        if index <= self.attack_time {
-            (index / self.attack_time).powf(self.slope)
-        } else if index - self.attack_time <= self.decay_time {
-            (1.0 + (self.sustain_level - 1.0) * ((index - self.attack_time) / self.decay_time).powf(self.slope))
-        } else {
-            self.sustain_level
-        }
-    }
-    pub fn sample_released(&self, release_index: f32, index: f32) -> f32 {
-        assert!(release_index <= index);
-        if index - release_index > self.release_time {
-            0.0
-        } else {
-            let level = self.sample_held(release_index);
-            (level - level * ((index - release_index) / self.release_time).powf(self.slope))
-        }
-    }
-    /// Modifies the envelope to prevent negative times and sustain levels outside of 0 to 1
-    pub fn limits(&mut self) {
-        self.attack_time = self.attack_time.max(0.0);
-        self.decay_time = self.decay_time.max(0.0);
-        self.release_time = self.release_time.max(0.0);
-        self.sustain_level = self.sustain_level.clamp(0.0, 1.0);
-        self.slope = self.sustain_level.max(0.0001);
-    }
-}
-
 fn delta(sample_rate: f64) -> f64 {
     1.0 / sample_rate
 }
@@ -150,3 +106,65 @@ fn samples_to_time(samples: u32, delta: f64) -> f64 {
 fn time_to_samples(time: f64, delta: f64) -> u32 {
     (time / delta) as u32
 }
+
+mod envelopes {
+    use lyon_geom::{CubicBezierSegment, Monotonic};
+
+    pub struct AdsrEnvelope {
+        pub attack_time: f32,
+        pub decay_time: f32,
+        pub release_time: f32,
+        pub sustain_level: f32,
+        pub slope: f32,
+    }
+    impl AdsrEnvelope {
+        pub fn new(attack_time: f32, decay_time: f32, release_time: f32, sustain_level: f32, slope: f32) -> Self {
+            Self {
+                attack_time,
+                decay_time,
+                release_time,
+                sustain_level,
+                slope,
+            }
+        }
+        /// Returns the envelope CV (between 0.0 and 1.0) associated with the given index
+        pub fn sample_held(&self, index: f32) -> f32 {
+            if index <= self.attack_time {
+                (index / self.attack_time).powf(self.slope)
+            } else if index - self.attack_time <= self.decay_time {
+                (1.0 - (index - self.attack_time) / self.decay_time).powf(self.slope) * (1.0 - self.sustain_level) + self.sustain_level
+            } else {
+                self.sustain_level
+            }
+        }
+        pub fn sample_released(&self, release_index: f32, index: f32) -> f32 {
+            assert!(release_index <= index);
+            if index - release_index > self.release_time {
+                0.0
+            } else {
+                let level = self.sample_held(release_index);
+                (1.0 - (index - release_index) / self.release_time).powf(self.slope) * level
+            }
+        }
+        /// Modifies the envelope to prevent negative times and sustain levels outside of 0 to 1
+        pub fn limits(&mut self) {
+            self.attack_time = self.attack_time.max(0.0);
+            self.decay_time = self.decay_time.max(0.0);
+            self.release_time = self.release_time.max(0.0);
+            self.sustain_level = self.sustain_level.clamp(0.0, 1.0);
+            self.slope = self.sustain_level.max(0.0001);
+        }
+    }
+
+    /// An ADSR envelope with adjustable curves
+    pub struct BezierEnvelope {
+        attack: Monotonic<CubicBezierSegment<f32>>,
+        decay: Monotonic<CubicBezierSegment<f32>>,
+        release: Monotonic<CubicBezierSegment<f32>>,
+        sustain_level: f32,
+    }
+    impl BezierEnvelope {
+
+    }
+}
+
