@@ -1,0 +1,13 @@
+[package]
+name = "three-osc"
+version = "0.0.0"
+authors = ["Adam Godwin <evilspamalt@gmail.com>"]
+license = "GPL-3.0"
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lv2 = "0.6.0"
+wmidi = "3.1.0"#wmidi = "4.0.6"
