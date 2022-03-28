@@ -7,6 +7,7 @@ use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
 use self::oscillator::BasicOscillator;
+use self::oscillator::OscVoice;
 
 const DEFAULT_SRATE: f32 = 44100.0;
 
@@ -21,7 +22,7 @@ pub struct ThreeOsc {
 impl ThreeOsc {
     pub fn new(sample_rate: f64) -> Self {
         Self {
-            voices: Vec::with_capacity(16),
+            voices: Vec::with_capacity(32),
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
             sample_rate,
             output_volume: 0.3,
@@ -48,11 +49,11 @@ impl ThreeOsc {
         output.for_each(|(out_l, out_r)| {
             self.release_voices();
             for voice in self.voices.iter_mut() {
-                let phase = voice.advance();
+                voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
                 let mut out = 0.0;
                 for oscillator in self.oscillators.iter() {
-                    out += phase.sin();
+                    out += oscillator.naive_saw(&mut voice.osc_voice);
                 }
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
@@ -62,6 +63,7 @@ impl ThreeOsc {
                 } * self.output_volume;
                 *out_l += out;
                 *out_r += out;
+
             }
         })
     }
@@ -69,26 +71,18 @@ impl ThreeOsc {
 
 /// An individual note press. 
 pub struct Voice {
-    id: u32, // from hashing note index
-    delta: f32,
-    phase: f32,
+    id: u32,
     runtime: u32,
     release_time: Option<u32>,
+    osc_voice: [OscVoice; 128],
 }
 impl Voice {
     pub fn from_midi_note(index: u8, sample_rate: f32) -> Self {
-        //let mut hasher = DefaultHasher::default();
         Self {
-            id: {
-                // index.hash(&mut hasher);
-                // hasher.finish() as u32
-
-                index.into() // Don't bother with hash
-            },
-            delta: (2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate,
-            phase: 0.0,
+            id: index.into(),
             runtime: 0,
             release_time: None,
+            osc_voice: [OscVoice::new(0.0, (2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate); 128],
         }
     }
     pub fn release(&mut self) {
@@ -96,10 +90,9 @@ impl Voice {
             self.release_time = Some(self.runtime)
         }
     }
-    pub fn advance(&mut self) -> f32 {
-        self.phase = (self.phase + self.delta) % (2.0 * PI);
+
+    pub fn advance(&mut self) {
         self.runtime += 1;
-        self.phase
     }
 }
 
@@ -116,26 +109,50 @@ fn time_to_samples(time: f64, delta: f64) -> u32 {
 }
 
 mod oscillator {
+    use std::f32::consts::PI;
+
     /// A single instance of a playing oscillator. Maintains phase for fm / pm stuff 
+    #[derive(Debug, Clone, Copy)]
     pub struct OscVoice {
         pub phase: f32,
         pub delta: f32,
     }
+    impl OscVoice {
+        pub fn new(phase: f32, delta: f32) -> Self {
+            Self { phase, delta }
+        }
+        pub fn add_phase(&mut self, delta: f32) -> f32 {
+            self.phase = (self.phase + delta) % (2.0 * PI);
+            self.phase
+        }
+    }
     pub struct BasicOscillator {
-        amp: f32,
-        semitone: f32,
-        exponent: i32,
+        pub amp: f32,
+        pub semitone: f32,
+        pub exponent: i32,
+        pub voice_count: u8,
+        pub voices_detune: f32,
     }
     impl BasicOscillator {
+        fn mult_delta(&self, delta: f32) -> f32 {
+            delta * 2.0_f32.powi(self.exponent) * 2.0_f32.powf(self.semitone / 12.0)
+        }
         pub fn sine(&self, voice: &mut OscVoice) -> f32 {
-            let delta = voice.delta.powi(self.exponent) * 2.0_f32.powf(self.semitone);
-            voice.phase += delta;
+            let delta = self.mult_delta(voice.delta);
+            voice.phase = voice.add_phase(delta);
             voice.phase.sin() * self.amp
+        }
+        pub fn naive_saw(&self, voices: &mut [OscVoice]) -> f32 {
+            voices.iter_mut().take(self.voice_count.into()).enumerate().map(|(i, voice)| {
+                let delta = self.mult_delta(voice.delta + voice.delta * i as f32 * self.voices_detune);
+                voice.phase = voice.add_phase(delta);
+                (voice.phase - PI) / (2.0 * PI) * self.amp / self.voice_count as f32
+            }).sum()
         }
     }
     impl Default for BasicOscillator {
         fn default() -> Self {
-        Self { amp: 100.0, semitone: Default::default(), exponent: Default::default() }
+            Self { amp: 1.0, semitone: Default::default(), exponent: Default::default(), voice_count: 1, voices_detune: 0.1 }
         }
     }
 }

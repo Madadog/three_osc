@@ -79,8 +79,12 @@ impl Plugin for Amp {
         self.synth.gain_envelope.release_time = *ports.vol_release;
         self.synth.gain_envelope.slope = 2.0_f32.powf(*ports.vol_slope);
         //self.synth.gain_envelope.limits();
-        println!("release is ({})", self.synth.gain_envelope.release_time);
-        println!("slope is ({})", self.synth.gain_envelope.slope);
+
+        self.synth.oscillators[0].amp = *ports.osc1_amp / 100.0;
+        self.synth.oscillators[0].semitone = *ports.osc1_semitone + *ports.global_pitch;
+        self.synth.oscillators[0].exponent = *ports.osc1_exponent as i32;
+        self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
+        self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 1000.0;
 
         
         let control_sequence = ports

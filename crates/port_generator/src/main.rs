@@ -242,7 +242,7 @@ impl PortList {
             ControlPort::new(
                 "global_pitch",
                 "Master Pitch",
-                Float(0.0, (-24.0, 24.0)),
+                Int(0, (-24, 24)),
             ),
         ])
     }
@@ -271,7 +271,7 @@ impl PortList {
             ControlPort::new(
                 "slope",
                 "Slope",
-                Float(0.0, (-8.0, 8.0)),
+                Float(0.0, (-3.0, 8.0)),
             ),
         ])
     }

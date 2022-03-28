@@ -167,7 +167,7 @@
                 lv2:symbol "vol_slope" ;
                 lv2:name "Vol Slope" ;
                 lv2:default 0.000 ;
-                lv2:minimum -8.000 ;
+                lv2:minimum -3.000 ;
                 lv2:maximum 8.000 ;
         ] , [
                 a lv2:InputPort ,
@@ -184,7 +184,8 @@
                 lv2:index 18 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Master Pitch" ;
-                lv2:default 0.000 ;
-                lv2:minimum -24.000 ;
-                lv2:maximum 24.000 ;
+                lv2:default 0 ;
+                lv2:minimum -24 ;
+                lv2:maximum 24 ;
+                lv2:portProperty lv2:integer ;
         ] .
