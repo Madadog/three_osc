@@ -22,12 +22,13 @@ struct Ports {
     osc1_super_detune: InputPort<Control>,
     osc1_phase: InputPort<Control>,
     osc1_phase_rand: InputPort<Control>,
-    output_gain: InputPort<Control>,
-    global_pitch: InputPort<Control>,
     vol_attack: InputPort<Control>,
     vol_decay: InputPort<Control>,
     vol_sustain: InputPort<Control>,
     vol_release: InputPort<Control>,
+    vol_slope: InputPort<Control>,
+    output_gain: InputPort<Control>,
+    global_pitch: InputPort<Control>,
 }
 
 #[derive(FeatureCollection)]
@@ -76,6 +77,10 @@ impl Plugin for Amp {
         self.synth.gain_envelope.decay_time = *ports.vol_decay;
         self.synth.gain_envelope.sustain_level = *ports.vol_sustain;
         self.synth.gain_envelope.release_time = *ports.vol_release;
+        self.synth.gain_envelope.slope = *ports.vol_slope;
+        //self.synth.gain_envelope.limits();
+        println!("release is ({})", self.synth.gain_envelope.release_time);
+        println!("slope is ({})", self.synth.gain_envelope.slope);
 
         
         let control_sequence = ports

@@ -18,7 +18,7 @@ impl ThreeOsc {
     pub fn new(sample_rate: f64) -> Self {
         Self {
             voices: Vec::with_capacity(16),
-            gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0),
+            gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
             sample_rate,
             output_volume: 0.3,
         }
@@ -98,22 +98,24 @@ pub struct AdsrEnvelope {
     pub decay_time: f32,
     pub release_time: f32,
     pub sustain_level: f32,
+    pub slope: f32,
 }
 impl AdsrEnvelope {
-    pub fn new(attack_time: f32, decay_time: f32, release_time: f32, sustain_level: f32) -> Self {
+    pub fn new(attack_time: f32, decay_time: f32, release_time: f32, sustain_level: f32, slope: f32) -> Self {
         Self {
             attack_time,
             decay_time,
             release_time,
             sustain_level,
+            slope,
         }
     }
     /// Returns a point between 0.0 and 1.0
     pub fn sample_held(&self, index: f32) -> f32 {
         if index <= self.attack_time {
-            index / self.attack_time
+            (index / self.attack_time).powf(self.slope)
         } else if index - self.attack_time <= self.decay_time {
-            1.0 + (self.sustain_level - 1.0) * (index - self.attack_time) / self.decay_time
+            (1.0 + (self.sustain_level - 1.0) * ((index - self.attack_time) / self.decay_time).powf(self.slope))
         } else {
             self.sustain_level
         }
@@ -124,14 +126,16 @@ impl AdsrEnvelope {
             0.0
         } else {
             let level = self.sample_held(release_index);
-            level - level * (index - release_index) / self.release_time
+            (level - level * ((index - release_index) / self.release_time).powf(self.slope))
         }
     }
+    /// Modifies the envelope to prevent negative times and sustain levels outside of 0 to 1
     pub fn limits(&mut self) {
-        self.attack_time = self.attack_time.clamp(0.0, 600.0); // 10 minutes is long enough I think
-        self.decay_time = self.decay_time.clamp(0.0, 600.0);
-        self.release_time = self.release_time.clamp(0.0, 600.0);
+        self.attack_time = self.attack_time.max(0.0);
+        self.decay_time = self.decay_time.max(0.0);
+        self.release_time = self.release_time.max(0.0);
         self.sustain_level = self.sustain_level.clamp(0.0, 1.0);
+        self.slope = self.sustain_level.max(0.0001);
     }
 }
 

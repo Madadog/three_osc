@@ -128,42 +128,24 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 12 ;
-                lv2:symbol "output_gain" ;
-                lv2:name "Output Gain" ;
-                lv2:default 0.0 ;
-                lv2:minimum -90.0 ;
-                lv2:maximum 12.0 ;
-        ] , [
-                a lv2:InputPort ,
-                    lv2:ControlPort ;
-                lv2:index 13 ;
-                lv2:symbol "global_pitch" ;
-                lv2:name "Global Pitch" ;
-                lv2:default 0.0 ;
-                lv2:minimum -24.0 ;
-                lv2:maximum 24.0 ;
-        ] , [
-                a lv2:InputPort ,
-                    lv2:ControlPort ;
-                lv2:index 14 ;
                 lv2:symbol "vol_attack" ;
                 lv2:name "Vol Attack" ;
                 lv2:default 0.0 ;
                 lv2:minimum 0.0 ;
-                lv2:maximum 20.0 ;
+                lv2:maximum 15.0 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 15 ;
+                lv2:index 13 ;
                 lv2:symbol "vol_decay" ;
                 lv2:name "Vol Decay" ;
-                lv2:default 0.0 ;
+                lv2:default 0.2 ;
                 lv2:minimum 0.0 ;
-                lv2:maximum 20.0 ;
+                lv2:maximum 15.0 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 16 ;
+                lv2:index 14 ;
                 lv2:symbol "vol_sustain" ;
                 lv2:name "Vol Sustain" ;
                 lv2:default 1.0 ;
@@ -172,10 +154,37 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 17 ;
+                lv2:index 15 ;
                 lv2:symbol "vol_release" ;
                 lv2:name "Vol Release" ;
                 lv2:default 0.0 ;
                 lv2:minimum 0.0 ;
-                lv2:maximum 20.0 ;
+                lv2:maximum 15.0 ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 16 ;
+                lv2:symbol "vol_slope" ;
+                lv2:name "Vol Slope" ;
+                lv2:default 1.0 ;
+                lv2:minimum 0.0 ;
+                lv2:maximum 32.0 ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 17 ;
+                lv2:symbol "output_gain" ;
+                lv2:name "Output Gain" ;
+                lv2:default -18.0 ;
+                lv2:minimum -90.0 ;
+                lv2:maximum 0.0 ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 18 ;
+                lv2:symbol "global_pitch" ;
+                lv2:name "Global Pitch" ;
+                lv2:default 0.0 ;
+                lv2:minimum -24.0 ;
+                lv2:maximum 24.0 ;
         ] .
