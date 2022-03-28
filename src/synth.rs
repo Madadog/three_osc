@@ -78,11 +78,17 @@ pub struct Voice {
 }
 impl Voice {
     pub fn from_midi_note(index: u8, sample_rate: f32) -> Self {
+        let mut osc_voice = [OscVoice::new(0.0, (2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate); 128];
+        let rng = fastrand::Rng::new();
+        
+        for voice in osc_voice.iter_mut() {
+            voice.phase += rng.f32() * 2.0 * PI;
+        }
         Self {
             id: index.into(),
             runtime: 0,
             release_time: None,
-            osc_voice: [OscVoice::new(0.0, (2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate); 128],
+            osc_voice,
         }
     }
     pub fn release(&mut self) {
@@ -143,11 +149,13 @@ mod oscillator {
             voice.phase.sin() * self.amp
         }
         pub fn naive_saw(&self, voices: &mut [OscVoice]) -> f32 {
+            let main_delta = self.mult_delta(voices[0].delta);
             voices.iter_mut().take(self.voice_count.into()).enumerate().map(|(i, voice)| {
-                let delta = self.mult_delta(voice.delta + voice.delta * i as f32 * self.voices_detune);
+                let i = i as f32 - (i % 2) as f32 * 2.0;
+                let delta = main_delta + main_delta * i as f32 * self.voices_detune / (self.voice_count as f32);
                 voice.phase = voice.add_phase(delta);
-                (voice.phase - PI) / (2.0 * PI) * self.amp / self.voice_count as f32
-            }).sum()
+                (voice.phase - PI) / (2.0 * PI)
+            }).sum::<f32>() * self.amp / self.voice_count as f32
         }
     }
     impl Default for BasicOscillator {

@@ -84,7 +84,7 @@ impl Plugin for Amp {
         self.synth.oscillators[0].semitone = *ports.osc1_semitone + *ports.global_pitch;
         self.synth.oscillators[0].exponent = *ports.osc1_exponent as i32;
         self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
-        self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 1000.0;
+        self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
 
         
         let control_sequence = ports
