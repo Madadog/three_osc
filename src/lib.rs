@@ -4,7 +4,7 @@ use std::convert::TryInto;
 use lv2::{prelude::*, lv2_core::plugin};
 
 mod synth;
-use synth::ThreeOsc;
+use synth::{ThreeOsc, oscillator::OscWave};
 use wmidi::MidiMessage;
 
 // Most useful plugins will have ports for input and output data. In code, these ports are represented by a struct implementing the `PortCollection` trait. Internally, ports are referred to by index. These indices are assigned in ascending order, starting with 0 for the first port. The indices in `amp.ttl` have to match them.
@@ -22,6 +22,12 @@ struct Ports {
     osc1_super_detune: InputPort<Control>,
     osc1_phase: InputPort<Control>,
     osc1_phase_rand: InputPort<Control>,
+    fil1_mode: InputPort<Control>,
+    fil1_cutoff: InputPort<Control>,
+    fil1_resonance: InputPort<Control>,
+    fil1_slope: InputPort<Control>,
+    fil1_feedback0_1: InputPort<Control>,
+    fil1_feedback1_0: InputPort<Control>,
     vol_attack: InputPort<Control>,
     vol_decay: InputPort<Control>,
     vol_sustain: InputPort<Control>,
@@ -85,6 +91,23 @@ impl Plugin for Amp {
         self.synth.oscillators[0].exponent = *ports.osc1_exponent as i32;
         self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
         self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
+        self.synth.oscillators[0].wave = match *ports.osc1_wave {
+            x if x < 1.0 => OscWave::Sine,
+            x if x < 2.0 => OscWave::Tri,
+            x if x < 3.0 => OscWave::Saw,
+            x if x < 4.0 => OscWave::Exp,
+            x if x < 5.0 => OscWave::Square,
+            x if x < 6.0 => OscWave::PulseQuarter,
+            x if x < 7.0 => OscWave::PulseEighth,
+            _ => OscWave::Sine,
+        };
+
+        self.synth.filter.input0 = *ports.fil1_mode;
+        self.synth.filter.input1 = *ports.fil1_cutoff;
+        self.synth.filter.feedback0 = *ports.fil1_resonance;
+        self.synth.filter.feedback1 = *ports.fil1_slope;
+        self.synth.filter.feedback0_1 = *ports.fil1_feedback0_1;
+        self.synth.filter.feedback1_0 = *ports.fil1_feedback1_0;
 
         
         let control_sequence = ports

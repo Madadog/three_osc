@@ -76,6 +76,15 @@ fn main() {
         struct_ports.push_str(&format!("\n{}", control.struct_port()));
     }
 
+    // filter controls
+    let mut filter_controls = PortList::filter().prefix("fil1_", "Filter 1 ");
+    for control in filter_controls.0.iter() {
+        ttl.push_str(ttl_divider);
+        ttl.push_str(&control.to_ttl(ttl_index));
+        ttl_index += 1;
+        struct_ports.push_str(&format!("\n{}", control.struct_port()));
+    }
+
     // prepare global controls
     let mut volume_envelope = PortList::envelope().prefix("vol_", "Vol ");
     let global_controls = PortList::global();
@@ -203,7 +212,7 @@ impl PortList {
             ControlPort::new(
                 "wave",
                 "Wave",
-                Int(0, (0, 4)),
+                Int(0, (0, 6)),
             ),
             ControlPort::new(
                 "mod",
@@ -272,6 +281,40 @@ impl PortList {
                 "slope",
                 "Slope",
                 Float(0.0, (-3.0, 8.0)),
+            ),
+        ])
+    }
+    fn filter() -> PortList {
+        Self(vec![
+            ControlPort::new(
+                "mode",
+                "Mode",
+                Float(0.0, (-2.0, 2.0)),
+            ),
+            ControlPort::new(
+                "cutoff",
+                "Cutoff",
+                Float(0.0, (-2.0, 2.0)),
+            ),
+            ControlPort::new(
+                "resonance",
+                "Feedback0",
+                Float(0.0, (-1.0, 1.0)),
+            ),
+            ControlPort::new(
+                "slope",
+                "Feedback1",
+                Float(0.0, (-1.0, 1.0)),
+            ),
+            ControlPort::new(
+                "feedback0_1",
+                "Feedback01",
+                Float(0.0, (-1.0, 1.0)),
+            ),
+            ControlPort::new(
+                "feedback1_0",
+                "Feedback10",
+                Float(0.0, (-1.0, 1.0)),
             ),
         ])
     }

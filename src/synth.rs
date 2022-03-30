@@ -8,6 +8,7 @@ use std::hash::Hasher;
 use self::envelopes::AdsrEnvelope;
 use self::oscillator::BasicOscillator;
 use self::oscillator::OscVoice;
+use self::oscillator::naive_saw;
 
 const DEFAULT_SRATE: f32 = 44100.0;
 
@@ -17,6 +18,7 @@ pub struct ThreeOsc {
     pub sample_rate: f64,
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 1],
+    pub filter: TestFilter,
 }
 
 impl ThreeOsc {
@@ -26,7 +28,8 @@ impl ThreeOsc {
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
             sample_rate,
             output_volume: 0.3,
-            oscillators: [BasicOscillator::default()]
+            oscillators: [BasicOscillator::default()],
+            filter: TestFilter::default(),
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -53,18 +56,19 @@ impl ThreeOsc {
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
                 let mut out = 0.0;
                 for oscillator in self.oscillators.iter() {
-                    out += oscillator.naive_saw(&mut voice.osc_voice);
+                    out += oscillator.unison(&mut voice.osc_voice, |x| oscillator.wave.generate(x));
                 }
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
                     out * self.gain_envelope.sample_released(release_index, envelope_index)
                 } else {
                     out * self.gain_envelope.sample_held(envelope_index)
-                } * self.output_volume;
+                };
                 *out_l += out;
                 *out_r += out;
-
             }
+            *out_l = self.filter.process(*out_l) * self.output_volume;
+            *out_r = *out_l;
         })
     }
 }
@@ -114,8 +118,8 @@ fn time_to_samples(time: f64, delta: f64) -> u32 {
     (time / delta) as u32
 }
 
-mod oscillator {
-    use std::f32::consts::PI;
+pub mod oscillator {
+    use std::f32::consts::{PI, FRAC_1_SQRT_2};
 
     /// A single instance of a playing oscillator. Maintains phase for fm / pm stuff 
     #[derive(Debug, Clone, Copy)]
@@ -138,30 +142,52 @@ mod oscillator {
         pub exponent: i32,
         pub voice_count: u8,
         pub voices_detune: f32,
+        pub wave: OscWave,
     }
     impl BasicOscillator {
         fn mult_delta(&self, delta: f32) -> f32 {
             delta * 2.0_f32.powi(self.exponent) * 2.0_f32.powf(self.semitone / 12.0)
         }
-        pub fn sine(&self, voice: &mut OscVoice) -> f32 {
-            let delta = self.mult_delta(voice.delta);
-            voice.phase = voice.add_phase(delta);
-            voice.phase.sin() * self.amp
-        }
-        pub fn naive_saw(&self, voices: &mut [OscVoice]) -> f32 {
+        pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut [OscVoice], wave: T) -> f32 {
             let main_delta = self.mult_delta(voices[0].delta);
             voices.iter_mut().take(self.voice_count.into()).enumerate().map(|(i, voice)| {
                 let i = i as f32 - (i % 2) as f32 * 2.0;
                 let delta = main_delta + main_delta * i as f32 * self.voices_detune / (self.voice_count as f32);
                 voice.phase = voice.add_phase(delta);
-                (voice.phase - PI) / (2.0 * PI)
+                wave(voice.phase)
             }).sum::<f32>() * self.amp / self.voice_count as f32
         }
     }
     impl Default for BasicOscillator {
         fn default() -> Self {
-            Self { amp: 1.0, semitone: Default::default(), exponent: Default::default(), voice_count: 1, voices_detune: 0.1 }
+            Self { amp: 1.0, semitone: Default::default(), exponent: Default::default(), voice_count: 1, voices_detune: 0.1, wave: OscWave::Sine}
         }
+    }
+    pub enum OscWave {
+        Sine,
+        Tri,
+        Saw,
+        Exp,
+        Square,
+        PulseQuarter,
+        PulseEighth,
+    }
+    impl OscWave {
+        pub fn generate(&self, phase: f32) -> f32 {
+            use OscWave::*;
+            match self {
+                Sine => phase.sin(),
+                Tri => if phase <= PI {(phase / PI) * 2.0 - 1.0} else {((-phase + 2.0 * PI) / PI) * 2.0 - 1.0}
+                Saw => (phase - PI) / (2.0 * PI),
+                Exp => phase.sin().abs() - 0.55,
+                Square => if phase <= PI { FRAC_1_SQRT_2 } else { -FRAC_1_SQRT_2 },
+                PulseQuarter => if phase <= std::f32::consts::FRAC_PI_2 { FRAC_1_SQRT_2 } else { -FRAC_1_SQRT_2 },
+                PulseEighth => if phase <= std::f32::consts::FRAC_PI_4 { FRAC_1_SQRT_2 } else { -FRAC_1_SQRT_2 },
+            }
+        }
+    }
+    pub fn naive_saw(phase: f32) -> f32 {
+        (phase - PI) / (2.0 * PI)
     }
 }
 
@@ -226,3 +252,27 @@ mod envelopes {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct TestFilter {
+    stage0: f32,
+    stage1: f32,
+    pub input0: f32,
+    pub input1: f32,
+    pub feedback0: f32,
+    pub feedback1: f32,
+    pub feedback0_1: f32,
+    pub feedback1_0: f32,
+}
+impl TestFilter {
+    fn process(&mut self, input: f32) -> f32 {
+        if self.stage0.is_finite() && self.stage1.is_finite() {
+            self.stage0 = input * self.input0 + self.stage0 * -self.feedback0 + self.stage0 * -self.feedback1_0; 
+            self.stage1 = self.stage1 * -self.feedback1 + self.stage0 * -self.feedback0_1;
+        } else {
+            println!("Warning: filters were {} and {}", self.stage0, self.stage1);
+            self.stage0 = 0.0; 
+            self.stage1 = 0.0; 
+        }
+        self.stage1 + input
+    }
+}
