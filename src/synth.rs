@@ -253,26 +253,55 @@ mod envelopes {
 }
 
 #[derive(Debug, Default)]
+/// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
 pub struct TestFilter {
     stage0: f32,
     stage1: f32,
-    pub input0: f32,
-    pub input1: f32,
-    pub feedback0: f32,
-    pub feedback1: f32,
-    pub feedback0_1: f32,
-    pub feedback1_0: f32,
+    // target_a1: f32,
+    prev_a1: f32, // for automation smoothing
+    pub a1: f32, // cutoff
+    pub a2: f32, // resonance
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
+    pub drive: f32,
 }
 impl TestFilter {
     fn process(&mut self, input: f32) -> f32 {
-        if self.stage0.is_finite() && self.stage1.is_finite() {
-            self.stage0 = input * self.input0 + self.stage0 * -self.feedback0 + self.stage0 * -self.feedback1_0; 
-            self.stage1 = self.stage1 * -self.feedback1 + self.stage0 * -self.feedback0_1;
-        } else {
-            println!("Warning: filters were {} and {}", self.stage0, self.stage1);
+        if !(self.stage0.is_finite() && self.stage1.is_finite()) {
+            println!("Warning: filters were unstable, {} and {}", self.stage0, self.stage1);
             self.stage0 = 0.0; 
             self.stage1 = 0.0; 
         }
-        self.stage1 + input
+
+        // small parameter smoothing
+        // self.a1 = self.target_a1 + 0.01 * self.prev_a1;
+        // self.prev_a1 = self.a1;
+
+        let previous_previous_sample = self.stage1 * self.drive;
+        let previous_sample = self.stage0;
+        let current_sample = (input - self.a1 * self.stage0 - self.a2 * self.stage1);
+        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
+        
+        // Propogate
+        self.stage0 = current_sample;
+        self.stage1 = previous_sample;
+
+        let gain_compensation = self.a1 + 2.0;
+
+        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample) * gain_compensation
     }
+    pub fn set_resonance(&mut self, resonance: f32) {
+        let (min, max) = (-0.9999 + self.a1.abs(), 1.0);
+        self.a2 = lerp(min, max, resonance);
+    }
+    pub fn set_cutoff(&mut self, cutoff: f32) {
+        let (min, max) = (-1.99999999, 1.99999999);
+        // self.target_a1 = lerp(min, max, cutoff.powi(2));
+        self.a1 = lerp(min, max, cutoff.powi(2));
+    }
+}
+
+fn lerp(from: f32, to: f32, amount: f32) -> f32 {
+    (to - from).mul_add(amount, from)
 }

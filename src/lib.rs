@@ -102,12 +102,13 @@ impl Plugin for Amp {
             _ => OscWave::Sine,
         };
 
-        self.synth.filter.input0 = *ports.fil1_mode;
-        self.synth.filter.input1 = *ports.fil1_cutoff;
-        self.synth.filter.feedback0 = *ports.fil1_resonance;
-        self.synth.filter.feedback1 = *ports.fil1_slope;
-        self.synth.filter.feedback0_1 = *ports.fil1_feedback0_1;
-        self.synth.filter.feedback1_0 = *ports.fil1_feedback1_0;
+        // self.synth.filter.a2 = *ports.fil1_resonance;
+        self.synth.filter.set_cutoff(*ports.fil1_cutoff);
+        self.synth.filter.set_resonance(*ports.fil1_resonance);
+        self.synth.filter.b0 = *ports.fil1_mode;
+        self.synth.filter.b1 = *ports.fil1_slope;
+        self.synth.filter.b2 = *ports.fil1_feedback0_1;
+        self.synth.filter.drive = *ports.fil1_feedback1_0;
 
         
         let control_sequence = ports
