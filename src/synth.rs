@@ -18,7 +18,7 @@ pub struct ThreeOsc {
     pub sample_rate: f64,
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 1],
-    pub filter: TestFilter,
+    pub filter: CascadeFilter,
 }
 
 impl ThreeOsc {
@@ -29,7 +29,7 @@ impl ThreeOsc {
             sample_rate,
             output_volume: 0.3,
             oscillators: [BasicOscillator::default()],
-            filter: TestFilter::default(),
+            filter: CascadeFilter::default(),
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -287,9 +287,75 @@ impl TestFilter {
         self.stage0 = current_sample;
         self.stage1 = previous_sample;
 
-        let gain_compensation = self.a1 + 2.0;
+        let gain_compensation = 1.0 + self.a2 + self.a1;
 
         (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample) * gain_compensation
+    }
+    pub fn set_resonance(&mut self, resonance: f32) {
+        let (min, max) = (-0.9999 + self.a1.abs(), 1.0);
+        self.a2 = lerp(min, max, resonance);
+    }
+    pub fn set_cutoff(&mut self, cutoff: f32) {
+        let (min, max) = (-1.99999999, 1.99999999);
+        // self.target_a1 = lerp(min, max, cutoff.powi(2));
+        self.a1 = lerp(min, max, cutoff.powi(2));
+    }
+}
+
+#[derive(Debug, Default)]
+/// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
+pub struct CascadeFilter {
+    stage0_0: f32,
+    stage1_0: f32,
+    stage0_1: f32,
+    stage1_1: f32,
+    pub a1: f32, // cutoff
+    pub a2: f32, // resonance
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
+    pub feedback: f32,
+}
+impl CascadeFilter {
+    fn process_single(&self, input: f32, stage0: &mut f32, stage1: &mut f32) -> f32 {
+        if !(stage0.is_finite() && stage1.is_finite()) {
+            println!("Warning: filters were unstable, {} and {}", stage0, stage1);
+            *stage0 = 0.0; 
+            *stage1 = 0.0; 
+        }
+
+        // small parameter smoothing
+        // self.a1 = self.target_a1 + 0.01 * self.prev_a1;
+        // self.prev_a1 = self.a1;
+
+        let previous_previous_sample = *stage1;
+        let previous_sample = *stage0;
+        let current_sample = input - self.a1 * *stage0 - self.a2 * *stage1;
+        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
+        
+        // Propogate
+        *stage0 = current_sample;
+        *stage1 = previous_sample;
+
+        let gain_compensation = 1.0 + self.a2 + self.a1;
+
+        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample) * gain_compensation
+    }
+    fn process(&mut self, input: f32) -> f32 {
+        let mut stage_0 = self.stage0_0;
+        let mut stage_1 = self.stage1_0;
+        let input = self.process_single(input, &mut stage_0, &mut stage_1);
+        self.stage0_0 = stage_0;
+        self.stage1_0 = stage_1;
+
+        let mut stage_0 = self.stage0_1;
+        let mut stage_1 = self.stage1_1;
+        let output = self.process_single(input, &mut stage_0, &mut stage_1);
+        self.stage0_1 = stage_0;
+        self.stage1_1 = stage_1;
+        self.stage0_0 += self.stage0_1 * self.feedback;
+        self.stage1_0 += self.stage1_1 * self.feedback;
+        output
     }
     pub fn set_resonance(&mut self, resonance: f32) {
         let (min, max) = (-0.9999 + self.a1.abs(), 1.0);
