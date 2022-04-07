@@ -91,6 +91,8 @@ impl Plugin for Amp {
         self.synth.oscillators[0].exponent = *ports.osc1_exponent as i32;
         self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
         self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
+        self.synth.oscillators[0].phase = *ports.osc1_phase;
+        self.synth.oscillators[0].phase_rand = *ports.osc1_phase_rand;
         self.synth.oscillators[0].wave = match *ports.osc1_wave {
             x if x < 1.0 => OscWave::Sine,
             x if x < 2.0 => OscWave::Tri,

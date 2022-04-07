@@ -6,9 +6,10 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
+use self::oscillator::SuperVoice;
+use self::oscillator::naive_saw;
 use self::oscillator::BasicOscillator;
 use self::oscillator::OscVoice;
-use self::oscillator::naive_saw;
 
 const DEFAULT_SRATE: f32 = 44100.0;
 
@@ -33,10 +34,14 @@ impl ThreeOsc {
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
-        self.voices.push(Voice::from_midi_note(note, self.sample_rate as f32))
+        self.voices
+            .push(Voice::from_midi_note(note, self.sample_rate as f32, &self.oscillators))
     }
     pub fn note_off(&mut self, note: u8, velocity: u8) {
-        self.voices.iter_mut().filter(|voice| voice.id == note as u32).for_each(|voice| voice.release())
+        self.voices
+            .iter_mut()
+            .filter(|voice| voice.id == note as u32)
+            .for_each(|voice| voice.release())
     }
     pub fn release_voices(&mut self) {
         let duration = (self.gain_envelope.release_time * self.sample_rate as f32) as u32;
@@ -48,7 +53,10 @@ impl ThreeOsc {
             }
         })
     }
-    pub fn run(&mut self, output: std::iter::Zip<std::slice::IterMut<f32>, std::slice::IterMut<f32>>) {
+    pub fn run(
+        &mut self,
+        output: std::iter::Zip<std::slice::IterMut<f32>, std::slice::IterMut<f32>>,
+    ) {
         output.for_each(|(out_l, out_r)| {
             self.release_voices();
             for voice in self.voices.iter_mut() {
@@ -60,7 +68,9 @@ impl ThreeOsc {
                 }
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
-                    out * self.gain_envelope.sample_released(release_index, envelope_index)
+                    out * self
+                        .gain_envelope
+                        .sample_released(release_index, envelope_index)
                 } else {
                     out * self.gain_envelope.sample_held(envelope_index)
                 };
@@ -73,21 +83,20 @@ impl ThreeOsc {
     }
 }
 
-/// An individual note press. 
+/// An individual note press.
 pub struct Voice {
     id: u32,
     runtime: u32,
     release_time: Option<u32>,
-    osc_voice: [OscVoice; 128],
+    osc_voice: SuperVoice,
 }
 impl Voice {
-    pub fn from_midi_note(index: u8, sample_rate: f32) -> Self {
-        let mut osc_voice = [OscVoice::new(0.0, (2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate); 128];
-        let rng = fastrand::Rng::new();
-        
-        for voice in osc_voice.iter_mut() {
-            voice.phase += rng.f32() * 2.0 * PI;
-        }
+    pub fn from_midi_note(index: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
+        let mut osc_voice = SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate,
+            osc[0].phase,
+            osc[0].phase_rand,
+        );
+ 
         Self {
             id: index.into(),
             runtime: 0,
@@ -119,9 +128,9 @@ fn time_to_samples(time: f64, delta: f64) -> u32 {
 }
 
 pub mod oscillator {
-    use std::f32::consts::{PI, FRAC_1_SQRT_2};
+    use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
-    /// A single instance of a playing oscillator. Maintains phase for fm / pm stuff 
+    /// A single instance of a playing oscillator. Maintains phase for fm / pm stuff
     #[derive(Debug, Clone, Copy)]
     pub struct OscVoice {
         pub phase: f32,
@@ -136,6 +145,36 @@ pub mod oscillator {
             self.phase
         }
     }
+    pub struct SuperVoice {
+        pub voice_phases: [f32; 128],
+        pub delta: f32,
+    }
+    impl SuperVoice {
+        pub fn new(delta: f32, phase: f32, phase_random: f32) -> Self {
+            let mut voice_phases = [phase; 128];
+            let rng = fastrand::Rng::new();
+
+            for phase in voice_phases.iter_mut() {
+                *phase += rng.f32() * phase_random;
+            }
+            Self { voice_phases, delta }
+        }
+        pub fn add_phase(&mut self, delta: f32, voice_count: usize, detune: f32) {
+            // self.phase = (self.phase + delta) % (2.0 * PI);
+            // self.phase
+            self.voice_phases
+                .iter_mut()
+                .take(voice_count)
+                .enumerate()
+                .for_each(|(i, phase): (usize, &mut f32)| {
+                    let i = i as f32 - (i % 2) as f32 * 2.0;
+                    let delta = delta
+                        + delta * i as f32 * detune / (voice_count as f32);
+                    *phase = (*phase + delta) % (2.0 * PI);
+                });
+        }
+    }
+
     pub struct BasicOscillator {
         pub amp: f32,
         pub semitone: f32,
@@ -143,24 +182,40 @@ pub mod oscillator {
         pub voice_count: u8,
         pub voices_detune: f32,
         pub wave: OscWave,
+        pub phase: f32,
+        pub phase_rand: f32,
     }
     impl BasicOscillator {
         fn mult_delta(&self, delta: f32) -> f32 {
             delta * 2.0_f32.powi(self.exponent) * 2.0_f32.powf(self.semitone / 12.0)
         }
-        pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut [OscVoice], wave: T) -> f32 {
-            let main_delta = self.mult_delta(voices[0].delta);
-            voices.iter_mut().take(self.voice_count.into()).enumerate().map(|(i, voice)| {
-                let i = i as f32 - (i % 2) as f32 * 2.0;
-                let delta = main_delta + main_delta * i as f32 * self.voices_detune / (self.voice_count as f32);
-                voice.phase = voice.add_phase(delta);
-                wave(voice.phase)
-            }).sum::<f32>() * self.amp / self.voice_count as f32
+        pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut SuperVoice, wave: T) -> f32 {
+            voices.add_phase(voices.delta, self.voice_count.into(), self.voices_detune);
+            voices
+                .voice_phases
+                .iter_mut()
+                .take(self.voice_count.into())
+                .enumerate()
+                .map(|(i, phase)| {
+                    wave(*phase)
+                })
+                .sum::<f32>()
+                * self.amp
+                / self.voice_count as f32
         }
     }
     impl Default for BasicOscillator {
         fn default() -> Self {
-            Self { amp: 1.0, semitone: Default::default(), exponent: Default::default(), voice_count: 1, voices_detune: 0.1, wave: OscWave::Sine}
+            Self {
+                amp: 1.0,
+                semitone: Default::default(),
+                exponent: Default::default(),
+                voice_count: 1,
+                voices_detune: 0.1,
+                wave: OscWave::Sine,
+                phase: 0.0,
+                phase_rand: PI * 2.0,
+            }
         }
     }
     pub enum OscWave {
@@ -177,12 +232,36 @@ pub mod oscillator {
             use OscWave::*;
             match self {
                 Sine => phase.sin(),
-                Tri => if phase <= PI {(phase / PI) * 2.0 - 1.0} else {((-phase + 2.0 * PI) / PI) * 2.0 - 1.0}
+                Tri => {
+                    if phase <= PI {
+                        (phase / PI) * 2.0 - 1.0
+                    } else {
+                        ((-phase + 2.0 * PI) / PI) * 2.0 - 1.0
+                    }
+                }
                 Saw => (phase - PI) / (2.0 * PI),
                 Exp => phase.sin().abs() - 0.55,
-                Square => if phase <= PI { FRAC_1_SQRT_2 } else { -FRAC_1_SQRT_2 },
-                PulseQuarter => if phase <= std::f32::consts::FRAC_PI_2 { FRAC_1_SQRT_2 } else { -FRAC_1_SQRT_2 },
-                PulseEighth => if phase <= std::f32::consts::FRAC_PI_4 { FRAC_1_SQRT_2 } else { -FRAC_1_SQRT_2 },
+                Square => {
+                    if phase <= PI {
+                        FRAC_1_SQRT_2
+                    } else {
+                        -FRAC_1_SQRT_2
+                    }
+                }
+                PulseQuarter => {
+                    if phase <= std::f32::consts::FRAC_PI_2 {
+                        FRAC_1_SQRT_2
+                    } else {
+                        -FRAC_1_SQRT_2
+                    }
+                }
+                PulseEighth => {
+                    if phase <= std::f32::consts::FRAC_PI_4 {
+                        FRAC_1_SQRT_2
+                    } else {
+                        -FRAC_1_SQRT_2
+                    }
+                }
             }
         }
     }
@@ -202,7 +281,13 @@ mod envelopes {
         pub slope: f32,
     }
     impl AdsrEnvelope {
-        pub fn new(attack_time: f32, decay_time: f32, release_time: f32, sustain_level: f32, slope: f32) -> Self {
+        pub fn new(
+            attack_time: f32,
+            decay_time: f32,
+            release_time: f32,
+            sustain_level: f32,
+            slope: f32,
+        ) -> Self {
             Self {
                 attack_time,
                 decay_time,
@@ -216,7 +301,9 @@ mod envelopes {
             if index <= self.attack_time {
                 (index / self.attack_time).powf(self.slope)
             } else if index - self.attack_time <= self.decay_time {
-                (1.0 - (index - self.attack_time) / self.decay_time).powf(self.slope) * (1.0 - self.sustain_level) + self.sustain_level
+                (1.0 - (index - self.attack_time) / self.decay_time).powf(self.slope)
+                    * (1.0 - self.sustain_level)
+                    + self.sustain_level
             } else {
                 self.sustain_level
             }
@@ -247,9 +334,7 @@ mod envelopes {
         release: Monotonic<CubicBezierSegment<f32>>,
         sustain_level: f32,
     }
-    impl BezierEnvelope {
-
-    }
+    impl BezierEnvelope {}
 }
 
 #[derive(Debug, Default)]
@@ -259,8 +344,8 @@ pub struct TestFilter {
     stage1: f32,
     // target_a1: f32,
     prev_a1: f32, // for automation smoothing
-    pub a1: f32, // cutoff
-    pub a2: f32, // resonance
+    pub a1: f32,  // cutoff
+    pub a2: f32,  // resonance
     pub b0: f32,
     pub b1: f32,
     pub b2: f32,
@@ -269,9 +354,12 @@ pub struct TestFilter {
 impl TestFilter {
     fn process(&mut self, input: f32) -> f32 {
         if !(self.stage0.is_finite() && self.stage1.is_finite()) {
-            println!("Warning: filters were unstable, {} and {}", self.stage0, self.stage1);
-            self.stage0 = 0.0; 
-            self.stage1 = 0.0; 
+            println!(
+                "Warning: filters were unstable, {} and {}",
+                self.stage0, self.stage1
+            );
+            self.stage0 = 0.0;
+            self.stage1 = 0.0;
         }
 
         // small parameter smoothing
@@ -282,14 +370,15 @@ impl TestFilter {
         let previous_sample = self.stage0;
         let current_sample = (input - self.a1 * self.stage0 - self.a2 * self.stage1);
         //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
-        
+
         // Propogate
         self.stage0 = current_sample;
         self.stage1 = previous_sample;
 
         let gain_compensation = 1.0 + self.a2 + self.a1;
 
-        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample) * gain_compensation
+        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample)
+            * gain_compensation
     }
     pub fn set_resonance(&mut self, resonance: f32) {
         let (min, max) = (-0.9999 + self.a1.abs(), 1.0);
@@ -320,8 +409,8 @@ impl CascadeFilter {
     fn process_single(&self, input: f32, stage0: &mut f32, stage1: &mut f32) -> f32 {
         if !(stage0.is_finite() && stage1.is_finite()) {
             println!("Warning: filters were unstable, {} and {}", stage0, stage1);
-            *stage0 = 0.0; 
-            *stage1 = 0.0; 
+            *stage0 = 0.0;
+            *stage1 = 0.0;
         }
 
         // small parameter smoothing
@@ -332,14 +421,15 @@ impl CascadeFilter {
         let previous_sample = *stage0;
         let current_sample = input - self.a1 * *stage0 - self.a2 * *stage1;
         //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
-        
+
         // Propogate
         *stage0 = current_sample;
         *stage1 = previous_sample;
 
         let gain_compensation = 1.0 + self.a2 + self.a1;
 
-        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample) * gain_compensation
+        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample)
+            * gain_compensation
     }
     fn process(&mut self, input: f32) -> f32 {
         let mut stage_0 = self.stage0_0;

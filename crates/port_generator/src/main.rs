@@ -1,4 +1,5 @@
 use std::{fs::File, io::Write};
+use std::f32::consts::PI;
 
 fn main() {
     let ttl_header = "@prefix atom: <http://lv2plug.in/ns/ext/atom#> .
@@ -232,12 +233,12 @@ impl PortList {
             ControlPort::new(
                 "phase",
                 "Phase",
-                Float(0.0, (0.0, 360.0)),
+                Float(0.0, (0.0, PI * 2.0)),
             ),
             ControlPort::new(
                 "phase_rand",
                 "Phase Rand.",
-                Float(100.0, (0.0, 100.0)),
+                Float(PI * 2.0, (0.0, PI * 2.0)),
             ),
         ])
     }
@@ -294,12 +295,12 @@ impl PortList {
             ControlPort::new(
                 "cutoff",
                 "Cutoff",
-                Float(0.01, (0.0, 1.0)),
+                Float(0.5, (0.0, 1.0)),
             ),
             ControlPort::new(
                 "resonance",
                 "Resonance",
-                Float(0.01, (0.01, 1.0)),
+                Float(0.1, (0.01, 1.0)),
             ),
             ControlPort::new(
                 "slope",
