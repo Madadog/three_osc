@@ -105,12 +105,13 @@ impl Plugin for Amp {
         };
 
         // self.synth.filter.a2 = *ports.fil1_resonance;
-        self.synth.filter.set_cutoff(*ports.fil1_cutoff);
-        self.synth.filter.set_resonance(*ports.fil1_resonance);
-        self.synth.filter.b0 = *ports.fil1_mode;
-        self.synth.filter.b1 = *ports.fil1_slope;
-        self.synth.filter.b2 = *ports.fil1_feedback0_1;
-        self.synth.filter.feedback = *ports.fil1_feedback1_0;
+        self.synth.filter.set_params(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
+        // self.synth.filter.set_cutoff(*ports.fil1_cutoff);
+        // self.synth.filter.set_resonance(*ports.fil1_resonance);
+        // self.synth.filter.b0 = *ports.fil1_mode;
+        // self.synth.filter.b1 = *ports.fil1_slope;
+        // self.synth.filter.b2 = *ports.fil1_feedback0_1;
+        // self.synth.filter.feedback = *ports.fil1_feedback1_0;
 
         
         let control_sequence = ports

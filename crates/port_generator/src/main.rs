@@ -295,12 +295,12 @@ impl PortList {
             ControlPort::new(
                 "cutoff",
                 "Cutoff",
-                Float(0.5, (0.0, 1.0)),
+                Float(22050.0, (1.0, 22000.0)),
             ),
             ControlPort::new(
                 "resonance",
                 "Resonance",
-                Float(0.1, (0.01, 1.0)),
+                Float(0.1, (0.01, 10.0)),
             ),
             ControlPort::new(
                 "slope",
