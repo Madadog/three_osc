@@ -92,7 +92,7 @@ pub struct Voice {
 }
 impl Voice {
     pub fn from_midi_note(index: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
-        let mut osc_voice = SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf((index as i16 - 69) as f32 / 12.0)) / sample_rate,
+        let mut osc_voice = SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
             osc[0].phase,
             osc[0].phase_rand,
         );
@@ -190,7 +190,7 @@ pub mod oscillator {
             delta * 2.0_f32.powi(self.exponent) * 2.0_f32.powf(self.semitone / 12.0)
         }
         pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut SuperVoice, wave: T) -> f32 {
-            voices.add_phase(voices.delta, self.voice_count.into(), self.voices_detune);
+            voices.add_phase(self.mult_delta(voices.delta), self.voice_count.into(), self.voices_detune);
             voices
                 .voice_phases
                 .iter_mut()
@@ -273,6 +273,7 @@ pub mod oscillator {
 mod envelopes {
     use lyon_geom::{CubicBezierSegment, Monotonic};
 
+    #[derive(Debug, Clone)]
     pub struct AdsrEnvelope {
         pub attack_time: f32,
         pub decay_time: f32,
@@ -337,7 +338,7 @@ mod envelopes {
     impl BezierEnvelope {}
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 /// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
 /// 
 pub struct TestFilter {
@@ -352,7 +353,7 @@ pub struct TestFilter {
     target_a: (f32, f32, f32), // smoothing
     target_b: (f32, f32, f32),
 }
-impl TestFilter {
+impl Filter for TestFilter {
     fn process(&mut self, input: f32) -> f32 {
         if !(self.stage0.is_finite() && self.stage1.is_finite()) {
             println!(
@@ -362,9 +363,6 @@ impl TestFilter {
             self.stage0 = 0.0;
             self.stage1 = 0.0;
         }
-
-        // parameter smoothing
-        self.lerp_towards_target(0.005);
 
         let previous_previous_sample = self.stage1;
         let previous_sample = self.stage0;
@@ -378,7 +376,7 @@ impl TestFilter {
         (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample)
             / self.a0
     }
-    pub fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
+    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
         // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
 
         // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)." 
@@ -400,37 +398,6 @@ impl TestFilter {
         self.a1 = -2.0 * cos;
         self.a2 = 1.0 - a;
     }
-    pub fn set_params_target(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
-
-        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)." 
-        
-        // [This notice should be placed within redistributed or derivative software code or text when appropriate. This particular formulation became active on May 13, 2015, and edited for clarity 7 April, 2021, superseding the 2002 version.]
-        // Audio Eq Cookbook: https://www.w3.org/TR/audio-eq-cookbook/
-        // Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute of Technology, European Research Consortium for Informatics and Mathematics, Keio University, Beihang). All Rights Reserved. This work is distributed under the W3C® Software and Document License [1] in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-        // [1] http://www.w3.org/Consortium/Legal/copyright-software
-
-        let phase_change = 2.0 * PI * cutoff / sample_rate;
-        let (sin, cos) = phase_change.sin_cos();
-        let a = sin / (2.0 * resonance);
-
-        self.target_b.0 = (1.0 - cos) / 2.0;
-        self.target_b.1 = 1.0 - cos;
-        self.target_b.2 = (1.0 - cos) / 2.0;
-
-        self.target_a.0 = 1.0 + a;
-        self.target_a.1 = -2.0 * cos;
-        self.target_a.2 = 1.0 - a;
-    }
-    pub fn lerp_towards_target(&mut self, amount: f32) {
-        self.b0 = lerp(self.b0, self.target_b.0, amount);
-        self.b1 = lerp(self.b1, self.target_b.1, amount);
-        self.b2 = lerp(self.b2, self.target_b.2, amount);
-
-        self.a0 = lerp(self.a0, self.target_a.0, amount);
-        self.a1 = lerp(self.a1, self.target_a.1, amount);
-        self.a2 = lerp(self.a2, self.target_a.2, amount);
-    }
 }
 
 #[derive(Debug, Default)]
@@ -439,8 +406,49 @@ pub struct CascadeFilter {
     filter_1: TestFilter,
     filter_2: TestFilter,
 }
-impl CascadeFilter {
+impl Filter for CascadeFilter {
+    fn process(&mut self, input: f32) -> f32 {
+        self.filter_2.process(self.filter_1.process(input))
+    }
+    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
+        self.filter_1.set_params(sample_rate, cutoff, resonance);
+        self.filter_2.set_params(sample_rate, cutoff, resonance);
+    }
+}
 
+pub trait Filter {
+    fn process(&mut self, input: f32) -> f32;
+    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32);
+}
+
+#[derive(Debug)]
+/// Filter in series
+pub struct FilterController {
+    filter: TestFilter,
+    cutoff_envelope: AdsrEnvelope,
+    envelope_amount: f32,
+    cutoff: f32,
+    resonance: f32,
+}
+impl FilterController {
+    pub fn process(&mut self, input: f32) -> f32 {
+        self.filter.process(input)
+    }
+    pub fn process_with_envelope_held(&mut self, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
+        self.filter.set_params(sample_rate,
+            (self.cutoff + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
+            self.resonance
+        );
+        let out = self.filter.process(input);
+        self.filter.set_params(sample_rate, self.cutoff, self.resonance);
+        out
+    }
+    
+    pub fn lerp_controls(&mut self, sample_rate: f32, target_cutoff: f32, target_resonance: f32) {
+        self.cutoff = lerp(self.cutoff, target_cutoff, 500.0 / sample_rate);
+        self.resonance = lerp(self.cutoff, target_resonance, 500.0 / sample_rate);
+        self.filter.set_params(sample_rate, self.cutoff, self.resonance);
+    }
 }
 
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {

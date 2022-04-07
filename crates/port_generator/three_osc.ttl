@@ -150,38 +150,56 @@
                 lv2:name "Filter 1 Resonance" ;
                 lv2:default 0.100 ;
                 lv2:minimum 0.010 ;
-                lv2:maximum 300.000 ;
+                lv2:maximum 50.000 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 15 ;
-                lv2:symbol "fil1_slope" ;
-                lv2:name "Filter 1 Feedback1" ;
-                lv2:default 0.000 ;
-                lv2:minimum -1.000 ;
-                lv2:maximum 1.000 ;
+                lv2:symbol "fil1_attack" ;
+                lv2:name "Filter 1 Attack" ;
+                lv2:default 0.001 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 15.000 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 16 ;
-                lv2:symbol "fil1_feedback0_1" ;
-                lv2:name "Filter 1 Feedback01" ;
-                lv2:default 0.000 ;
-                lv2:minimum -1.000 ;
-                lv2:maximum 1.000 ;
+                lv2:symbol "fil1_decay" ;
+                lv2:name "Filter 1 Decay" ;
+                lv2:default 0.250 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 15.000 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 17 ;
-                lv2:symbol "fil1_feedback1_0" ;
-                lv2:name "Filter 1 Feedback10" ;
-                lv2:default 0.000 ;
+                lv2:symbol "fil1_sustain" ;
+                lv2:name "Filter 1 Sustain" ;
+                lv2:default 1.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 18 ;
+                lv2:symbol "fil1_release" ;
+                lv2:name "Filter 1 Release" ;
+                lv2:default 0.005 ;
+                lv2:minimum 0.001 ;
+                lv2:maximum 15.000 ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 19 ;
+                lv2:symbol "fil1_slope" ;
+                lv2:name "Filter 1 Slope" ;
+                lv2:default 0.000 ;
+                lv2:minimum -3.000 ;
+                lv2:maximum 8.000 ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 20 ;
                 lv2:symbol "vol_attack" ;
                 lv2:name "Vol Attack" ;
                 lv2:default 0.001 ;
@@ -190,7 +208,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 19 ;
+                lv2:index 21 ;
                 lv2:symbol "vol_decay" ;
                 lv2:name "Vol Decay" ;
                 lv2:default 0.250 ;
@@ -199,7 +217,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 20 ;
+                lv2:index 22 ;
                 lv2:symbol "vol_sustain" ;
                 lv2:name "Vol Sustain" ;
                 lv2:default 1.000 ;
@@ -208,7 +226,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 21 ;
+                lv2:index 23 ;
                 lv2:symbol "vol_release" ;
                 lv2:name "Vol Release" ;
                 lv2:default 0.005 ;
@@ -217,7 +235,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 22 ;
+                lv2:index 24 ;
                 lv2:symbol "vol_slope" ;
                 lv2:name "Vol Slope" ;
                 lv2:default 0.000 ;
@@ -226,7 +244,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 23 ;
+                lv2:index 25 ;
                 lv2:symbol "output_gain" ;
                 lv2:name "Output Gain" ;
                 lv2:default -18.000 ;
@@ -235,7 +253,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 24 ;
+                lv2:index 26 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Master Pitch" ;
                 lv2:default 0 ;

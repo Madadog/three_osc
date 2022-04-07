@@ -79,7 +79,8 @@ fn main() {
 
     // filter controls
     let mut filter_controls = PortList::filter().prefix("fil1_", "Filter 1 ");
-    for control in filter_controls.0.iter() {
+    let mut filter_envelope = PortList::envelope().prefix("fil1_", "Filter 1 ");
+    for control in filter_controls.0.iter().chain(filter_envelope.0.iter()) {
         ttl.push_str(ttl_divider);
         ttl.push_str(&control.to_ttl(ttl_index));
         ttl_index += 1;
@@ -301,21 +302,6 @@ impl PortList {
                 "resonance",
                 "Resonance",
                 Float(0.1, (0.01, 50.0)),
-            ),
-            ControlPort::new(
-                "slope",
-                "Feedback1",
-                Float(0.0, (-1.0, 1.0)),
-            ),
-            ControlPort::new(
-                "feedback0_1",
-                "Feedback01",
-                Float(0.0, (-1.0, 1.0)),
-            ),
-            ControlPort::new(
-                "feedback1_0",
-                "Feedback10",
-                Float(0.00001, (0.00001, 1.0)),
             ),
         ])
     }

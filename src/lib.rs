@@ -4,7 +4,7 @@ use std::convert::TryInto;
 use lv2::{prelude::*, lv2_core::plugin};
 
 mod synth;
-use synth::{ThreeOsc, oscillator::OscWave};
+use synth::{ThreeOsc, oscillator::OscWave, Filter};
 use wmidi::MidiMessage;
 
 // Most useful plugins will have ports for input and output data. In code, these ports are represented by a struct implementing the `PortCollection` trait. Internally, ports are referred to by index. These indices are assigned in ascending order, starting with 0 for the first port. The indices in `amp.ttl` have to match them.
@@ -25,9 +25,11 @@ struct Ports {
     fil1_mode: InputPort<Control>,
     fil1_cutoff: InputPort<Control>,
     fil1_resonance: InputPort<Control>,
+    fil1_attack: InputPort<Control>,
+    fil1_decay: InputPort<Control>,
+    fil1_sustain: InputPort<Control>,
+    fil1_release: InputPort<Control>,
     fil1_slope: InputPort<Control>,
-    fil1_feedback0_1: InputPort<Control>,
-    fil1_feedback1_0: InputPort<Control>,
     vol_attack: InputPort<Control>,
     vol_decay: InputPort<Control>,
     vol_sustain: InputPort<Control>,
@@ -105,7 +107,7 @@ impl Plugin for SynthLv2 {
         };
 
         // self.synth.filter.a2 = *ports.fil1_resonance;
-        self.synth.filter.set_params_target(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
+        self.synth.filter.set_params(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
         // self.synth.filter.set_cutoff(*ports.fil1_cutoff);
         // self.synth.filter.set_resonance(*ports.fil1_resonance);
         // self.synth.filter.b0 = *ports.fil1_mode;
