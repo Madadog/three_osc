@@ -300,7 +300,7 @@ impl PortList {
             ControlPort::new(
                 "resonance",
                 "Resonance",
-                Float(0.1, (0.01, 10.0)),
+                Float(0.1, (0.01, 50.0)),
             ),
             ControlPort::new(
                 "slope",

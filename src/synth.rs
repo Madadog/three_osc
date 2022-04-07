@@ -341,16 +341,16 @@ mod envelopes {
 /// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
 /// 
 pub struct TestFilter {
-    stage0: f32,
+    stage0: f32, // internal feedback storage
     stage1: f32,
-    // target_a1: f32,
     pub a0: f32, // gain compensation
     pub a1: f32, // [n-1] feedback
     pub a2: f32, // [n-2] feedback
     pub b0: f32, // [n] out
     pub b1: f32, // [n-1] out
     pub b2: f32, // [n-2] out
-    pub drive: f32,
+    target_a: (f32, f32, f32), // smoothing
+    target_b: (f32, f32, f32),
 }
 impl TestFilter {
     fn process(&mut self, input: f32) -> f32 {
@@ -363,9 +363,8 @@ impl TestFilter {
             self.stage1 = 0.0;
         }
 
-        // small parameter smoothing
-        // self.a1 = self.target_a1 + 0.01 * self.prev_a1;
-        // self.prev_a1 = self.a1;
+        // parameter smoothing
+        self.lerp_towards_target(0.005);
 
         let previous_previous_sample = self.stage1;
         let previous_sample = self.stage0;
@@ -400,75 +399,48 @@ impl TestFilter {
         self.a0 = 1.0 + a;
         self.a1 = -2.0 * cos;
         self.a2 = 1.0 - a;
+    }
+    pub fn set_params_target(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
+        // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
 
+        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)." 
+        
+        // [This notice should be placed within redistributed or derivative software code or text when appropriate. This particular formulation became active on May 13, 2015, and edited for clarity 7 April, 2021, superseding the 2002 version.]
+        // Audio Eq Cookbook: https://www.w3.org/TR/audio-eq-cookbook/
+        // Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute of Technology, European Research Consortium for Informatics and Mathematics, Keio University, Beihang). All Rights Reserved. This work is distributed under the W3C® Software and Document License [1] in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+        // [1] http://www.w3.org/Consortium/Legal/copyright-software
+
+        let phase_change = 2.0 * PI * cutoff / sample_rate;
+        let (sin, cos) = phase_change.sin_cos();
+        let a = sin / (2.0 * resonance);
+
+        self.target_b.0 = (1.0 - cos) / 2.0;
+        self.target_b.1 = 1.0 - cos;
+        self.target_b.2 = (1.0 - cos) / 2.0;
+
+        self.target_a.0 = 1.0 + a;
+        self.target_a.1 = -2.0 * cos;
+        self.target_a.2 = 1.0 - a;
+    }
+    pub fn lerp_towards_target(&mut self, amount: f32) {
+        self.b0 = lerp(self.b0, self.target_b.0, amount);
+        self.b1 = lerp(self.b1, self.target_b.1, amount);
+        self.b2 = lerp(self.b2, self.target_b.2, amount);
+
+        self.a0 = lerp(self.a0, self.target_a.0, amount);
+        self.a1 = lerp(self.a1, self.target_a.1, amount);
+        self.a2 = lerp(self.a2, self.target_a.2, amount);
     }
 }
 
 #[derive(Debug, Default)]
-/// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
+/// Filter in series
 pub struct CascadeFilter {
-    stage0_0: f32,
-    stage1_0: f32,
-    stage0_1: f32,
-    stage1_1: f32,
-    pub a1: f32, // cutoff
-    pub a2: f32, // resonance
-    pub b0: f32,
-    pub b1: f32,
-    pub b2: f32,
-    pub feedback: f32,
+    filter_1: TestFilter,
+    filter_2: TestFilter,
 }
 impl CascadeFilter {
-    fn process_single(&self, input: f32, stage0: &mut f32, stage1: &mut f32) -> f32 {
-        if !(stage0.is_finite() && stage1.is_finite()) {
-            println!("Warning: filters were unstable, {} and {}", stage0, stage1);
-            *stage0 = 0.0;
-            *stage1 = 0.0;
-        }
 
-        // small parameter smoothing
-        // self.a1 = self.target_a1 + 0.01 * self.prev_a1;
-        // self.prev_a1 = self.a1;
-
-        let previous_previous_sample = *stage1;
-        let previous_sample = *stage0;
-        let current_sample = input - self.a1 * *stage0 - self.a2 * *stage1;
-        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
-
-        // Propogate
-        *stage0 = current_sample;
-        *stage1 = previous_sample;
-
-        let gain_compensation = 1.0 + self.a2 + self.a1;
-
-        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample)
-            * gain_compensation
-    }
-    fn process(&mut self, input: f32) -> f32 {
-        let mut stage_0 = self.stage0_0;
-        let mut stage_1 = self.stage1_0;
-        let input = self.process_single(input, &mut stage_0, &mut stage_1);
-        self.stage0_0 = stage_0;
-        self.stage1_0 = stage_1;
-
-        let mut stage_0 = self.stage0_1;
-        let mut stage_1 = self.stage1_1;
-        let output = self.process_single(input, &mut stage_0, &mut stage_1);
-        self.stage0_1 = stage_0;
-        self.stage1_1 = stage_1;
-        self.stage0_0 += self.stage0_1 * self.feedback;
-        self.stage1_0 += self.stage1_1 * self.feedback;
-        output
-    }
-    pub fn set_resonance(&mut self, resonance: f32) {
-        let (min, max) = (-0.9999 + self.a1.abs(), 1.0);
-        self.a2 = lerp(min, max, resonance);
-    }
-    pub fn set_cutoff(&mut self, cutoff: f32) {
-        let (min, max) = (-1.99999999, 1.99999999);
-        // self.target_a1 = lerp(min, max, cutoff.powi(2));
-        self.a1 = lerp(min, max, cutoff.powi(2));
-    }
 }
 
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {

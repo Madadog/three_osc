@@ -50,13 +50,13 @@ pub struct URIDs {
 }
 
 #[uri("https://github.com/Madadog/three_osc")]
-struct Amp {
+struct SynthLv2 {
     synth: ThreeOsc,
     urids: URIDs,
 }
 
 // Every plugin struct implements the `Plugin` trait. This trait contains both the methods that are called by the hosting application and the collection types for the ports and the used host features. This plugin does not use additional host features and therefore, we set both feature collection types to `()`. Other plugins may define separate structs with their required and optional features and set it here.
-impl Plugin for Amp {
+impl Plugin for SynthLv2 {
     type Ports = Ports;
 
     type InitFeatures = Features<'static>;
@@ -105,7 +105,7 @@ impl Plugin for Amp {
         };
 
         // self.synth.filter.a2 = *ports.fil1_resonance;
-        self.synth.filter.set_params(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
+        self.synth.filter.set_params_target(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
         // self.synth.filter.set_cutoff(*ports.fil1_cutoff);
         // self.synth.filter.set_resonance(*ports.fil1_resonance);
         // self.synth.filter.b0 = *ports.fil1_mode;
@@ -164,4 +164,4 @@ impl Plugin for Amp {
     }
 }
 // The `lv2_descriptors` macro creates the entry point to the plugin library. It takes structs that implement `Plugin` and exposes them. The host will load the library and call a generated function to find all the plugins defined in the library.
-lv2_descriptors!(Amp);
+lv2_descriptors!(SynthLv2);
