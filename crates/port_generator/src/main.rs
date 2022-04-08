@@ -221,9 +221,14 @@ impl PortList {
                 Int(0, (0, 6)),
             ),
             ControlPort::new(
-                "mod",
-                "Mod",
-                Int(0, (0, 4)),
+                "pm",
+                "PM",
+                Float(0.0, (0.0, 20.0)),
+            ),
+            ControlPort::new(
+                "fm",
+                "FM",
+                Float(0.0, (0.0, 2.0)),
             ),
             ControlPort::new(
                 "voices",
@@ -300,7 +305,7 @@ impl PortList {
             ControlPort::new(
                 "cutoff",
                 "Cutoff",
-                Float(22050.0, (1.0, 22000.0)),
+                Float(22000.0, (1.0, 22000.0)),
             ),
             ControlPort::new(
                 "resonance",

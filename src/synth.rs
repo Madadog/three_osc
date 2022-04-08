@@ -20,6 +20,8 @@ pub struct ThreeOsc {
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 2],
     pub filter: TestFilter,
+    pub osc1_pm: f32,
+    pub osc1_fm: f32,
 }
 
 impl ThreeOsc {
@@ -31,6 +33,8 @@ impl ThreeOsc {
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
             filter: TestFilter::default(),
+            osc1_pm: 0.0,
+            osc1_fm: 0.0,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -63,9 +67,21 @@ impl ThreeOsc {
                 voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
                 let mut out = 0.0;
-                for (i, oscillator) in self.oscillators.iter().enumerate() {
-                    out += oscillator.unison(&mut voice.osc_voice[i], |x| oscillator.wave.generate(x));
+
+                let osc2_out = if let Some(osc) = self.oscillators.get(1) {
+                    let osc_out = osc.unison(&mut voice.osc_voice[1], |x| osc.wave.generate(x), 0.0, 0.0);
+                    out += osc_out * osc.amp;
+                    osc_out
+                } else {
+                    unreachable!("Osc2 wasn't found...");
+                };
+
+
+                if let Some(osc) = self.oscillators.get(0) {
+                    out += osc.unison(&mut voice.osc_voice[0], |x| osc.wave.generate(x),
+                    osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, ) * osc.amp;
                 }
+
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
                     out * self
@@ -196,11 +212,13 @@ pub mod oscillator {
     }
     impl BasicOscillator {
         fn pitch_mult_delta(&self, delta: f32) -> f32 {
-            // delta * 2.0_f32.powi(self.octave) * 2.0_f32.powf(self.semitone / 12.0)
             delta * 2.0_f32.powf(self.semitone / 12.0 + self.octave as f32) * self.multiplier
         }
-        pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut SuperVoice, wave: T) -> f32 {
-            voices.add_phase(self.pitch_mult_delta(voices.delta), self.voice_count.into(), self.voices_detune);
+        fn pitch_mult_delta_fm(&self, delta: f32, fm: f32) -> f32 {
+            delta * 2.0_f32.powf((self.semitone / 12.0 + self.octave as f32) * fm) * self.multiplier
+        }
+        pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut SuperVoice, wave: T, pm: f32, fm: f32) -> f32 {
+            voices.add_phase(self.pitch_mult_delta((voices.delta) * (1.0 + pm) + fm), self.voice_count.into(), self.voices_detune);
             voices
                 .voice_phases
                 .iter_mut()
@@ -210,7 +228,6 @@ pub mod oscillator {
                     wave(*phase)
                 })
                 .sum::<f32>()
-                * self.amp
                 / self.voice_count as f32
         }
     }

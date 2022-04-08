@@ -18,7 +18,8 @@ struct Ports {
     osc1_octave: InputPort<Control>,
     osc1_multiplier: InputPort<Control>,
     osc1_wave: InputPort<Control>,
-    osc1_mod: InputPort<Control>,
+    osc1_pm: InputPort<Control>,
+    osc1_fm: InputPort<Control>,
     osc1_voices: InputPort<Control>,
     osc1_super_detune: InputPort<Control>,
     osc1_phase: InputPort<Control>,
@@ -28,7 +29,8 @@ struct Ports {
     osc2_octave: InputPort<Control>,
     osc2_multiplier: InputPort<Control>,
     osc2_wave: InputPort<Control>,
-    osc2_mod: InputPort<Control>,
+    osc2_pm: InputPort<Control>,
+    osc2_fm: InputPort<Control>,
     osc2_voices: InputPort<Control>,
     osc2_super_detune: InputPort<Control>,
     osc2_phase: InputPort<Control>,
@@ -125,6 +127,8 @@ impl Plugin for SynthLv2 {
                 x if x < 7.0 => OscWave::PulseEighth,
                 _ => OscWave::Sine,
             };
+            self.synth.osc1_pm = *ports.osc1_pm;
+            self.synth.osc1_fm = *ports.osc1_fm;
     
             // osc2
             self.synth.oscillators[1].amp = *ports.osc2_amp / 100.0;
@@ -149,7 +153,7 @@ impl Plugin for SynthLv2 {
                 x if x < 7.0 => OscWave::PulseEighth,
                 _ => OscWave::Sine,
             };
-            
+
         }
 
         // self.synth.filter.a2 = *ports.fil1_resonance;
