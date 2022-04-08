@@ -23,6 +23,16 @@ struct Ports {
     osc1_super_detune: InputPort<Control>,
     osc1_phase: InputPort<Control>,
     osc1_phase_rand: InputPort<Control>,
+    osc2_amp: InputPort<Control>,
+    osc2_semitone: InputPort<Control>,
+    osc2_octave: InputPort<Control>,
+    osc2_multiplier: InputPort<Control>,
+    osc2_wave: InputPort<Control>,
+    osc2_mod: InputPort<Control>,
+    osc2_voices: InputPort<Control>,
+    osc2_super_detune: InputPort<Control>,
+    osc2_phase: InputPort<Control>,
+    osc2_phase_rand: InputPort<Control>,
     fil1_mode: InputPort<Control>,
     fil1_cutoff: InputPort<Control>,
     fil1_resonance: InputPort<Control>,
@@ -89,28 +99,58 @@ impl Plugin for SynthLv2 {
         self.synth.gain_envelope.slope = 2.0_f32.powf(*ports.vol_slope);
         //self.synth.gain_envelope.limits();
 
-        self.synth.oscillators[0].amp = *ports.osc1_amp / 100.0;
-        self.synth.oscillators[0].semitone = *ports.osc1_semitone + *ports.global_pitch;
-        self.synth.oscillators[0].octave = *ports.osc1_octave as i32;
-        self.synth.oscillators[0].multiplier = if ports.osc1_multiplier.is_sign_positive() {
-            1.0 + *ports.osc1_multiplier
-        } else {
-            1.0 / (1.0 - *ports.osc1_multiplier)
-        };
-        self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
-        self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
-        self.synth.oscillators[0].phase = *ports.osc1_phase;
-        self.synth.oscillators[0].phase_rand = *ports.osc1_phase_rand;
-        self.synth.oscillators[0].wave = match *ports.osc1_wave {
-            x if x < 1.0 => OscWave::Sine,
-            x if x < 2.0 => OscWave::Tri,
-            x if x < 3.0 => OscWave::Saw,
-            x if x < 4.0 => OscWave::Exp,
-            x if x < 5.0 => OscWave::Square,
-            x if x < 6.0 => OscWave::PulseQuarter,
-            x if x < 7.0 => OscWave::PulseEighth,
-            _ => OscWave::Sine,
-        };
+        // apply oscillator ports
+        // ... TODO: write a macro for all this
+        {
+            // osc1
+            self.synth.oscillators[0].amp = *ports.osc1_amp / 100.0;
+            self.synth.oscillators[0].semitone = *ports.osc1_semitone + *ports.global_pitch;
+            self.synth.oscillators[0].octave = *ports.osc1_octave as i32;
+            self.synth.oscillators[0].multiplier = if ports.osc1_multiplier.is_sign_positive() {
+                1.0 + *ports.osc1_multiplier
+            } else {
+                1.0 / (1.0 - *ports.osc1_multiplier)
+            };
+            self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
+            self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
+            self.synth.oscillators[0].phase = *ports.osc1_phase;
+            self.synth.oscillators[0].phase_rand = *ports.osc1_phase_rand;
+            self.synth.oscillators[0].wave = match *ports.osc1_wave {
+                x if x < 1.0 => OscWave::Sine,
+                x if x < 2.0 => OscWave::Tri,
+                x if x < 3.0 => OscWave::Saw,
+                x if x < 4.0 => OscWave::Exp,
+                x if x < 5.0 => OscWave::Square,
+                x if x < 6.0 => OscWave::PulseQuarter,
+                x if x < 7.0 => OscWave::PulseEighth,
+                _ => OscWave::Sine,
+            };
+    
+            // osc2
+            self.synth.oscillators[1].amp = *ports.osc2_amp / 100.0;
+            self.synth.oscillators[1].semitone = *ports.osc2_semitone + *ports.global_pitch;
+            self.synth.oscillators[1].octave = *ports.osc2_octave as i32;
+            self.synth.oscillators[1].multiplier = if ports.osc2_multiplier.is_sign_positive() {
+                1.0 + *ports.osc2_multiplier
+            } else {
+                1.0 / (1.0 - *ports.osc2_multiplier)
+            };
+            self.synth.oscillators[1].voice_count = *ports.osc2_voices as u8;
+            self.synth.oscillators[1].voices_detune = *ports.osc2_super_detune / 100.0;
+            self.synth.oscillators[1].phase = *ports.osc2_phase;
+            self.synth.oscillators[1].phase_rand = *ports.osc2_phase_rand;
+            self.synth.oscillators[1].wave = match *ports.osc2_wave {
+                x if x < 1.0 => OscWave::Sine,
+                x if x < 2.0 => OscWave::Tri,
+                x if x < 3.0 => OscWave::Saw,
+                x if x < 4.0 => OscWave::Exp,
+                x if x < 5.0 => OscWave::Square,
+                x if x < 6.0 => OscWave::PulseQuarter,
+                x if x < 7.0 => OscWave::PulseEighth,
+                _ => OscWave::Sine,
+            };
+            
+        }
 
         // self.synth.filter.a2 = *ports.fil1_resonance;
         self.synth.filter.set_params(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);

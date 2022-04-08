@@ -62,8 +62,7 @@ fn main() {
 
     // format oscillator duplicates
     let mut oscillators = Vec::new();
-
-    for i in 1..=1 {
+    for i in 1..=2 {
         oscillators.push(PortList::oscillator().prefix(&format!("osc{i}_"), &format!("Osc{i} ")))
     }
     

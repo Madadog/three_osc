@@ -18,7 +18,7 @@ pub struct ThreeOsc {
     pub gain_envelope: AdsrEnvelope,
     pub sample_rate: f64,
     pub output_volume: f32,
-    pub oscillators: [BasicOscillator; 1],
+    pub oscillators: [BasicOscillator; 2],
     pub filter: TestFilter,
 }
 
@@ -29,7 +29,7 @@ impl ThreeOsc {
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
             sample_rate,
             output_volume: 0.3,
-            oscillators: [BasicOscillator::default()],
+            oscillators: [BasicOscillator::default(), BasicOscillator::default()],
             filter: TestFilter::default(),
         }
     }
@@ -63,8 +63,8 @@ impl ThreeOsc {
                 voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
                 let mut out = 0.0;
-                for oscillator in self.oscillators.iter() {
-                    out += oscillator.unison(&mut voice.osc_voice, |x| oscillator.wave.generate(x));
+                for (i, oscillator) in self.oscillators.iter().enumerate() {
+                    out += oscillator.unison(&mut voice.osc_voice[i], |x| oscillator.wave.generate(x));
                 }
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
@@ -88,14 +88,19 @@ pub struct Voice {
     id: u32,
     runtime: u32,
     release_time: Option<u32>,
-    osc_voice: SuperVoice,
+    osc_voice: [SuperVoice; 2],
 }
 impl Voice {
     pub fn from_midi_note(index: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
-        let mut osc_voice = SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
+        let mut osc_voice = [SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
             osc[0].phase,
             osc[0].phase_rand,
-        );
+        ),
+        SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
+            osc[1].phase,
+            osc[1].phase_rand,
+        ),
+        ];
  
         Self {
             id: index.into(),
@@ -145,6 +150,8 @@ pub mod oscillator {
             self.phase
         }
     }
+
+    #[derive(Debug, Clone)]
     pub struct SuperVoice {
         pub voice_phases: [f32; 128],
         pub delta: f32,
@@ -175,6 +182,7 @@ pub mod oscillator {
         }
     }
 
+    #[derive(Debug, Clone)]
     pub struct BasicOscillator {
         pub amp: f32,
         pub semitone: f32,
@@ -221,6 +229,8 @@ pub mod oscillator {
             }
         }
     }
+
+    #[derive(Debug, Clone)]
     pub enum OscWave {
         Sine,
         Tri,
