@@ -243,7 +243,7 @@ pub mod oscillator {
                     }
                 }
                 Saw => (phase - PI) / (2.0 * PI),
-                Exp => phase.sin().abs() - 0.55,
+                Exp => phase.sin().abs() - (0.5 + 0.5 / PI),
                 Square => {
                     if phase <= PI {
                         FRAC_1_SQRT_2
