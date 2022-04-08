@@ -178,7 +178,8 @@ pub mod oscillator {
     pub struct BasicOscillator {
         pub amp: f32,
         pub semitone: f32,
-        pub exponent: i32,
+        pub octave: i32,
+        pub multiplier: f32,
         pub voice_count: u8,
         pub voices_detune: f32,
         pub wave: OscWave,
@@ -186,11 +187,12 @@ pub mod oscillator {
         pub phase_rand: f32,
     }
     impl BasicOscillator {
-        fn mult_delta(&self, delta: f32) -> f32 {
-            delta * 2.0_f32.powi(self.exponent) * 2.0_f32.powf(self.semitone / 12.0)
+        fn pitch_mult_delta(&self, delta: f32) -> f32 {
+            // delta * 2.0_f32.powi(self.octave) * 2.0_f32.powf(self.semitone / 12.0)
+            delta * 2.0_f32.powf(self.semitone / 12.0 + self.octave as f32) * self.multiplier
         }
         pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut SuperVoice, wave: T) -> f32 {
-            voices.add_phase(self.mult_delta(voices.delta), self.voice_count.into(), self.voices_detune);
+            voices.add_phase(self.pitch_mult_delta(voices.delta), self.voice_count.into(), self.voices_detune);
             voices
                 .voice_phases
                 .iter_mut()
@@ -209,7 +211,8 @@ pub mod oscillator {
             Self {
                 amp: 1.0,
                 semitone: Default::default(),
-                exponent: Default::default(),
+                octave: Default::default(),
+                multiplier: 1.0,
                 voice_count: 1,
                 voices_detune: 0.1,
                 wave: OscWave::Sine,

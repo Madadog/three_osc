@@ -207,9 +207,14 @@ impl PortList {
                 Float(0.0, (-24.0, 24.0)),
             ),
             ControlPort::new(
-                "exponent",
-                "Freq. Exponent",
-                Int(0, (-16, 16)),
+                "octave",
+                "Octave",
+                Int(0, (-8, 8)),
+            ),
+            ControlPort::new(
+                "multiplier",
+                "Freq. Mult",
+                Int(0, (-64, 64)),
             ),
             ControlPort::new(
                 "wave",

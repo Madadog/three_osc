@@ -15,7 +15,8 @@ struct Ports {
     out_r: OutputPort<Audio>,
     osc1_amp: InputPort<Control>,
     osc1_semitone: InputPort<Control>,
-    osc1_exponent: InputPort<Control>,
+    osc1_octave: InputPort<Control>,
+    osc1_multiplier: InputPort<Control>,
     osc1_wave: InputPort<Control>,
     osc1_mod: InputPort<Control>,
     osc1_voices: InputPort<Control>,
@@ -90,7 +91,12 @@ impl Plugin for SynthLv2 {
 
         self.synth.oscillators[0].amp = *ports.osc1_amp / 100.0;
         self.synth.oscillators[0].semitone = *ports.osc1_semitone + *ports.global_pitch;
-        self.synth.oscillators[0].exponent = *ports.osc1_exponent as i32;
+        self.synth.oscillators[0].octave = *ports.osc1_octave as i32;
+        self.synth.oscillators[0].multiplier = if ports.osc1_multiplier.is_sign_positive() {
+            1.0 + *ports.osc1_multiplier
+        } else {
+            1.0 / (1.0 - *ports.osc1_multiplier)
+        };
         self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
         self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
         self.synth.oscillators[0].phase = *ports.osc1_phase;
