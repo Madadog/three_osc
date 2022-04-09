@@ -50,6 +50,7 @@ struct Ports {
     vol_slope: InputPort<Control>,
     output_gain: InputPort<Control>,
     global_pitch: InputPort<Control>,
+    bend_range: InputPort<Control>,
 }
 
 #[derive(FeatureCollection)]
@@ -92,6 +93,7 @@ impl Plugin for SynthLv2 {
         } else {
             0.0
         };
+        self.synth.bend_range = *ports.bend_range;
 
         // adjust master gain envelope
         self.synth.gain_envelope.attack_time = *ports.vol_attack;
@@ -201,7 +203,10 @@ impl Plugin for SynthLv2 {
                 },
                 MidiMessage::ProgramChange(_, program) => {
 
-                }
+                },
+                MidiMessage::PitchBendChange(_, bend) => {
+                    self.synth.pitch_bend(bend.into());
+                },
                 _ => (),
             }
         }

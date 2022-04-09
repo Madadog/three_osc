@@ -39,4 +39,5 @@ struct Ports {
     vol_slope: InputPort<Control>,
     output_gain: InputPort<Control>,
     global_pitch: InputPort<Control>,
+    bend_range: InputPort<Control>,
 }

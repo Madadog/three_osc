@@ -228,7 +228,7 @@ impl PortList {
             ControlPort::new(
                 "fm",
                 "FM",
-                Float(0.0, (0.0, 2.0)),
+                Float(0.0, (0.0, 20.0)),
             ),
             ControlPort::new(
                 "voices",
@@ -262,6 +262,11 @@ impl PortList {
             ControlPort::new(
                 "global_pitch",
                 "Master Pitch",
+                Int(0, (-24, 24)),
+            ),
+            ControlPort::new(
+                "bend_range",
+                "Bend Range",
                 Int(0, (-24, 24)),
             ),
         ])

@@ -22,6 +22,7 @@ pub struct ThreeOsc {
     pub filter: TestFilter,
     pub osc1_pm: f32,
     pub osc1_fm: f32,
+    pub bend_range: f32,
 }
 
 impl ThreeOsc {
@@ -35,11 +36,12 @@ impl ThreeOsc {
             filter: TestFilter::default(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
+            bend_range: 2.0,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
         self.voices
-            .push(Voice::from_midi_note(note, self.sample_rate as f32, &self.oscillators))
+            .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
     }
     pub fn note_off(&mut self, note: u8, velocity: u8) {
         self.voices
@@ -67,10 +69,11 @@ impl ThreeOsc {
                 voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
                 let mut out = 0.0;
+                let velocity = voice.velocity as f32 / 128.0;
 
                 let osc2_out = if let Some(osc) = self.oscillators.get(1) {
                     let osc_out = osc.unison(&mut voice.osc_voice[1], |x| osc.wave.generate(x), 0.0, 0.0);
-                    out += osc_out * osc.amp;
+                    out += osc_out * osc.amp * velocity;
                     osc_out
                 } else {
                     unreachable!("Osc2 wasn't found...");
@@ -79,7 +82,7 @@ impl ThreeOsc {
 
                 if let Some(osc) = self.oscillators.get(0) {
                     out += osc.unison(&mut voice.osc_voice[0], |x| osc.wave.generate(x),
-                    osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, ) * osc.amp;
+                    osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, ) * osc.amp * velocity;
                 }
 
                 out = if let Some(release_time) = voice.release_time {
@@ -97,6 +100,12 @@ impl ThreeOsc {
             *out_r = *out_l;
         })
     }
+    pub fn pitch_bend(&mut self, bend: u16) {
+        let bend = (bend as i32 - 8192) as f32 / 8192.0 * self.bend_range;
+        for osc in self.oscillators.iter_mut() {
+            osc.pitch_bend = bend;
+        }
+    }
 }
 
 /// An individual note press.
@@ -105,9 +114,11 @@ pub struct Voice {
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 2],
+    velocity: u8,
 }
 impl Voice {
-    pub fn from_midi_note(index: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
+    pub fn from_midi_note(index: u8, velocity: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
+        // w = (2pi*f) / sample_rate
         let mut osc_voice = [SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
             osc[0].phase,
             osc[0].phase_rand,
@@ -123,6 +134,7 @@ impl Voice {
             runtime: 0,
             release_time: None,
             osc_voice,
+            velocity,
         }
     }
     pub fn release(&mut self) {
@@ -209,16 +221,16 @@ pub mod oscillator {
         pub wave: OscWave,
         pub phase: f32,
         pub phase_rand: f32,
+        pub pitch_bend: f32,
     }
     impl BasicOscillator {
         fn pitch_mult_delta(&self, delta: f32) -> f32 {
-            delta * 2.0_f32.powf(self.semitone / 12.0 + self.octave as f32) * self.multiplier
-        }
-        fn pitch_mult_delta_fm(&self, delta: f32, fm: f32) -> f32 {
-            delta * 2.0_f32.powf((self.semitone / 12.0 + self.octave as f32) * fm) * self.multiplier
+            delta * 2.0_f32.powf((self.semitone + self.pitch_bend) / 12.0 + self.octave as f32) * self.multiplier
         }
         pub fn unison<T: Fn(f32) -> f32>(&self, voices: &mut SuperVoice, wave: T, pm: f32, fm: f32) -> f32 {
-            voices.add_phase(self.pitch_mult_delta((voices.delta) * (1.0 + pm) + fm), self.voice_count.into(), self.voices_detune);
+            let constant = 7018.73299; // sample_rate / 2pi
+            let delta = ((voices.delta) * (1.0 + pm) * constant + fm * 100.0) / constant;
+            voices.add_phase(self.pitch_mult_delta(delta), self.voice_count.into(), self.voices_detune);
             voices
                 .voice_phases
                 .iter_mut()
@@ -243,6 +255,7 @@ pub mod oscillator {
                 wave: OscWave::Sine,
                 phase: 0.0,
                 phase_rand: PI * 2.0,
+                pitch_bend: 0.0,
             }
         }
     }
@@ -424,6 +437,7 @@ impl Filter for TestFilter {
         self.b1 = 1.0 - cos;
         self.b2 = (1.0 - cos) / 2.0;
 
+        // self.a0 = 1.0 + a;
         self.a0 = 1.0 + a;
         self.a1 = -2.0 * cos;
         self.a2 = 1.0 - a;
