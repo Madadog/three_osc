@@ -312,6 +312,69 @@ pub mod oscillator {
     pub fn naive_saw(phase: f32) -> f32 {
         (phase - PI) / (2.0 * PI)
     }
+
+    pub struct SimpleSin {
+        // sin(a+b) = sin(a)cos(b) + sin(b)cos(a)
+        // cos(a+b) = cos(a)cos(b) - sin(a)sin(b)
+        // sin(t+dt) = sin(t)cos(dt) + sin(dt)cos(t)
+        // cos(t+dt) = cos(t)cos(dt) - sin(t)sin(dt)
+        sin_dt: f32,
+        cos_dt: f32,
+        sin: f32,
+        cos: f32,
+    }
+    impl SimpleSin {
+        pub fn new(phase: f32, delta: f32) -> Self {
+            let (sin_dt, cos_dt) = delta.sin_cos();
+            let (sin, cos) = phase.sin_cos();
+            Self {
+                sin_dt,
+                cos_dt,
+                sin,
+                cos,
+            }
+        }
+        #[inline]
+        pub fn next(&mut self) -> (f32, f32) {
+            self.sin = self.sin * self.cos_dt + self.sin_dt * self.cos;
+            self.cos = self.cos * self.cos_dt - self.sin * self.sin_dt;
+            (self.sin, self.cos)
+        }
+        pub fn set_delta(&mut self, delta: f32) {
+            let (sin_dt, cos_dt) = delta.sin_cos();
+            *self = Self {
+                sin_dt,
+                cos_dt,
+                ..*self
+            }
+        }
+        pub fn set_phase(&mut self, phase: f32) {
+            let (sin, cos) = phase.sin_cos();
+            *self = Self {
+                sin,
+                cos,
+                ..*self
+            }
+        }
+        pub fn sin(&self) -> f32 { self.sin }
+        pub fn cos(&self) -> f32 { self.cos }
+    }
+
+    mod tests {
+        use super::SimpleSin;
+
+        #[test]
+        fn test_simple_sin() {
+            let mut simple_sin = SimpleSin::new(0.0, 0.1);
+            for _ in 0..10 {
+                simple_sin.next();
+            }
+            println!("{}, {}", simple_sin.sin(), 1.0_f32.sin());
+            println!("{}, {}", simple_sin.cos(), 1.0_f32.cos());
+            assert!((simple_sin.sin() - 1.0_f32.sin()).abs() <= 0.1);
+            assert!((simple_sin.cos() - 1.0_f32.cos()).abs() <= 0.1);
+        }
+    }
 }
 
 mod envelopes {
