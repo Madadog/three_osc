@@ -273,6 +273,7 @@ pub mod oscillator {
     impl OscWave {
         pub fn generate(&self, phase: f32) -> f32 {
             use OscWave::*;
+            let phase = phase % 2.0*PI; // TODO: eliminate the need for this
             match self {
                 Sine => phase.sin(),
                 Tri => {
@@ -468,30 +469,35 @@ pub trait Filter {
 #[derive(Debug)]
 /// Filter in series
 pub struct FilterController {
-    filter: TestFilter,
     cutoff_envelope: AdsrEnvelope,
     envelope_amount: f32,
     cutoff: f32,
     resonance: f32,
 }
 impl FilterController {
-    pub fn process(&mut self, input: f32) -> f32 {
-        self.filter.process(input)
-    }
-    pub fn process_with_envelope_held(&mut self, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
-        self.filter.set_params(sample_rate,
+    pub fn process_envelope_held(&mut self, filter: &mut TestFilter, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
+        filter.set_params(sample_rate,
             (self.cutoff + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
             self.resonance
         );
-        let out = self.filter.process(input);
-        self.filter.set_params(sample_rate, self.cutoff, self.resonance);
+        let out = filter.process(input);
+        filter.set_params(sample_rate, self.cutoff, self.resonance);
+        out
+    }
+    pub fn process_envelope_released(&mut self, filter: &mut TestFilter, input: f32, envelope_index: f32, release_index: f32, sample_rate: f32) -> f32 {
+        filter.set_params(sample_rate,
+            (self.cutoff + self.cutoff_envelope.sample_released(release_index, envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
+            self.resonance
+        );
+        let out = filter.process(input);
+        filter.set_params(sample_rate, self.cutoff, self.resonance);
         out
     }
     
-    pub fn lerp_controls(&mut self, sample_rate: f32, target_cutoff: f32, target_resonance: f32) {
+    pub fn lerp_controls(&mut self, filter: &mut TestFilter, sample_rate: f32, target_cutoff: f32, target_resonance: f32) {
         self.cutoff = lerp(self.cutoff, target_cutoff, 500.0 / sample_rate);
         self.resonance = lerp(self.cutoff, target_resonance, 500.0 / sample_rate);
-        self.filter.set_params(sample_rate, self.cutoff, self.resonance);
+        filter.set_params(sample_rate, self.cutoff, self.resonance);
     }
 }
 
