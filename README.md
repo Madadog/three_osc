@@ -8,8 +8,20 @@ An LV2 clone of LMMS's default synth (Triple Oscillator).
 * Unlimited polyphony
 * ADSR envelopes with adjustable slopes
 * Sine, triangle, exponential, saw, and pulse (50%, 25%, 12.5%) waves
-* Alias-free synthesis (todo)
+* Alias-free wave generation (todo)
 * Detunable super with (up to) 128 voices for each oscillator
+* Integer frequency division/multiplication for each oscillator for harmonic sound effects
+
+## Differences from Triple Oscillator
+* Doesn't hard clip when you play more than 1 note
+* Phase randomisation
+* Oscillator super
+* Adjustable envelope slope
+* Alias-free wave generation (todo)
+* More control over oscillator pitch
+* Less waves (for now)
+* Less filters (probably forever)
+* No arpeggiator/chord generator
 
 ## Sound Demo
 Forthcoming.
@@ -27,6 +39,7 @@ Forthcoming.
 * Readjust super detune control to reasonable values
 * Envelope declicking
 * Fix strange PM/FM bug with naive wave generators
+* Make the build system nicer
 * Delete LV2, switch to VST and add gui with egui
 
 ## LICENSE
