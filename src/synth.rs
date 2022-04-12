@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::f32::consts::PI;
+use std::f64::consts::PI as PI64;
 use std::hash::Hash;
 use std::hash::Hasher;
 
@@ -362,7 +363,7 @@ pub mod oscillator {
         }
         #[inline]
         pub fn next(&mut self) -> (f32, f32) {
-            self.sin = self.sin * self.cos_dt + self.sin_dt * self.cos;
+            self.sin = self.sin * self.cos_dt + self.cos * self.sin_dt;
             self.cos = self.cos * self.cos_dt - self.sin * self.sin_dt;
             (self.sin, self.cos)
         }
