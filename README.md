@@ -28,3 +28,6 @@ Forthcoming.
 * Envelope declicking
 * Fix strange PM/FM bug with naive wave generators
 * Delete LV2, switch to VST and add gui with egui
+
+## LICENSE
+The Three Osc project is licensed under the GPLv3.0.
