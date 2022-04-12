@@ -1,3 +1,10 @@
+This applies ONLY to the filter coefficient calculation equations in synth.rs. In order to use information provided by W3C (i.e. the RBJ audio filter cookbook),
+you need to put all the required notices and comments.
+
+The THREE_OSC project is unaffiliated with W3C.
+
+--------
+
 W3C Software and Document Notice and License
 
 Status: This license takes effect 13 May, 2015.
