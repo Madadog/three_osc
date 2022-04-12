@@ -78,7 +78,7 @@ fn main() {
 
     // filter controls
     let mut filter_controls = PortList::filter().prefix("fil1_", "Filter 1 ");
-    let mut filter_envelope = PortList::envelope().prefix("fil1_", "Filter 1 ");
+    let mut filter_envelope = PortList::filter_envelope().prefix("fil1_", "Filter 1 ");
     for control in filter_controls.0.iter().chain(filter_envelope.0.iter()) {
         ttl.push_str(ttl_divider);
         ttl.push_str(&control.to_ttl(ttl_index));
@@ -273,6 +273,45 @@ impl PortList {
     }
     fn envelope() -> PortList {
         Self(vec![
+            ControlPort::new(
+                "attack",
+                "Attack",
+                Float(0.001, (0.0, 15.0)),
+            ),
+            ControlPort::new(
+                "decay",
+                "Decay",
+                Float(0.25, (0.0, 15.0)),
+            ),
+            ControlPort::new(
+                "sustain",
+                "Sustain",
+                Float(1.0, (0.0, 1.0)),
+            ),
+            ControlPort::new(
+                "release",
+                "Release",
+                Float(0.005, (0.001, 15.0)),
+            ),
+            ControlPort::new(
+                "slope",
+                "Slope",
+                Float(0.0, (-3.0, 8.0)),
+            ),
+        ])
+    }
+    fn filter_envelope() -> PortList {
+        Self(vec![
+            ControlPort::new(
+                "keytrack",
+                "Keytrack",
+                Float(0.0, (0.0, 1.0)),
+            ),
+            ControlPort::new(
+                "env_amount",
+                "Env. Amount",
+                Float(0.0, (0.0, 1.0)),
+            ),
             ControlPort::new(
                 "attack",
                 "Attack",

@@ -38,6 +38,8 @@ struct Ports {
     fil1_mode: InputPort<Control>,
     fil1_cutoff: InputPort<Control>,
     fil1_resonance: InputPort<Control>,
+    fil1_keytrack: InputPort<Control>,
+    fil1_env_amount: InputPort<Control>,
     fil1_attack: InputPort<Control>,
     fil1_decay: InputPort<Control>,
     fil1_sustain: InputPort<Control>,
@@ -101,6 +103,17 @@ impl Plugin for SynthLv2 {
         self.synth.gain_envelope.sustain_level = *ports.vol_sustain;
         self.synth.gain_envelope.release_time = *ports.vol_release;
         self.synth.gain_envelope.slope = 2.0_f32.powf(*ports.vol_slope);
+
+        self.synth.filter_controller.envelope_amount = *ports.fil1_env_amount * 22000.0;
+        self.synth.filter_controller.keytrack = *ports.fil1_keytrack;
+        self.synth.filter_controller.cutoff_envelope.attack_time = *ports.fil1_attack;
+        self.synth.filter_controller.cutoff_envelope.decay_time = *ports.fil1_decay;
+        self.synth.filter_controller.cutoff_envelope.sustain_level = *ports.fil1_sustain;
+        self.synth.filter_controller.cutoff_envelope.release_time = *ports.fil1_release;
+        self.synth.filter_controller.cutoff_envelope.slope = 2.0_f32.powf(*ports.fil1_slope);
+        self.synth.filter_controller.cutoff = *ports.fil1_cutoff;
+        self.synth.filter_controller.resonance = *ports.fil1_resonance;
+
         //self.synth.gain_envelope.limits();
 
         // apply oscillator ports
@@ -159,7 +172,7 @@ impl Plugin for SynthLv2 {
         }
 
         // self.synth.filter.a2 = *ports.fil1_resonance;
-        self.synth.filter.set_params(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
+        // self.synth.filter.set_params(self.synth.sample_rate as f32, *ports.fil1_cutoff, *ports.fil1_resonance);
         // self.synth.filter.set_cutoff(*ports.fil1_cutoff);
         // self.synth.filter.set_resonance(*ports.fil1_resonance);
         // self.synth.filter.b0 = *ports.fil1_mode;

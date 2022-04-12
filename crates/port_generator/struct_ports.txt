@@ -27,6 +27,8 @@ struct Ports {
     fil1_mode: InputPort<Control>,
     fil1_cutoff: InputPort<Control>,
     fil1_resonance: InputPort<Control>,
+    fil1_keytrack: InputPort<Control>,
+    fil1_env_amount: InputPort<Control>,
     fil1_attack: InputPort<Control>,
     fil1_decay: InputPort<Control>,
     fil1_sustain: InputPort<Control>,

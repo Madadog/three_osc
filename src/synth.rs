@@ -16,6 +16,7 @@ const DEFAULT_SRATE: f32 = 44100.0;
 pub struct ThreeOsc {
     pub voices: Vec<Voice>,
     pub gain_envelope: AdsrEnvelope,
+    pub filter_controller: FilterController,
     pub sample_rate: f64,
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 2],
@@ -28,8 +29,9 @@ pub struct ThreeOsc {
 impl ThreeOsc {
     pub fn new(sample_rate: f64) -> Self {
         Self {
-            voices: Vec::with_capacity(32),
+            voices: Vec::with_capacity(64),
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
+            filter_controller: FilterController::new(),
             sample_rate,
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
@@ -85,6 +87,7 @@ impl ThreeOsc {
                     osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, ) * osc.amp * velocity;
                 }
 
+                // amplitude envelope
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
                     out * self
@@ -93,10 +96,26 @@ impl ThreeOsc {
                 } else {
                     out * self.gain_envelope.sample_held(envelope_index)
                 };
+
+                let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
+
+                if voice_freq > 10000.0 {
+                    panic!("something went very wrong (keytrack freq: {}, voice id: {}, sample rate: {}, keytrack: {}, 2.0_f32.powf(voice.id as f32 - 69.0 / 12.0): {}, voice.id as f32 = {})", voice_freq, voice.id, self.sample_rate, self.filter_controller.keytrack, 2.0_f32.powf(voice.id as f32 - 69.0 / 12.0), voice.id as f32);
+                }
+
+                // filter envelope
+                out = if let Some(release_time) = voice.release_time {
+                    let release_index = release_time as f32 / self.sample_rate as f32;
+                    self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
+                } else {
+                    self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
+                };
+
                 *out_l += out;
                 *out_r += out;
             }
-            *out_l = self.filter.process(*out_l) * self.output_volume;
+            // *out_l = self.filter.process(*out_l) * self.output_volume;
+            *out_l = *out_l * self.output_volume;
             *out_r = *out_l;
         })
     }
@@ -114,6 +133,7 @@ pub struct Voice {
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 2],
+    filter: TestFilter,
     velocity: u8,
 }
 impl Voice {
@@ -135,6 +155,7 @@ impl Voice {
             release_time: None,
             osc_voice,
             velocity,
+            filter: TestFilter::default(),
         }
     }
     pub fn release(&mut self) {
@@ -273,7 +294,6 @@ pub mod oscillator {
     impl OscWave {
         pub fn generate(&self, phase: f32) -> f32 {
             use OscWave::*;
-            let phase = phase % 2.0*PI; // TODO: eliminate the need for this
             match self {
                 Sine => phase.sin(),
                 Tri => {
@@ -532,24 +552,34 @@ pub trait Filter {
 #[derive(Debug)]
 /// Filter in series
 pub struct FilterController {
-    cutoff_envelope: AdsrEnvelope,
-    envelope_amount: f32,
-    cutoff: f32,
-    resonance: f32,
+    pub cutoff_envelope: AdsrEnvelope,
+    pub envelope_amount: f32,
+    pub cutoff: f32,
+    pub resonance: f32,
+    pub keytrack: f32,
 }
 impl FilterController {
-    pub fn process_envelope_held(&mut self, filter: &mut TestFilter, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
+    pub fn new() -> Self {
+        Self {
+            cutoff_envelope: AdsrEnvelope::new(0.0, 0.0, 0.0, 1.0, 1.0),
+            envelope_amount: 0.0,
+            cutoff: 100.0,
+            resonance: 0.1,
+            keytrack: 0.0,
+        }
+    }
+    pub fn process_envelope_held(&mut self, filter: &mut TestFilter, keytrack_freq: f32, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
         filter.set_params(sample_rate,
-            (self.cutoff + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
+            (self.cutoff + keytrack_freq + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
             self.resonance
         );
         let out = filter.process(input);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
         out
     }
-    pub fn process_envelope_released(&mut self, filter: &mut TestFilter, input: f32, envelope_index: f32, release_index: f32, sample_rate: f32) -> f32 {
+    pub fn process_envelope_released(&mut self, filter: &mut TestFilter, keytrack_freq: f32, input: f32, envelope_index: f32, release_index: f32, sample_rate: f32) -> f32 {
         filter.set_params(sample_rate,
-            (self.cutoff + self.cutoff_envelope.sample_released(release_index, envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
+            (self.cutoff + keytrack_freq + self.cutoff_envelope.sample_released(release_index, envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
             self.resonance
         );
         let out = filter.process(input);
