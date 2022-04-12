@@ -129,7 +129,7 @@ impl Plugin for SynthLv2 {
                 1.0 / (1.0 - *ports.osc1_multiplier)
             };
             self.synth.oscillators[0].voice_count = *ports.osc1_voices as u8;
-            self.synth.oscillators[0].voices_detune = *ports.osc1_super_detune / 100.0;
+            self.synth.oscillators[0].voices_detune = (*ports.osc1_super_detune / 100.0).powi(3);
             self.synth.oscillators[0].phase = *ports.osc1_phase;
             self.synth.oscillators[0].phase_rand = *ports.osc1_phase_rand;
             self.synth.oscillators[0].wave = match *ports.osc1_wave {
@@ -155,7 +155,7 @@ impl Plugin for SynthLv2 {
                 1.0 / (1.0 - *ports.osc2_multiplier)
             };
             self.synth.oscillators[1].voice_count = *ports.osc2_voices as u8;
-            self.synth.oscillators[1].voices_detune = *ports.osc2_super_detune / 100.0;
+            self.synth.oscillators[1].voices_detune = (*ports.osc2_super_detune / 100.0).powi(3);
             self.synth.oscillators[1].phase = *ports.osc2_phase;
             self.synth.oscillators[1].phase_rand = *ports.osc2_phase_rand;
             self.synth.oscillators[1].wave = match *ports.osc2_wave {

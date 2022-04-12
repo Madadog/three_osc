@@ -75,9 +75,6 @@ impl ThreeOsc {
                 let mut out = 0.0;
                 let velocity = voice.velocity as f32 / 128.0;
 
-                // test simple sin
-                out += voice.simple_sin.next().0;
-
                 let osc2_out = if let Some(osc) = self.oscillators.get(1) {
                     let osc_out = osc.unison(&mut voice.osc_voice[1], |x| osc.wave.generate(x), 0.0, 0.0);
                     out += osc_out * osc.amp * velocity;
@@ -140,7 +137,6 @@ pub struct Voice {
     osc_voice: [SuperVoice; 2],
     filter: TestFilter,
     velocity: u8,
-    simple_sin: SimpleSin,
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
@@ -162,7 +158,6 @@ impl Voice {
             osc_voice,
             velocity,
             filter: TestFilter::default(),
-            simple_sin: SimpleSin::new(osc[0].phase, (2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate),
         }
     }
     pub fn release(&mut self) {
