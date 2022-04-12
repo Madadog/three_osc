@@ -12,19 +12,18 @@ An LV2 clone of LMMS's default synth (Triple Oscillator).
 * Detunable super with (up to) 128 voices for each oscillator
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 
-## Differences from Triple Oscillator
-* Doesn't hard clip when you play more than 1 note
-* Phase randomisation
-* Oscillator super
-* Adjustable envelope slope
-* Alias-free wave generation (todo)
-* More control over oscillator pitch
-* Less waves (for now)
-* Less filters (probably forever)
-* No arpeggiator/chord generator
-
 ## Sound Demo
 Forthcoming.
+
+## Why?
+* I'm currently migrating from LMMS to Ardour. Surge and ZynAddSubFx are great synths, but...
+    * Controls are spread out over multiple tabs / screens.
+    * Surge is a little bit aggressive.
+    * Sometimes you want to make simple, predictable sounds quickly.
+* The original Triple Oscillator also had several issues:
+    * A bit loud.
+    * Volume envelope was off by default. *Click click click*.
+    * Emulating super was a bit verbose, and without phase randomness it didn't work very well.
 
 ## TODO
 * Bandlimited waves
@@ -43,4 +42,4 @@ Forthcoming.
 * Delete LV2, switch to VST and add gui with egui
 
 ## LICENSE
-The Three Osc project is licensed under the GPLv3.0.
+The Three Osc project is licensed under the GNU General Public Licence version 3.
