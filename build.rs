@@ -1,64 +1,30 @@
-use std::{fs::File, io::Write};
+use std::env;
 use std::f32::consts::PI;
+use std::fs;
+use std::path::Path;
 
 fn main() {
-    let ttl_header = "@prefix atom: <http://lv2plug.in/ns/ext/atom#> .
-@prefix doap:  <http://usefulinc.com/ns/doap#> .
-@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
-@prefix midi: <http://lv2plug.in/ns/ext/midi#> .
-@prefix props: <http://lv2plug.in/ns/ext/port-props#> .
-@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix units: <http://lv2plug.in/ns/extensions/units#> .
-@prefix urid: <http://lv2plug.in/ns/ext/urid#> .
+    let out_dir = env::var_os("OUT_DIR").unwrap();
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("hello.rs");
+    let templates_dir = Path::new(&manifest_dir).join("build_templates");
 
-<https://github.com/Madadog/three_osc>
-        a lv2:Plugin ,
-                lv2:InstrumentPlugin ;
-        lv2:project <https://github.com/Madadog/three_osc> ;
+    let ttl_header = fs::read_to_string(templates_dir.join("ttl_header")).unwrap();
+    let ttl_control_divider = fs::read_to_string(templates_dir.join("ttl_control_divider")).unwrap();
+    let ttl_end = fs::read_to_string(templates_dir.join("ttl_end")).unwrap();
+    
+    let portstruct_header = fs::read_to_string(templates_dir.join("portstruct_header")).unwrap();
+    let portstruct_end = fs::read_to_string(templates_dir.join("portstruct_end")).unwrap();
 
-        doap:name \"Three Osc\" ;
-        doap:license <https://www.gnu.org/licenses/gpl-3.0.html> ;
-        lv2:requiredFeature urid:map ;
-        lv2:optionalFeature lv2:hardRTCapable ;
+    let mut ttl = ttl_header;
+    let mut portstruct = portstruct_header;
 
-        lv2:port [
-                a lv2:InputPort ,
-                    atom:AtomPort ;
-                atom:bufferType atom:Sequence ;
-                atom:supports midi:MidiEvent ;
-                lv2:designation lv2:control ;
-                lv2:index 0 ;
-                lv2:symbol \"midi\" ;
-                lv2:name \"Midi In\"
-        ] , [
-                a lv2:AudioPort ,
-                        lv2:OutputPort ;
-                lv2:index 1 ;
-                lv2:symbol \"out_l\" ;
-                lv2:name \"Output L\"
-        ] , [
-                a lv2:AudioPort ,
-                        lv2:OutputPort ;
-                lv2:index 2 ;
-                lv2:symbol \"out_r\" ;
-                lv2:name \"Output R\"";
-    let ttl_divider = "
-        ] , [
-                a lv2:InputPort ,
-                    lv2:ControlPort ;
-";
-    let ttl_end = "
-        ] .";
-    let mut ttl = ttl_header.to_string();
+    // format oscillator duplicates
+    let mut oscillators = Vec::new();
+    for i in 1..=2 {
+        oscillators.push(PortList::oscillator().prefix(&format!("osc{i}_"), &format!("Osc{i} ")))
+    }
 
-    let mut struct_header = "struct Ports {
-    midi: InputPort<AtomPort>,
-    out_l: OutputPort<Audio>,
-    out_r: OutputPort<Audio>,";
-    let mut struct_end = "
-}";
-    let mut struct_ports = struct_header.to_string();
 
     // format oscillator duplicates
     let mut oscillators = Vec::new();
@@ -70,20 +36,20 @@ fn main() {
     let mut ttl_index = 3; 
     // add oscillator ports
     for control in oscillators.iter().map(|x| &x.0).flatten() {
-        ttl.push_str(ttl_divider);
+        ttl.push_str(&ttl_control_divider);
         ttl.push_str(&control.to_ttl(ttl_index));
         ttl_index += 1;
-        struct_ports.push_str(&format!("\n{}", control.struct_port()));
+        portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
     // filter controls
     let mut filter_controls = PortList::filter().prefix("fil1_", "Filter 1 ");
     let mut filter_envelope = PortList::filter_envelope().prefix("fil1_", "Filter 1 ");
     for control in filter_controls.0.iter().chain(filter_envelope.0.iter()) {
-        ttl.push_str(ttl_divider);
+        ttl.push_str(&ttl_control_divider);
         ttl.push_str(&control.to_ttl(ttl_index));
         ttl_index += 1;
-        struct_ports.push_str(&format!("\n{}", control.struct_port()));
+        portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
     // prepare global controls
@@ -92,25 +58,28 @@ fn main() {
 
     // add global ports
     for control in volume_envelope.0.iter().chain(global_controls.0.iter()) {
-        ttl.push_str(ttl_divider);
+        ttl.push_str(&ttl_control_divider);
         ttl.push_str(&control.to_ttl(ttl_index));
         ttl_index += 1;
-        struct_ports.push_str(&format!("\n{}", control.struct_port()));
+        portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
 
     // end ports
-    ttl.push_str(ttl_end);
-    struct_ports.push_str(struct_end);
+    ttl.push_str(&ttl_end);
+    portstruct.push_str(&portstruct_end);
 
-    let mut file = File::create("three_osc.ttl").expect("couldn't create file");
-    file.write_all(ttl.as_bytes()).expect("Couldn't write everything to file");
+    // write files
+    fs::write(Path::new(&out_dir).join("three_osc.ttl"), ttl).expect("couldn't create file");
+    fs::write(Path::new(&out_dir).join("portstruct.rs"), portstruct).expect("couldn't create file");
 
-    let mut file = File::create("struct_ports.txt").expect("couldn't create file");
-    file.write_all(struct_ports.as_bytes()).expect("Couldn't write everything to file");
-    
-    // println!("{struct_ports}");
+    // copy ttl into LV2 
+    fs::copy(Path::new(&out_dir).join("three_osc.ttl"), Path::new(&manifest_dir).join("three_osc.lv2").join("three_osc.ttl")).unwrap();
+
+    println!("cargo:rerun-if-changed=build.rs");
 }
+
+
 
 #[derive(Debug, Clone)]
 struct ControlPort {

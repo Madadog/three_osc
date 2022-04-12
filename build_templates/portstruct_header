@@ -1,0 +1,4 @@
+struct Ports {
+    midi: InputPort<AtomPort>,
+    out_l: OutputPort<Audio>,
+    out_r: OutputPort<Audio>,

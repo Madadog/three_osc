@@ -7,7 +7,7 @@ mod synth;
 use synth::{ThreeOsc, oscillator::OscWave, Filter};
 use wmidi::MidiMessage;
 
-// Most useful plugins will have ports for input and output data. In code, these ports are represented by a struct implementing the `PortCollection` trait. Internally, ports are referred to by index. These indices are assigned in ascending order, starting with 0 for the first port. The indices in `amp.ttl` have to match them.
+// Most useful plugins will have ports for input and output data. In code, these ports are represented by a struct implementing the `PortCollection` trait. Internally, ports are referred to by index. These indices are assigned in ascending order, starting with 0 for the first port. The indices in `amp.ttl` have to match them, or else.
 #[derive(PortCollection)]
 struct Ports {
     midi: InputPort<AtomPort>,
