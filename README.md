@@ -19,11 +19,11 @@ Forthcoming.
 * I'm currently migrating from LMMS to Ardour. Surge and ZynAddSubFx are great synths, but...
     * Controls are spread out over multiple tabs / screens.
     * Surge is a little bit aggressive.
-    * Sometimes you want to make simple, predictable sounds quickly.
-* The original Triple Oscillator also had several issues:
+    * Sometimes you want to quickly make simple and predictable sounds.
+* The original Triple Oscillator also has several issues:
     * A bit loud.
-    * Volume envelope was off by default. *Click click click*.
-    * Emulating super was a bit verbose, and without phase randomness it didn't work very well.
+    * Volume envelope is off by default. *Click click click*.
+    * Emulating super is a bit verbose, and without phase randomness it doesn't work very well.
 
 ## TODO
 * Bandlimited waves
@@ -35,7 +35,6 @@ Forthcoming.
 * Add third oscillator, work out oscillator modulation interface
 * Stereo
 * Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
-* Readjust super detune control to reasonable values
 * Envelope declicking
 * Fix strange PM/FM bug with naive wave generators
 * Make the build system nicer
