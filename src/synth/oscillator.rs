@@ -1,4 +1,6 @@
-use std::f32::consts::{FRAC_1_SQRT_2, PI};
+use std::f32::consts::{FRAC_1_SQRT_2, PI, FRAC_2_PI};
+
+use super::lerp;
 
 /// A single instance of a playing oscillator. Maintains phase for fm / pm stuff
 /// 
@@ -214,8 +216,63 @@ impl SimpleSin {
     pub fn cos(&self) -> f32 { self.cos }
 }
 
+pub struct Wavetable {
+    pub table: Vec<f32>,
+}
+impl Wavetable {
+    pub fn new(table: Vec<f32>) -> Self {
+        Self { table }
+    }
+    pub fn index(&self, index: usize) -> f32 {
+        self.table[index as usize]
+    }
+    pub fn index_lerp(&self, index: f32) -> f32 {
+        let index_1 = index as usize % self.table.len();
+        let index_2 = (index_1 + 1) % self.table.len();
+        let from = self.table[index_1];
+        let to = self.table[index_2];
+        lerp(from, to, index.fract())
+    }
+    pub fn phase_to_index(&self, phase: f32) -> f32 {
+        phase / (2.0 * PI) * self.table.len() as f32
+    }
+}
+
+/// Wave generator with a unique wavetable for each midi note.
+pub struct WavetableNotes {
+    pub tables: [Wavetable; 128],
+}
+impl WavetableNotes {
+    // 440.0 * 2.0_f32.powf(index / 12.0)
+    pub fn frequency_to_note(frequency: f32) -> usize {
+        (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
+    }
+}
+
+/// Oscillator which generates waves by summing sines
+pub struct AdditiveOsc {
+    amplitudes: [f32; 256],
+    phases: [f32; 256],
+}
+impl AdditiveOsc {
+    pub fn generate(&self, phase: f32, harmonics: usize) -> f32 {
+        self.amplitudes.iter().take(harmonics).zip(self.phases.iter()).map(|(amp, part_phase)| (part_phase + phase).sin() * amp).sum()
+    }
+    pub fn generate_segment(&self, output: &mut [f32], delta: f32, harmonics: usize) {
+        for (i, sample) in output.iter_mut().enumerate() {
+            *sample = self.generate(delta * i as f32, harmonics);
+        }
+    }
+    pub fn saw() -> Self {
+        let mut amplitudes = [1.0; 256];
+        amplitudes.iter_mut().enumerate().for_each(|(i, x)| *x /= i as f32);
+        let phases = [0.0; 256];
+        Self { amplitudes, phases }
+    }
+}
+
 mod tests {
-    use super::SimpleSin;
+    use super::{SimpleSin, WavetableNotes, Wavetable};
 
     #[test]
     fn test_simple_sin() {
@@ -227,5 +284,11 @@ mod tests {
         println!("{}, {}", simple_sin.cos(), 1.0_f32.cos());
         assert!((simple_sin.sin() - 1.0_f32.sin()).abs() <= 0.001);
         assert!((simple_sin.cos() - 1.0_f32.cos()).abs() <= 0.001);
+    }
+    
+    #[test]
+    fn test_frequency_to_note() {
+        assert!(WavetableNotes::frequency_to_note(440.0) == 69);
+        assert!(WavetableNotes::frequency_to_note(415.0) == 68);
     }
 }
