@@ -101,7 +101,7 @@ impl ThreeOsc {
 
                 let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
 
-                if voice_freq > 10000.0 {
+                if voice_freq > 100000.0 {
                     panic!("something went very wrong (keytrack freq: {}, voice id: {}, sample rate: {}, keytrack: {}, 2.0_f32.powf(voice.id as f32 - 69.0 / 12.0): {}, voice.id as f32 = {})", voice_freq, voice.id, self.sample_rate, self.filter_controller.keytrack, 2.0_f32.powf(voice.id as f32 - 69.0 / 12.0), voice.id as f32);
                 }
 
@@ -387,14 +387,14 @@ pub mod oscillator {
 
         #[test]
         fn test_simple_sin() {
-            let mut simple_sin = SimpleSin::new(0.0, 0.1);
-            for _ in 0..10 {
+            let mut simple_sin = SimpleSin::new(0.0, 1.0 / 100_000.0);
+            for _ in 0..100_000 {
                 simple_sin.next();
             }
             println!("{}, {}", simple_sin.sin(), 1.0_f32.sin());
             println!("{}, {}", simple_sin.cos(), 1.0_f32.cos());
-            assert!((simple_sin.sin() - 1.0_f32.sin()).abs() <= 0.1);
-            assert!((simple_sin.cos() - 1.0_f32.cos()).abs() <= 0.1);
+            assert!((simple_sin.sin() - 1.0_f32.sin()).abs() <= 0.001);
+            assert!((simple_sin.cos() - 1.0_f32.cos()).abs() <= 0.001);
         }
     }
 }
