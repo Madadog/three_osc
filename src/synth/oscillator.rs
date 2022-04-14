@@ -238,6 +238,10 @@ impl Wavetable {
     pub fn phase_to_index(&self, phase: f32) -> f32 {
         phase / (2.0 * PI) * self.table.len() as f32
     }
+    pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32, len: usize) -> Self {
+        let table: Vec<f32> = (0..len).into_iter().map(|x| osc.generate((2.0 * PI * (x as f32 / len as f32)) / sample_rate, len)).collect();
+        Self { table }
+    }
 }
 
 /// Wave generator with a unique wavetable for each midi note.
@@ -251,12 +255,11 @@ impl WavetableNotes {
     pub fn frequency_to_note(frequency: f32) -> usize {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
-    pub fn from_additive_osc(osc: AdditiveOsc, sample_rate: f32) -> Self {
+    pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32) -> Self {
         let tables: Vec<Wavetable> = (0..128).into_iter()
             .map(|x| (sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))) as usize)
             .map(|len| {
-                let table: Vec<f32> = (0..len).into_iter().map(|x| osc.generate((2.0 * PI * (x as f32 / len as f32)) / sample_rate, len)).collect();
-                Wavetable { table }
+                Wavetable::from_additive_osc(osc, sample_rate, len)
             }).collect();
         
         Self {tables: tables.try_into().unwrap()}
