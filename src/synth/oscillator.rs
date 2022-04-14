@@ -261,7 +261,6 @@ impl WavetableNotes {
             .map(|len| {
                 Wavetable::from_additive_osc(osc, sample_rate, len)
             }).collect();
-        
         Self {tables: tables.try_into().unwrap()}
     }
 }

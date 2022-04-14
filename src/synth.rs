@@ -7,10 +7,12 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
+use self::oscillator::AdditiveOsc;
 use self::oscillator::SimpleSin;
 use self::oscillator::SuperVoice;
 use self::oscillator::BasicOscillator;
 use self::oscillator::OscVoice;
+use self::oscillator::WavetableNotes;
 
 const DEFAULT_SRATE: f32 = 44100.0;
 
@@ -21,6 +23,7 @@ pub struct ThreeOsc {
     pub sample_rate: f64,
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 2],
+    pub wavetables: WavetableNotes,
     pub filter: TestFilter,
     pub osc1_pm: f32,
     pub osc1_fm: f32,
@@ -36,6 +39,7 @@ impl ThreeOsc {
             sample_rate,
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
+            wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32),
             filter: TestFilter::default(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
@@ -86,7 +90,9 @@ impl ThreeOsc {
                 if let Some(osc) = self.oscillators.get(0) {
                     out += osc.unison(&mut voice.osc_voice[0], |x| osc.wave.generate(x),
                     osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, ) * osc.amp * velocity;
+                    // out += self.wavetables.tables[voice.id as usize].index_lerp((voice.osc_voice[0].voice_phases[0] / (2.0 * PI)) * self.wavetables.tables[voice.id as usize].table.len() as f32);
                 }
+                // out += self.wavetables.tables[voice.id as usize].index(0);
 
                 // amplitude envelope
                 out = if let Some(release_time) = voice.release_time {
