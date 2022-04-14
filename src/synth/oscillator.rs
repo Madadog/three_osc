@@ -281,7 +281,7 @@ impl AdditiveOsc {
     }
     pub fn saw() -> Self {
         let mut amplitudes = [1.0; 256];
-        amplitudes.iter_mut().enumerate().for_each(|(i, x)| *x /= i as f32);
+        amplitudes.iter_mut().enumerate().for_each(|(i, x)| *x /= (i + 1) as f32);
         let phases = [0.0; 256];
         Self { amplitudes, phases }
     }
