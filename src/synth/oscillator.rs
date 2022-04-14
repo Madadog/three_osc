@@ -241,31 +241,38 @@ impl Wavetable {
     pub fn new(table: Vec<f32>) -> Self {
         Self { table }
     }
+    #[inline]
     pub fn index(&self, index: usize) -> f32 {
         self.table[index as usize]
     }
+    #[inline]
+    // TODO: This is very slow, compared to the index above
     pub fn index_lerp(&self, index: f32) -> f32 {
-        let index_1 = index as usize % self.table.len();
+        let index_1 = index as usize;
         let index_2 = (index_1 + 1) % self.table.len();
         let from = self.table[index_1];
         let to = self.table[index_2];
         lerp(from, to, index.fract())
     }
+    #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
         phase / (2.0 * PI) * self.table.len() as f32
     }
-    pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32, len: usize) -> Self {
+    #[inline]
+    pub fn generate(&self, phase: f32) -> f32 {
+        // self.index(self.phase_to_index(phase) as usize)
+        self.index_lerp(self.phase_to_index(phase))
+    }
+    pub fn from_additive_osc(osc: &AdditiveOsc, len: usize) -> Self {
         let table: Vec<f32> = (0..len)
             .into_iter()
-            .map(|x| osc.generate((2.0 * PI * (x as f32 / len as f32)) / sample_rate, len))
+            .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), len / 2))
             .collect();
         Self { table }
     }
 }
 
 /// Wave generator with a unique wavetable for each midi note.
-///
-/// Expected have exactly 128 wavetables, one corresponding to each midi note. (Will switch to array as soon as I find the crate that adds `collect` for arrays)
 pub struct WavetableNotes {
     pub tables: [Wavetable; 128],
 }
@@ -278,7 +285,7 @@ impl WavetableNotes {
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
             .map(|x| (sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))) as usize)
-            .map(|len| Wavetable::from_additive_osc(osc, sample_rate, len))
+            .map(|len| Wavetable::from_additive_osc(osc, len))
             .collect();
         Self {
             tables: tables.try_into().unwrap(),
