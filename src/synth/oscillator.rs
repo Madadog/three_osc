@@ -1,4 +1,4 @@
-use std::f32::consts::{FRAC_1_SQRT_2, PI, FRAC_2_PI};
+use std::{f32::consts::{FRAC_1_SQRT_2, PI, FRAC_2_PI}, ops::Add, convert::TryInto};
 
 use super::lerp;
 
@@ -128,6 +128,7 @@ pub enum OscWave {
 impl OscWave {
     pub fn generate(&self, phase: f32) -> f32 {
         use OscWave::*;
+
         match self {
             Sine => phase.sin(),
             Tri => {
@@ -216,6 +217,7 @@ impl SimpleSin {
     pub fn cos(&self) -> f32 { self.cos }
 }
 
+#[derive(Debug, Clone)]
 pub struct Wavetable {
     pub table: Vec<f32>,
 }
@@ -239,6 +241,8 @@ impl Wavetable {
 }
 
 /// Wave generator with a unique wavetable for each midi note.
+/// 
+/// Expected have exactly 128 wavetables, one corresponding to each midi note. (Will switch to array as soon as I find the crate that adds `collect` for arrays)
 pub struct WavetableNotes {
     pub tables: [Wavetable; 128],
 }
@@ -246,6 +250,16 @@ impl WavetableNotes {
     // 440.0 * 2.0_f32.powf(index / 12.0)
     pub fn frequency_to_note(frequency: f32) -> usize {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
+    }
+    pub fn from_additive_osc(osc: AdditiveOsc, sample_rate: f32) -> Self {
+        let tables: Vec<Wavetable> = (0..128).into_iter()
+            .map(|x| (sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))) as usize)
+            .map(|len| {
+                let table: Vec<f32> = (0..len).into_iter().map(|x| osc.generate((2.0 * PI * (x as f32 / len as f32)) / sample_rate, len)).collect();
+                Wavetable { table }
+            }).collect();
+        
+        Self {tables: tables.try_into().unwrap()}
     }
 }
 
