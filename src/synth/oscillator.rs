@@ -284,7 +284,7 @@ impl WavetableNotes {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
     pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32) -> Self {
-        let oversampling_factor = 2.0; // Don't skip samples in lerp
+        let oversampling_factor = 4.0; // Don't skip samples in lerp
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
             .map(|x| (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))) as usize)
