@@ -248,7 +248,7 @@ impl Wavetable {
     #[inline]
     // TODO: This is very slow, compared to the index above
     pub fn index_lerp(&self, index: f32) -> f32 {
-        let index_1 = index as usize;
+        let index_1 = index as usize % self.table.len();
         let index_2 = (index_1 + 1) % self.table.len();
         let from = self.table[index_1];
         let to = self.table[index_2];
@@ -256,17 +256,19 @@ impl Wavetable {
     }
     #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
-        phase / (2.0 * PI) * self.table.len() as f32
+        if phase >= 2.0 * PI { panic!("Phase was greater than 2.0 * PI") };
+        (phase / (2.0 * PI)) * self.table.len() as f32
     }
     #[inline]
     pub fn generate(&self, phase: f32) -> f32 {
         // self.index(self.phase_to_index(phase) as usize)
         self.index_lerp(self.phase_to_index(phase))
     }
-    pub fn from_additive_osc(osc: &AdditiveOsc, len: usize) -> Self {
+    // Harmonics should be less than or equal to len
+    pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
         let table: Vec<f32> = (0..len)
             .into_iter()
-            .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), len / 2))
+            .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
             .collect();
         Self { table }
     }
@@ -282,10 +284,11 @@ impl WavetableNotes {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
     pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32) -> Self {
+        let oversampling_factor = 2.0; // Don't skip samples in lerp
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
-            .map(|x| (sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))) as usize)
-            .map(|len| Wavetable::from_additive_osc(osc, len))
+            .map(|x| (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))) as usize)
+            .map(|len| Wavetable::from_additive_osc(osc, len, len / (2.1 * oversampling_factor) as usize))
             .collect();
         Self {
             tables: tables.try_into().unwrap(),
@@ -295,10 +298,11 @@ impl WavetableNotes {
 
 /// Oscillator which generates waves by summing sines
 pub struct AdditiveOsc {
-    amplitudes: [f32; 256],
-    phases: [f32; 256],
+    amplitudes: [f32; 2560],
+    phases: [f32; 2560],
 }
 impl AdditiveOsc {
+    #[inline]
     pub fn generate(&self, phase: f32, harmonics: usize) -> f32 {
         self.amplitudes
             .iter()
@@ -314,12 +318,12 @@ impl AdditiveOsc {
         }
     }
     pub fn saw() -> Self {
-        let mut amplitudes = [1.0; 256];
+        let mut amplitudes = [1.0; 2560];
         amplitudes
             .iter_mut()
             .enumerate()
             .for_each(|(i, x)| *x /= (i + 1) as f32);
-        let phases = [0.0; 256];
+        let phases = [0.0; 2560];
         Self { amplitudes, phases }
     }
 }

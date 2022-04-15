@@ -25,6 +25,7 @@ pub struct ThreeOsc {
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 2],
     pub wavetables: WavetableNotes,
+    additive: AdditiveOsc,
     pub filter: TestFilter,
     pub osc1_pm: f32,
     pub osc1_fm: f32,
@@ -41,6 +42,7 @@ impl ThreeOsc {
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
             wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32),
+            additive: AdditiveOsc::saw(),
             filter: TestFilter::default(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
@@ -94,6 +96,7 @@ impl ThreeOsc {
                     // out += self.wavetables.tables[voice.id as usize].index_lerp((voice.osc_voice[0].voice_phases[0] / (2.0 * PI)) * self.wavetables.tables[voice.id as usize].table.len() as f32);
                     // out += self.wavetable.generate(voice.osc_voice[0].voice_phases[0]);
                     out += self.wavetables.tables[voice.id as usize].generate(voice.osc_voice[0].voice_phases[0]);
+                    // out += self.additive.generate(voice.osc_voice[0].voice_phases[0], (self.sample_rate as f32 / (440.0 * 2.0_f32.powf((voice.id as i32 - 69) as f32 / 12.0))) as usize / 2);
                 }
                 // out += self.wavetables.tables[voice.id as usize].index(0);
 
