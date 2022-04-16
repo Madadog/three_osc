@@ -284,11 +284,11 @@ impl WavetableNotes {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
     pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32) -> Self {
-        let oversampling_factor = 8.0; // Don't skip samples in lerp
+        let oversampling_factor = 4.0; // Don't skip samples in lerp
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
             .map(|x| (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).ceil() as usize)
-            .map(|len| Wavetable::from_additive_osc(osc, len, len / (2.1 * oversampling_factor) as usize))
+            .map(|len| Wavetable::from_additive_osc(osc, len, len / (2.5 * oversampling_factor) as usize))
             .collect();
         Self {
             tables: tables.try_into().unwrap(),
@@ -297,11 +297,11 @@ impl WavetableNotes {
 }
 
 /// Oscillator which generates waves by summing sines
-pub struct AdditiveOsc {
-    amplitudes: [f32; 2560],
-    phases: [f32; 2560],
+pub struct AdditiveOsc<const N: usize = 2560> {
+    amplitudes: [f32; N],
+    phases: [f32; N],
 }
-impl AdditiveOsc {
+impl<const N: usize> AdditiveOsc<N> {
     #[inline]
     pub fn generate(&self, phase: f32, harmonics: usize) -> f32 {
         self.amplitudes
@@ -318,12 +318,24 @@ impl AdditiveOsc {
         }
     }
     pub fn saw() -> Self {
-        let mut amplitudes = [1.0; 2560];
+        let mut amplitudes = [1.0; N];
         amplitudes
             .iter_mut()
             .enumerate()
             .for_each(|(i, x)| *x /= (i + 1) as f32);
-        let phases = [0.0; 2560];
+        let phases = [0.0; N];
+        Self { amplitudes, phases }
+    }
+    pub fn square() -> Self {
+        let mut amplitudes = [1.0; N];
+        amplitudes
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, x)| {
+                *x /= (i + 1) as f32;
+                *x = *x * (i % 2) as f32;
+            });
+        let phases = [0.0; N];
         Self { amplitudes, phases }
     }
 }
