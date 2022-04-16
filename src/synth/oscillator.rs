@@ -254,17 +254,30 @@ impl Wavetable {
         let to = self.table[index_2];
         lerp(from, to, index.fract())
     }
+    pub fn index_lagrange(&self, index: f32) -> f32 {
+        // let index_0 = self.table[((index - 2.0) % self.table.len() as f32) as usize];
+        let index_1 = self.table[((index - 1.0) % self.table.len() as f32) as usize];
+        let index_2 = self.table[(index % self.table.len() as f32) as usize];
+        let index_3 = self.table[((index + 1.0) % self.table.len() as f32) as usize];
+        let index = index % 1.0 + 1.0;
+        index_1 * (index - 2.0) / (-1.0) * (index - 3.0) / (-2.0)
+            + index_2 * (index - 1.0) / (1.0) * (index - 3.0) / (-1.0)
+            + index_3 * (index - 1.0) / (2.0) * (index - 2.0) / (1.0)
+    }
     #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
-        if phase >= 2.0 * PI { panic!("Phase was greater than 2.0 * PI") };
+        if phase >= 2.0 * PI {
+            panic!("Phase was greater than 2.0 * PI")
+        };
         (phase / (2.0 * PI)) * self.table.len() as f32
     }
     #[inline]
     pub fn generate(&self, phase: f32) -> f32 {
         // self.index(self.phase_to_index(phase) as usize)
         self.index_lerp(self.phase_to_index(phase))
+        // self.index_lagrange(self.phase_to_index(phase))
     }
-    // Harmonics should be less than or equal to len
+    /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
         let table: Vec<f32> = (0..len)
             .into_iter()
@@ -274,7 +287,27 @@ impl Wavetable {
     }
 }
 
-/// Wave generator with a unique wavetable for each midi note.
+/// Wave generator with a unique wavetable for each midi note index.
+///
+/// Wavetables can be trivially bandlimited by generating each table with additive synthesis
+/// with harmonics up to the Nyquist frequency. The table can then be sampled for cheap,
+/// alias-free synthesis.
+///
+/// ... At least, in theory. If we had a perfect sampling function (which consists of summing
+/// sines again), this would be the case but we are instead using linear interpolation, which creates
+/// discontinuous straight lines which cause aliasing. Currently we suppress these artifacts by
+/// oversampling the wavetables (initialising them several times larger than they need to be).
+/// This reduces the amplitude of the artifacts and makes them more harmonically distant from
+/// the source. 8 times oversampling seems to provide reasonable artifact suppression (-60 dB or
+/// lower compared to the fundamental).
+/// 
+/// Of course, all this is made sort of irrelevant by the fact that you can just use additive
+/// synthesis while rendering since you have unlimited time to generate the sound, thus providing
+/// completely alias-free oscillators. But it was fun to implement, and it's fun to perform in 
+/// realtime because of how cheap it is to sample + lerp.
+/// 
+/// The artifacts could be reduced further by using better interpolation (with a derivative closer
+/// to that of the original signal).
 pub struct WavetableNotes {
     pub tables: [Wavetable; 128],
 }
@@ -283,12 +316,30 @@ impl WavetableNotes {
     pub fn frequency_to_note(frequency: f32) -> usize {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
-    pub fn from_additive_osc(osc: &AdditiveOsc, sample_rate: f32) -> Self {
-        let oversampling_factor = 4.0; // Don't skip samples in lerp
+    pub fn from_additive_osc(
+        osc: &AdditiveOsc,
+        sample_rate: f32,
+        oversampling_factor: f32,
+    ) -> Self {
+        debug_assert!(
+            oversampling_factor >= 1.0,
+            "Oversampling factor should be greater than 1"
+        );
+        // let oversampling_factor = 8.0; // Reduce lerp aliasing
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
-            .map(|x| (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).ceil() as usize)
-            .map(|len| Wavetable::from_additive_osc(osc, len, len / (2.5 * oversampling_factor) as usize))
+            .map(|x| {
+                (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
+                    .ceil() as usize
+            })
+            .map(|len| {
+                let len = len + len % 2;
+                Wavetable::from_additive_osc(
+                    osc,
+                    len,
+                    (len as f32 / (2.0 * oversampling_factor)) as usize,
+                )
+            })
             .collect();
         Self {
             tables: tables.try_into().unwrap(),
@@ -296,7 +347,10 @@ impl WavetableNotes {
     }
 }
 
-/// Oscillator which generates waves by summing sines
+/// Oscillator which generates waves by summing sines.
+/// 
+/// The lowest-frequency signal that can be generated with all of its expected harmonics
+/// is given by sample_rate / (2.0 * N). (i.e. with 2560 sinusoids: 44100/(2.0 * 2560) = 8.613 Hz)
 pub struct AdditiveOsc<const N: usize = 2560> {
     amplitudes: [f32; N],
     phases: [f32; N],
@@ -328,13 +382,10 @@ impl<const N: usize> AdditiveOsc<N> {
     }
     pub fn square() -> Self {
         let mut amplitudes = [1.0; N];
-        amplitudes
-            .iter_mut()
-            .enumerate()
-            .for_each(|(i, x)| {
-                *x /= (i + 1) as f32;
-                *x = *x * (i % 2) as f32;
-            });
+        amplitudes.iter_mut().enumerate().for_each(|(i, x)| {
+            *x /= (i + 1) as f32;
+            *x = *x * ((i + 1) % 2) as f32;
+        });
         let phases = [0.0; N];
         Self { amplitudes, phases }
     }
