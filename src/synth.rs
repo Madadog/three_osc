@@ -20,13 +20,12 @@ const DEFAULT_SRATE: f32 = 44100.0;
 pub struct ThreeOsc {
     pub voices: Vec<Voice>,
     pub gain_envelope: AdsrEnvelope,
-    pub filter_controller: FilterController,
+    pub(crate) filter_controller: filter::FilterController,
     pub sample_rate: f64,
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 2],
     pub wavetables: WavetableNotes,
     additive: AdditiveOsc,
-    pub filter: TestFilter,
     pub osc1_pm: f32,
     pub osc1_fm: f32,
     pub bend_range: f32,
@@ -37,13 +36,12 @@ impl ThreeOsc {
         Self {
             voices: Vec::with_capacity(64),
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
-            filter_controller: FilterController::new(),
+            filter_controller: filter::FilterController::new(),
             sample_rate,
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
             wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 8.0),
             additive: AdditiveOsc::saw(),
-            filter: TestFilter::default(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
             bend_range: 2.0,
@@ -144,7 +142,7 @@ pub struct Voice {
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 2],
-    filter: TestFilter,
+    filter: filter::TestFilter,
     velocity: u8,
 }
 impl Voice {
@@ -166,7 +164,7 @@ impl Voice {
             release_time: None,
             osc_voice,
             velocity,
-            filter: TestFilter::default(),
+            filter: filter::TestFilter::default(),
         }
     }
     pub fn release(&mut self) {
@@ -266,134 +264,7 @@ mod envelopes {
 
 
 
-#[derive(Debug, Default, Clone)]
-/// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
-/// 
-pub struct TestFilter {
-    stage0: f32, // internal feedback storage
-    stage1: f32,
-    pub a0: f32, // gain compensation
-    pub a1: f32, // [n-1] feedback
-    pub a2: f32, // [n-2] feedback
-    pub b0: f32, // [n] out
-    pub b1: f32, // [n-1] out
-    pub b2: f32, // [n-2] out
-    target_a: (f32, f32, f32), // smoothing
-    target_b: (f32, f32, f32),
-}
-impl Filter for TestFilter {
-    fn process(&mut self, input: f32) -> f32 {
-        if !(self.stage0.is_finite() && self.stage1.is_finite()) {
-            println!(
-                "Warning: filters were unstable, {} and {}",
-                self.stage0, self.stage1
-            );
-            self.stage0 = 0.0;
-            self.stage1 = 0.0;
-        }
-
-        let previous_previous_sample = self.stage1;
-        let previous_sample = self.stage0;
-        let current_sample = (input - self.a1 * self.stage0 - self.a2 * self.stage1) / self.a0;
-        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
-
-        // Propogate
-        self.stage0 = current_sample;
-        self.stage1 = previous_sample;
-
-        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample)
-            / self.a0
-    }
-    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
-
-        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)." 
-        
-        // [This notice should be placed within redistributed or derivative software code or text when appropriate. This particular formulation became active on May 13, 2015, and edited for clarity 7 April, 2021, superseding the 2002 version.]
-        // Audio Eq Cookbook: https://www.w3.org/TR/audio-eq-cookbook/
-        // Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute of Technology, European Research Consortium for Informatics and Mathematics, Keio University, Beihang). All Rights Reserved. This work is distributed under the W3C® Software and Document License [1] in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-        // [1] http://www.w3.org/Consortium/Legal/copyright-software
-
-        let phase_change = 2.0 * PI * cutoff / sample_rate;
-        let (sin, cos) = phase_change.sin_cos();
-        let a = sin / (2.0 * resonance);
-
-        self.b0 = (1.0 - cos) / 2.0;
-        self.b1 = 1.0 - cos;
-        self.b2 = (1.0 - cos) / 2.0;
-
-        // self.a0 = 1.0 + a;
-        self.a0 = 1.0 + a;
-        self.a1 = -2.0 * cos;
-        self.a2 = 1.0 - a;
-    }
-}
-
-#[derive(Debug, Default)]
-/// Filter in series
-pub struct CascadeFilter {
-    filter_1: TestFilter,
-    filter_2: TestFilter,
-}
-impl Filter for CascadeFilter {
-    fn process(&mut self, input: f32) -> f32 {
-        self.filter_2.process(self.filter_1.process(input))
-    }
-    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        self.filter_1.set_params(sample_rate, cutoff, resonance);
-        self.filter_2.set_params(sample_rate, cutoff, resonance);
-    }
-}
-
-pub trait Filter {
-    fn process(&mut self, input: f32) -> f32;
-    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32);
-}
-
-#[derive(Debug)]
-/// Filter in series
-pub struct FilterController {
-    pub cutoff_envelope: AdsrEnvelope,
-    pub envelope_amount: f32,
-    pub cutoff: f32,
-    pub resonance: f32,
-    pub keytrack: f32,
-}
-impl FilterController {
-    pub fn new() -> Self {
-        Self {
-            cutoff_envelope: AdsrEnvelope::new(0.0, 0.0, 0.0, 1.0, 1.0),
-            envelope_amount: 0.0,
-            cutoff: 100.0,
-            resonance: 0.1,
-            keytrack: 0.0,
-        }
-    }
-    pub fn process_envelope_held(&mut self, filter: &mut TestFilter, keytrack_freq: f32, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
-        filter.set_params(sample_rate,
-            (self.cutoff + keytrack_freq + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
-            self.resonance
-        );
-        let out = filter.process(input);
-        filter.set_params(sample_rate, self.cutoff, self.resonance);
-        out
-    }
-    pub fn process_envelope_released(&mut self, filter: &mut TestFilter, keytrack_freq: f32, input: f32, envelope_index: f32, release_index: f32, sample_rate: f32) -> f32 {
-        filter.set_params(sample_rate,
-            (self.cutoff + keytrack_freq + self.cutoff_envelope.sample_released(release_index, envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
-            self.resonance
-        );
-        let out = filter.process(input);
-        filter.set_params(sample_rate, self.cutoff, self.resonance);
-        out
-    }
-    
-    pub fn lerp_controls(&mut self, filter: &mut TestFilter, sample_rate: f32, target_cutoff: f32, target_resonance: f32) {
-        self.cutoff = lerp(self.cutoff, target_cutoff, 500.0 / sample_rate);
-        self.resonance = lerp(self.cutoff, target_resonance, 500.0 / sample_rate);
-        filter.set_params(sample_rate, self.cutoff, self.resonance);
-    }
-}
+pub(crate) mod filter;
 
 #[inline]
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {
