@@ -112,6 +112,22 @@ impl BasicOscillator {
             .sum::<f32>()
             / self.voice_count as f32
     }
+    pub fn unison_phases<'a>(
+        &self,
+        voices: &'a mut SuperVoice,
+        pm: f32,
+        fm: f32,
+        sample_rate: f32,
+    ) -> &'a [f32] {
+        let constant = sample_rate / (2.0 * PI);
+        let delta = ((voices.delta) * (1.0 + pm) * constant + fm * 100.0) / constant;
+        voices.add_phase(
+            self.pitch_mult_delta(delta),
+            self.voice_count.into(),
+            self.voices_detune,
+        );
+        &voices.voice_phases
+    }
 }
 impl Default for BasicOscillator {
     fn default() -> Self {
@@ -276,6 +292,10 @@ impl Wavetable {
         // self.index(self.phase_to_index(phase) as usize)
         self.index_lerp(self.phase_to_index(phase))
         // self.index_lagrange(self.phase_to_index(phase))
+    }
+    #[inline]
+    pub fn generate_multi(&self, phases: &[f32]) -> f32 {
+        phases.iter().map(|phase| self.index_lerp(self.phase_to_index(*phase))).sum()
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {

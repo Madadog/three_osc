@@ -80,23 +80,21 @@ impl ThreeOsc {
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
                 let mut out = 0.0;
                 let velocity = voice.velocity as f32 / 128.0;
+                let index = voice.id as usize;
 
                 let osc2_out = if let Some(osc) = self.oscillators.get(1) {
-                    let osc_out = osc.unison(&mut voice.osc_voice[1], |x| osc.wave.generate(x), 0.0, 0.0);
+                    let phases = osc.unison_phases(&mut voice.osc_voice[1], 0.0, 0.0, self.sample_rate as f32);
+                    let osc_out = self.wavetables.tables[index].generate_multi(phases);
                     out += osc_out * osc.amp * velocity;
                     osc_out
                 } else {
                     unreachable!("Osc2 wasn't found...");
                 };
 
-
                 if let Some(osc) = self.oscillators.get(0) {
-                    out += osc.unison(&mut voice.osc_voice[0], |x| osc.wave.generate(x),
-                    osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, ) * osc.amp * velocity;
-                    // out += self.wavetables.tables[voice.id as usize].index_lerp((voice.osc_voice[0].voice_phases[0] / (2.0 * PI)) * self.wavetables.tables[voice.id as usize].table.len() as f32);
-                    // out += self.wavetable.generate(voice.osc_voice[0].voice_phases[0]);
-                    out += self.wavetables.tables[voice.id as usize].generate(voice.osc_voice[0].voice_phases[0]);
-                    // out += self.additive.generate(voice.osc_voice[0].voice_phases[0], (self.sample_rate as f32 / (440.0 * 2.0_f32.powf((voice.id as i32 - 69) as f32 / 12.0))) as usize / 2);
+                    let phases = osc.unison_phases(&mut voice.osc_voice[0],
+                        osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
+                    out += self.wavetables.tables[index].generate_multi(phases);
                 }
                 // out += self.wavetables.tables[voice.id as usize].index(0);
 
@@ -265,6 +263,8 @@ mod envelopes {
     }
     impl BezierEnvelope {}
 }
+
+
 
 #[derive(Debug, Default, Clone)]
 /// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
