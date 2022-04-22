@@ -6,18 +6,18 @@ use std::f32::consts::PI;
 
 #[derive(Debug, Default, Clone)]
 /// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
-/// 
+///
 pub(crate) struct TestFilter {
-    pub(crate) stage0: f32, pub(crate) // internal feedback storage
-    stage1: f32,
+    pub(crate) stage0: f32,
+    pub(crate) stage1: f32,
     pub(crate) a0: f32, // gain compensation
     pub(crate) a1: f32, // [n-1] feedback
     pub(crate) a2: f32, // [n-2] feedback
     pub(crate) b0: f32, // [n] out
     pub(crate) b1: f32, // [n-1] out
-    pub(crate) b2: f32, pub(crate) // [n-2] out
-    target_a: (f32, f32, f32), pub(crate) // smoothing
-    target_b: (f32, f32, f32),
+    pub(crate) b2: f32,
+    pub(crate) target_a: (f32, f32, f32),
+    pub(crate) target_b: (f32, f32, f32),
 }
 
 impl Filter for TestFilter {
@@ -46,8 +46,8 @@ impl Filter for TestFilter {
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
         // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
 
-        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)." 
-    
+        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)."
+
         // [This notice should be placed within redistributed or derivative software code or text when appropriate. This particular formulation became active on May 13, 2015, and edited for clarity 7 April, 2021, superseding the 2002 version.]
         // Audio Eq Cookbook: https://www.w3.org/TR/audio-eq-cookbook/
         // Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute of Technology, European Research Consortium for Informatics and Mathematics, Keio University, Beihang). All Rights Reserved. This work is distributed under the W3C® Software and Document License [1] in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
@@ -110,26 +110,58 @@ impl FilterController {
             keytrack: 0.0,
         }
     }
-    pub(crate) fn process_envelope_held(&mut self, filter: &mut impl Filter, keytrack_freq: f32, input: f32, envelope_index: f32, sample_rate: f32) -> f32 {
-        filter.set_params(sample_rate,
-            (self.cutoff + keytrack_freq + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
-            self.resonance
+    pub(crate) fn process_envelope_held(
+        &mut self,
+        filter: &mut impl Filter,
+        keytrack_freq: f32,
+        input: f32,
+        envelope_index: f32,
+        sample_rate: f32,
+    ) -> f32 {
+        filter.set_params(
+            sample_rate,
+            (self.cutoff
+                + keytrack_freq
+                + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount)
+                .clamp(1.0, 22000.0),
+            self.resonance,
         );
         let out = filter.process(input);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
         out
     }
-    pub(crate) fn process_envelope_released(&mut self, filter: &mut impl Filter, keytrack_freq: f32, input: f32, envelope_index: f32, release_index: f32, sample_rate: f32) -> f32 {
-        filter.set_params(sample_rate,
-            (self.cutoff + keytrack_freq + self.cutoff_envelope.sample_released(release_index, envelope_index) * self.envelope_amount).clamp(1.0, 22000.0),
-            self.resonance
+    pub(crate) fn process_envelope_released(
+        &mut self,
+        filter: &mut impl Filter,
+        keytrack_freq: f32,
+        input: f32,
+        envelope_index: f32,
+        release_index: f32,
+        sample_rate: f32,
+    ) -> f32 {
+        filter.set_params(
+            sample_rate,
+            (self.cutoff
+                + keytrack_freq
+                + self
+                    .cutoff_envelope
+                    .sample_released(release_index, envelope_index)
+                    * self.envelope_amount)
+                .clamp(1.0, 22000.0),
+            self.resonance,
         );
         let out = filter.process(input);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
         out
     }
 
-    pub(crate) fn lerp_controls(&mut self, filter: &mut TestFilter, sample_rate: f32, target_cutoff: f32, target_resonance: f32) {
+    pub(crate) fn lerp_controls(
+        &mut self,
+        filter: &mut TestFilter,
+        sample_rate: f32,
+        target_cutoff: f32,
+        target_resonance: f32,
+    ) {
         self.cutoff = lerp(self.cutoff, target_cutoff, 500.0 / sample_rate);
         self.resonance = lerp(self.cutoff, target_resonance, 500.0 / sample_rate);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
@@ -154,13 +186,72 @@ pub struct RcFilter {
     rcc: f32,
     rcq: f32,
 
-    last: f32,
-    bp: f32,
-    lp: f32,
-    hp: f32,
+    // First stage
+    last0: f32,
+    bp0: f32,
+    lp0: f32,
+    hp0: f32,
+
+    // Second stage
+    last1: f32,
+    bp1: f32,
+    lp1: f32,
+    hp1: f32,
 
     order: FilterOrder,
     filter_type: FilterType,
+}
+impl RcFilter {
+    /// Filters a single sample through the RC filter's first stage
+    #[inline]
+    fn step_first_stage(&mut self, input: f32) {
+        let temp_in = (input + self.bp0 * self.rcq).clamp(-1.0, 1.0);
+        let lp = (temp_in * self.rcb + self.lp0 * self.rca).clamp(-1.0, 1.0);
+        let hp = (self.rcc * (self.hp0 + temp_in - self.last0)).clamp(-1.0, 1.0);
+        let bp = (hp * self.rcb + self.bp0 * self.rca).clamp(-1.0, 1.0);
+
+        self.last0 = temp_in;
+        self.lp0 = lp;
+        self.hp0 = hp;
+        self.bp0 = bp;
+    }
+    /// Filters a single sample through the RC filter's second stage
+    #[inline]
+    fn step_second_stage(&mut self, input: f32) {
+        let temp_in = (input + self.bp1 * self.rcq).clamp(-1.0, 1.0);
+        let lp = (temp_in * self.rcb + self.lp1 * self.rca).clamp(-1.0, 1.0);
+        let hp = (self.rcc * (self.hp1 + temp_in - self.last1)).clamp(-1.0, 1.0);
+        let bp = (hp * self.rcb + self.bp1 * self.rca).clamp(-1.0, 1.0);
+
+        self.last1 = temp_in;
+        self.lp1 = lp;
+        self.hp1 = hp;
+        self.bp1 = bp;
+    }
+    /// First-order-filters a single sample and returns a tuple of (lp, hp, bp)
+    #[inline]
+    pub fn filter_all(&mut self, input: f32) -> (f32, f32, f32) {
+        for _ in 0..4 {
+            self.step_first_stage(input);
+        }
+        (self.lp0, self.hp0, self.bp0)
+    }
+    #[inline]
+    pub fn filter_2nd_order(&mut self, input: f32) -> f32 {
+        for _ in 0..4 {
+            self.step_first_stage(input);
+            match self.filter_type {
+                FilterType::Lowpass => self.step_second_stage(self.lp0),
+                FilterType::Bandpass => self.step_second_stage(self.bp0),
+                FilterType::Highpass => self.step_second_stage(self.hp0),
+            }
+        }
+        match self.filter_type {
+            FilterType::Lowpass => self.lp1,
+            FilterType::Bandpass => self.bp1,
+            FilterType::Highpass => self.hp1,
+        }
+    }
 }
 impl Filter for RcFilter {
     // Original notice:
@@ -169,39 +260,46 @@ impl Filter for RcFilter {
     // can be driven up to self-oscillation (BTW: do not remove the limits!!!).
     // (C) 1998 ... 2009 S.Fendt. Released under the GPL v2.0  or any later version.
     fn process(&mut self, input: f32) -> f32 {
-        match self.order {
-            FilterOrder::_12dB => {
-                match self.filter_type {
-                    FilterType::Lowpass => {
-                        for _ in 0..4 {
-                            let old_last = self.last;
-                            self.last = (input + self.bp * self.rcq).clamp(-1.0, 1.0);
-                            
-                            self.lp = (self.last * self.rcb + self.lp * self.rca).clamp(-1.0, 1.0);
-
-                            self.hp = (self.rcc * (self.hp + self.last - old_last)).clamp(-1.0, 1.0);
-
-                            self.bp = (self.hp * self.rcb + self.bp * self.rca).clamp(-1.0, 1.0);
-                        }
-                        self.lp
-                    },
-                    FilterType::Bandpass => todo!(),
-                    FilterType::Highpass => todo!(),
-                }
+        match &self.order {
+            FilterOrder::_12dB => match &self.filter_type {
+                FilterType::Lowpass => self.filter_all(input).0,
+                FilterType::Bandpass => self.filter_all(input).1,
+                FilterType::Highpass => self.filter_all(input).2,
             },
-            FilterOrder::_24dB => todo!(),
+            FilterOrder::_24dB => self.filter_2nd_order(input),
         }
     }
 
     fn set_params(&mut self, sample_rate: f32, mut cutoff: f32, resonance: f32) {
         cutoff = cutoff.clamp(20.0, 21000.0);
-        let delta = (1.0 / sample_rate) * 0.25;
+        let delta = (1.0 / sample_rate) / 4.0; // division by 4.0 occurs because of oversampling when processing... 
         let freq = 1.0 / (cutoff * PI * 2.0);
 
         self.rca = 1.0 - delta / (freq + delta);
         self.rcb = 1.0 - self.rca;
-        self.rcb = freq / (freq + delta);
+        self.rcc = freq / (freq + delta);
 
         self.rcq = resonance * 0.25;
+        // println!("rcq: {}", self.rcq);
+    }
+}
+impl Default for RcFilter {
+    fn default() -> Self {
+        Self {
+            rca: Default::default(),
+            rcb: Default::default(),
+            rcc: Default::default(),
+            rcq: Default::default(),
+            last0: Default::default(),
+            bp0: Default::default(),
+            lp0: Default::default(),
+            hp0: Default::default(),
+            last1: Default::default(),
+            bp1: Default::default(),
+            lp1: Default::default(),
+            hp1: Default::default(),
+            order: FilterOrder::_24dB,
+            filter_type: FilterType::Lowpass,
+        }
     }
 }

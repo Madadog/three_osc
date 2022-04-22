@@ -294,8 +294,8 @@ impl Wavetable {
         // self.index_lagrange(self.phase_to_index(phase))
     }
     #[inline]
-    pub fn generate_multi(&self, phases: &[f32]) -> f32 {
-        phases.iter().map(|phase| self.index_lerp(self.phase_to_index(*phase))).sum()
+    pub fn generate_multi(&self, phases: &[f32], max: usize) -> f32 {
+        phases.iter().take(max).map(|phase| self.index_lerp(self.phase_to_index(*phase))).sum()
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {

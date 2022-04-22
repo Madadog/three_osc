@@ -82,20 +82,29 @@ impl ThreeOsc {
 
                 let osc2_out = if let Some(osc) = self.oscillators.get(1) {
                     let phases = osc.unison_phases(&mut voice.osc_voice[1], 0.0, 0.0, self.sample_rate as f32);
-                    let osc_out = self.wavetables.tables[index].generate_multi(phases);
+                    let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                     out += osc_out * osc.amp * velocity;
                     osc_out
                 } else {
                     unreachable!("Osc2 wasn't found...");
                 };
-
+                
                 if let Some(osc) = self.oscillators.get(0) {
                     let phases = osc.unison_phases(&mut voice.osc_voice[0],
                         osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
-                    out += self.wavetables.tables[index].generate_multi(phases);
+                    let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                    out += osc_out * osc.amp * velocity;
                 }
-                // out += self.wavetables.tables[voice.id as usize].index(0);
-
+                let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
+                
+                // filter envelope
+                out = if let Some(release_time) = voice.release_time {
+                    let release_index = release_time as f32 / self.sample_rate as f32;
+                    self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
+                } else {
+                    self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
+                };
+                
                 // amplitude envelope
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;
@@ -104,20 +113,6 @@ impl ThreeOsc {
                         .sample_released(release_index, envelope_index)
                 } else {
                     out * self.gain_envelope.sample_held(envelope_index)
-                };
-
-                let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
-
-                if voice_freq > 100000.0 {
-                    panic!("something went very wrong (keytrack freq: {}, voice id: {}, sample rate: {}, keytrack: {}, 2.0_f32.powf(voice.id as f32 - 69.0 / 12.0): {}, voice.id as f32 = {})", voice_freq, voice.id, self.sample_rate, self.filter_controller.keytrack, 2.0_f32.powf(voice.id as f32 - 69.0 / 12.0), voice.id as f32);
-                }
-
-                // filter envelope
-                out = if let Some(release_time) = voice.release_time {
-                    let release_index = release_time as f32 / self.sample_rate as f32;
-                    self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
-                } else {
-                    self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
                 };
 
                 *out_l += out;
@@ -142,7 +137,7 @@ pub struct Voice {
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 2],
-    filter: filter::TestFilter,
+    filter: filter::RcFilter,
     velocity: u8,
 }
 impl Voice {
@@ -164,7 +159,7 @@ impl Voice {
             release_time: None,
             osc_voice,
             velocity,
-            filter: filter::TestFilter::default(),
+            filter: filter::RcFilter::default(),
         }
     }
     pub fn release(&mut self) {
