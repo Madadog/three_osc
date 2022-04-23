@@ -222,7 +222,33 @@ impl RcFilter {
         let lp = (temp_in * self.rcb + self.lp1 * self.rca).clamp(-1.0, 1.0);
         let hp = (self.rcc * (self.hp1 + temp_in - self.last1)).clamp(-1.0, 1.0);
         let bp = (hp * self.rcb + self.bp1 * self.rca).clamp(-1.0, 1.0);
+        
+        self.last1 = temp_in;
+        self.lp1 = lp;
+        self.hp1 = hp;
+        self.bp1 = bp;
+    }
+    /// Filters a single sample through the RC filter's first stage using tanh instead of hard clipping
+    #[inline]
+    fn step_first_stage_tanh(&mut self, input: f32) {
+        let temp_in = (input + self.bp0 * self.rcq).tanh();
+        let lp = (temp_in * self.rcb + self.lp0 * self.rca).tanh();
+        let hp = (self.rcc * (self.hp0 + temp_in - self.last0)).tanh();
+        let bp = (hp * self.rcb + self.bp0 * self.rca).tanh();
 
+        self.last0 = temp_in;
+        self.lp0 = lp;
+        self.hp0 = hp;
+        self.bp0 = bp;
+    }
+    /// Filters a single sample through the RC filter's second stage using tanh instead of hard clipping
+    #[inline]
+    fn step_second_stage_tanh(&mut self, input: f32) {
+        let temp_in = (input + self.bp1 * self.rcq).tanh();
+        let lp = (temp_in * self.rcb + self.lp1 * self.rca).tanh();
+        let hp = (self.rcc * (self.hp1 + temp_in - self.last1)).tanh();
+        let bp = (hp * self.rcb + self.bp1 * self.rca).tanh();
+        
         self.last1 = temp_in;
         self.lp1 = lp;
         self.hp1 = hp;
@@ -252,6 +278,29 @@ impl RcFilter {
             FilterType::Highpass => self.hp1,
         }
     }
+    #[inline]
+    pub fn filter_all_tanh(&mut self, input: f32) -> (f32, f32, f32) {
+        for _ in 0..4 {
+            self.step_first_stage_tanh(input);
+        }
+        (self.lp0, self.hp0, self.bp0)
+    }
+    #[inline]
+    pub fn filter_2nd_order_tanh(&mut self, input: f32) -> f32 {
+        for _ in 0..4 {
+            self.step_first_stage_tanh(input);
+            match self.filter_type {
+                FilterType::Lowpass => self.step_second_stage_tanh(self.lp0),
+                FilterType::Bandpass => self.step_second_stage_tanh(self.bp0),
+                FilterType::Highpass => self.step_second_stage_tanh(self.hp0),
+            }
+        }
+        match self.filter_type {
+            FilterType::Lowpass => self.lp1,
+            FilterType::Bandpass => self.bp1,
+            FilterType::Highpass => self.hp1,
+        }
+    }
 }
 impl Filter for RcFilter {
     // Original notice:
@@ -262,11 +311,11 @@ impl Filter for RcFilter {
     fn process(&mut self, input: f32) -> f32 {
         match &self.order {
             FilterOrder::_12dB => match &self.filter_type {
-                FilterType::Lowpass => self.filter_all(input).0,
-                FilterType::Bandpass => self.filter_all(input).1,
-                FilterType::Highpass => self.filter_all(input).2,
+                FilterType::Lowpass => self.filter_all_tanh(input).0,
+                FilterType::Bandpass => self.filter_all_tanh(input).1,
+                FilterType::Highpass => self.filter_all_tanh(input).2,
             },
-            FilterOrder::_24dB => self.filter_2nd_order(input),
+            FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
         }
     }
 
@@ -298,8 +347,8 @@ impl Default for RcFilter {
             bp1: Default::default(),
             lp1: Default::default(),
             hp1: Default::default(),
-            order: FilterOrder::_24dB,
-            filter_type: FilterType::Lowpass,
+            order: FilterOrder::_12dB,
+            filter_type: FilterType::Bandpass,
         }
     }
 }
