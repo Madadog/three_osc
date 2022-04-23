@@ -249,15 +249,25 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 25 ;
-                lv2:symbol "fil1_mode" ;
-                lv2:name "Filter 1 Mode" ;
-                lv2:default 0.000 ;
-                lv2:minimum -2.000 ;
-                lv2:maximum 2.000 ;
+                lv2:symbol "fil1_model" ;
+                lv2:name "Filter 1 Model" ;
+                lv2:default 0 ;
+                lv2:minimum 0 ;
+                lv2:maximum 3 ;
+                lv2:portProperty lv2:integer ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 26 ;
+                lv2:symbol "fil1_mode" ;
+                lv2:name "Filter 1 Mode" ;
+                lv2:default 0.000 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 3.000 ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 27 ;
                 lv2:symbol "fil1_cutoff" ;
                 lv2:name "Filter 1 Cutoff" ;
                 lv2:default 22000.000 ;
@@ -266,7 +276,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 27 ;
+                lv2:index 28 ;
                 lv2:symbol "fil1_resonance" ;
                 lv2:name "Filter 1 Resonance" ;
                 lv2:default 0.100 ;
@@ -275,7 +285,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 28 ;
+                lv2:index 29 ;
                 lv2:symbol "fil1_keytrack" ;
                 lv2:name "Filter 1 Keytrack" ;
                 lv2:default 0.000 ;
@@ -284,7 +294,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 29 ;
+                lv2:index 30 ;
                 lv2:symbol "fil1_env_amount" ;
                 lv2:name "Filter 1 Env. Amount" ;
                 lv2:default 0.000 ;
@@ -293,7 +303,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 30 ;
+                lv2:index 31 ;
                 lv2:symbol "fil1_attack" ;
                 lv2:name "Filter 1 Attack" ;
                 lv2:default 0.001 ;
@@ -302,7 +312,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 31 ;
+                lv2:index 32 ;
                 lv2:symbol "fil1_decay" ;
                 lv2:name "Filter 1 Decay" ;
                 lv2:default 0.250 ;
@@ -311,7 +321,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 32 ;
+                lv2:index 33 ;
                 lv2:symbol "fil1_sustain" ;
                 lv2:name "Filter 1 Sustain" ;
                 lv2:default 1.000 ;
@@ -320,7 +330,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 33 ;
+                lv2:index 34 ;
                 lv2:symbol "fil1_release" ;
                 lv2:name "Filter 1 Release" ;
                 lv2:default 0.005 ;
@@ -329,7 +339,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 34 ;
+                lv2:index 35 ;
                 lv2:symbol "fil1_slope" ;
                 lv2:name "Filter 1 Slope" ;
                 lv2:default 0.000 ;
@@ -338,7 +348,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 35 ;
+                lv2:index 36 ;
                 lv2:symbol "vol_attack" ;
                 lv2:name "Vol Attack" ;
                 lv2:default 0.001 ;
@@ -347,7 +357,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 36 ;
+                lv2:index 37 ;
                 lv2:symbol "vol_decay" ;
                 lv2:name "Vol Decay" ;
                 lv2:default 0.250 ;
@@ -356,7 +366,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 37 ;
+                lv2:index 38 ;
                 lv2:symbol "vol_sustain" ;
                 lv2:name "Vol Sustain" ;
                 lv2:default 1.000 ;
@@ -365,7 +375,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 38 ;
+                lv2:index 39 ;
                 lv2:symbol "vol_release" ;
                 lv2:name "Vol Release" ;
                 lv2:default 0.005 ;
@@ -374,7 +384,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 39 ;
+                lv2:index 40 ;
                 lv2:symbol "vol_slope" ;
                 lv2:name "Vol Slope" ;
                 lv2:default 0.000 ;
@@ -383,7 +393,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 40 ;
+                lv2:index 41 ;
                 lv2:symbol "output_gain" ;
                 lv2:name "Output Gain" ;
                 lv2:default -18.000 ;
@@ -392,7 +402,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 41 ;
+                lv2:index 42 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Master Pitch" ;
                 lv2:default 0 ;
@@ -402,7 +412,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 42 ;
+                lv2:index 43 ;
                 lv2:symbol "bend_range" ;
                 lv2:name "Bend Range" ;
                 lv2:default 0 ;

@@ -7,6 +7,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
+use self::filter::Filter;
 use self::oscillator::AdditiveOsc;
 use self::oscillator::SimpleSin;
 use self::oscillator::SuperVoice;
@@ -97,6 +98,8 @@ impl ThreeOsc {
                 }
                 let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
                 
+                voice.filter.set_filter_type(self.filter_controller.mode);
+
                 // filter envelope
                 out = if let Some(release_time) = voice.release_time {
                     let release_index = release_time as f32 / self.sample_rate as f32;

@@ -88,6 +88,7 @@ impl Filter for CascadeFilter {
 pub(crate) trait Filter {
     fn process(&mut self, input: f32) -> f32;
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32);
+    fn set_filter_type(&mut self, filter_type: FilterType) {}
 }
 
 #[derive(Debug)]
@@ -98,6 +99,8 @@ pub(crate) struct FilterController {
     pub(crate) cutoff: f32,
     pub(crate) resonance: f32,
     pub(crate) keytrack: f32,
+    pub(crate) mode: FilterType,
+
 }
 
 impl FilterController {
@@ -108,6 +111,7 @@ impl FilterController {
             cutoff: 100.0,
             resonance: 0.1,
             keytrack: 0.0,
+            mode: FilterType::Lowpass,
         }
     }
     pub(crate) fn process_envelope_held(
@@ -168,12 +172,14 @@ impl FilterController {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum FilterType {
     Lowpass,
     Bandpass,
     Highpass,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum FilterOrder {
     _12dB,
     _24dB,
@@ -311,16 +317,24 @@ impl Filter for RcFilter {
     fn process(&mut self, input: f32) -> f32 {
         match &self.order {
             FilterOrder::_12dB => match &self.filter_type {
-                FilterType::Lowpass => self.filter_all_tanh(input).0,
-                FilterType::Bandpass => self.filter_all_tanh(input).1,
-                FilterType::Highpass => self.filter_all_tanh(input).2,
+                FilterType::Lowpass => self.filter_all(input).0,
+                FilterType::Bandpass => self.filter_all(input).1,
+                FilterType::Highpass => self.filter_all(input).2,
             },
-            FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
+            FilterOrder::_24dB => self.filter_2nd_order(input),
         }
+        // match &self.order {
+        //     FilterOrder::_12dB => match &self.filter_type {
+        //         FilterType::Lowpass => self.filter_all_tanh(input).0,
+        //         FilterType::Bandpass => self.filter_all_tanh(input).1,
+        //         FilterType::Highpass => self.filter_all_tanh(input).2,
+        //     },
+        //     FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
+        // }
     }
 
     fn set_params(&mut self, sample_rate: f32, mut cutoff: f32, resonance: f32) {
-        cutoff = cutoff.clamp(20.0, 21000.0);
+        cutoff = cutoff.clamp(5.0, 22000.0);
         let delta = (1.0 / sample_rate) / 4.0; // division by 4.0 occurs because of oversampling when processing... 
         let freq = 1.0 / (cutoff * PI * 2.0);
 
@@ -330,6 +344,9 @@ impl Filter for RcFilter {
 
         self.rcq = resonance * 0.25;
         // println!("rcq: {}", self.rcq);
+    }
+    fn set_filter_type(&mut self, filter_type: FilterType) {
+        self.filter_type = filter_type;
     }
 }
 impl Default for RcFilter {
@@ -347,8 +364,8 @@ impl Default for RcFilter {
             bp1: Default::default(),
             lp1: Default::default(),
             hp1: Default::default(),
-            order: FilterOrder::_12dB,
-            filter_type: FilterType::Bandpass,
+            order: FilterOrder::_24dB,
+            filter_type: FilterType::Lowpass,
         }
     }
 }

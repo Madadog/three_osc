@@ -311,9 +311,14 @@ impl PortList {
     fn filter() -> PortList {
         Self(vec![
             ControlPort::new(
+                "model",
+                "Model",
+                Int(0, (0, 3)),
+            ),
+            ControlPort::new(
                 "mode",
                 "Mode",
-                Float(0.0, (-2.0, 2.0)),
+                Float(0.0, (0.0, 3.0)),
             ),
             ControlPort::new(
                 "cutoff",

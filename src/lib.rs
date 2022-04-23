@@ -4,7 +4,7 @@ use std::convert::TryInto;
 use lv2::{prelude::*, lv2_core::plugin};
 
 mod synth;
-use synth::{ThreeOsc, oscillator::OscWave, filter::Filter};
+use synth::{ThreeOsc, oscillator::OscWave, filter::{Filter, FilterType}};
 use wmidi::MidiMessage;
 
 // Most useful plugins will have ports for input and output data. In code, these ports are represented by a struct implementing the `PortCollection` trait. Internally, ports are referred to by index. These indices are assigned in ascending order, starting with 0 for the first port. The indices in `amp.ttl` have to match them, or else.
@@ -35,6 +35,7 @@ struct Ports {
     osc2_super_detune: InputPort<Control>,
     osc2_phase: InputPort<Control>,
     osc2_phase_rand: InputPort<Control>,
+    fil1_model: InputPort<Control>,
     fil1_mode: InputPort<Control>,
     fil1_cutoff: InputPort<Control>,
     fil1_resonance: InputPort<Control>,
@@ -113,6 +114,12 @@ impl Plugin for SynthLv2 {
         self.synth.filter_controller.cutoff_envelope.slope = 2.0_f32.powf(*ports.fil1_slope);
         self.synth.filter_controller.cutoff = *ports.fil1_cutoff;
         self.synth.filter_controller.resonance = *ports.fil1_resonance;
+        self.synth.filter_controller.mode = match *ports.fil1_mode {
+            x if x < 1.0 => {FilterType::Lowpass},
+            x if x < 2.0 => {FilterType::Bandpass},
+            x if x <= 3.0 => {FilterType::Highpass},
+            _ => {panic!("You messed up")}
+        };
 
         //self.synth.gain_envelope.limits();
 
