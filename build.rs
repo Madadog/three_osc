@@ -86,9 +86,12 @@ struct ControlPort {
     symbol: String,
     name: String,
     range: ControlRange,
+    properties: Vec<PortProperty>,
 }
 impl ControlPort {
-    fn new(symbol: &str, name: &str, range: ControlRange) -> Self { Self { symbol: symbol.to_string(), name: name.to_string(), range } }
+    fn new(symbol: &str, name: &str, range: ControlRange) -> Self { Self { symbol: symbol.to_string(), name: name.to_string(), range, properties: vec!() } }
+    fn with_properties(self, properties: Vec<PortProperty>) -> Self { Self {properties, ..self}}
+    fn logarithmic(self) -> Self { self.with_properties(vec![PortProperty::Logarithmic]) }
     fn to_ttl(&self, index: usize) -> String {
         let mut buf = String::with_capacity(1000);
         buf.push_str(&format!("                lv2:index {index} ;\n"));
@@ -99,6 +102,12 @@ impl ControlPort {
         buf.push_str(&format!("                lv2:maximum {} ;", self.range.max()));
         if matches!(self.range, ControlRange::Int(_, (_, _))) {
             buf.push_str("\n                lv2:portProperty lv2:integer ;")
+        }
+        for property in self.properties.iter() {
+            match property {
+                PortProperty::Logarithmic => {buf.push_str("\n                lv2:portProperty props:logarithmic ;")},
+                x => {panic!("You need to add {:?} to the .to_ttl() function", x)}
+            }
         }
         buf
     }
@@ -149,6 +158,11 @@ fn prefix_ports(ports: &mut [ControlPort], symbol_prefix: &str, name_prefix: &st
     for port in ports {
         port.prefix(symbol_prefix, name_prefix);
     }
+}
+
+#[derive(Debug, Clone)]
+enum PortProperty {
+    Logarithmic,
 }
 
 use ControlRange::{Int, Float};
@@ -207,7 +221,7 @@ impl PortList {
             ControlPort::new(
                 "super_detune",
                 "Super Detune",
-                Float(0.0, (0.0, 100.0)),
+                Float(21.0, (0.0, 100.0)),
             ),
             ControlPort::new(
                 "phase",
@@ -236,7 +250,7 @@ impl PortList {
             ControlPort::new(
                 "bend_range",
                 "Bend Range",
-                Int(0, (-24, 24)),
+                Int(2, (-24, 24)),
             ),
         ])
     }
@@ -246,12 +260,12 @@ impl PortList {
                 "attack",
                 "Attack",
                 Float(0.001, (0.0, 15.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "decay",
                 "Decay",
                 Float(0.25, (0.0, 15.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "sustain",
                 "Sustain",
@@ -261,7 +275,7 @@ impl PortList {
                 "release",
                 "Release",
                 Float(0.005, (0.001, 15.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "slope",
                 "Slope",
@@ -285,12 +299,12 @@ impl PortList {
                 "attack",
                 "Attack",
                 Float(0.001, (0.0, 15.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "decay",
                 "Decay",
                 Float(0.25, (0.0, 15.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "sustain",
                 "Sustain",
@@ -300,7 +314,7 @@ impl PortList {
                 "release",
                 "Release",
                 Float(0.005, (0.001, 15.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "slope",
                 "Slope",
@@ -324,7 +338,7 @@ impl PortList {
                 "cutoff",
                 "Cutoff",
                 Float(22000.0, (1.0, 22000.0)),
-            ),
+            ).logarithmic(),
             ControlPort::new(
                 "resonance",
                 "Resonance",

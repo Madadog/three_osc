@@ -121,7 +121,7 @@
                 lv2:index 11 ;
                 lv2:symbol "osc1_super_detune" ;
                 lv2:name "Osc1 Super Detune" ;
-                lv2:default 0.000 ;
+                lv2:default 21.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 100.000 ;
         ] , [
@@ -224,7 +224,7 @@
                 lv2:index 22 ;
                 lv2:symbol "osc2_super_detune" ;
                 lv2:name "Osc2 Super Detune" ;
-                lv2:default 0.000 ;
+                lv2:default 21.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 100.000 ;
         ] , [
@@ -273,6 +273,7 @@
                 lv2:default 22000.000 ;
                 lv2:minimum 1.000 ;
                 lv2:maximum 22000.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -309,6 +310,7 @@
                 lv2:default 0.001 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 15.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -318,6 +320,7 @@
                 lv2:default 0.250 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 15.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -336,6 +339,7 @@
                 lv2:default 0.005 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -354,6 +358,7 @@
                 lv2:default 0.001 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 15.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -363,6 +368,7 @@
                 lv2:default 0.250 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 15.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -381,6 +387,7 @@
                 lv2:default 0.005 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
+                lv2:portProperty props:logarithmic ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -415,7 +422,7 @@
                 lv2:index 43 ;
                 lv2:symbol "bend_range" ;
                 lv2:name "Bend Range" ;
-                lv2:default 0 ;
+                lv2:default 2 ;
                 lv2:minimum -24 ;
                 lv2:maximum 24 ;
                 lv2:portProperty lv2:integer ;
