@@ -99,8 +99,8 @@ pub(crate) struct FilterController {
     pub(crate) cutoff: f32,
     pub(crate) resonance: f32,
     pub(crate) keytrack: f32,
-    pub(crate) mode: FilterType,
-
+    pub(crate) filter_type: FilterType,
+    pub(crate) filter_model: FilterModel,
 }
 
 impl FilterController {
@@ -111,7 +111,8 @@ impl FilterController {
             cutoff: 100.0,
             resonance: 0.1,
             keytrack: 0.0,
-            mode: FilterType::Lowpass,
+            filter_type: FilterType::Lowpass,
+            filter_model: FilterModel::RcFilter,
         }
     }
     pub(crate) fn process_envelope_held(
@@ -170,6 +171,14 @@ impl FilterController {
         self.resonance = lerp(self.cutoff, target_resonance, 500.0 / sample_rate);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FilterModel {
+    None,
+    RcFilter,
+    LadderFilter,
+    BiquadFilter,
 }
 
 #[derive(Debug, Clone, Copy)]

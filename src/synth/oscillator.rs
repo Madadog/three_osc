@@ -299,6 +299,7 @@ impl Wavetable {
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
+        assert!(harmonics <= (len / 2), "Generated {harmonics} harmonics with {len} len");
         let table: Vec<f32> = (0..len)
             .into_iter()
             .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
@@ -343,7 +344,7 @@ impl WavetableNotes {
     ) -> Self {
         debug_assert!(
             oversampling_factor >= 1.0,
-            "Oversampling factor should be greater than 1"
+            "Oversampling factor should be 1.0 or greater"
         );
         // let oversampling_factor = 8.0; // Reduce lerp aliasing
         let tables: Vec<Wavetable> = (0..128)
@@ -355,11 +356,49 @@ impl WavetableNotes {
             })
             .map(|len| {
                 // Make sample length even
-                let len = len + len % 2;
+                // let len_up = len + 2 + len % 2;
+                // let len_down = len - 2 - len % 2;
+                let len_up = len.saturating_add(8);
+                let len_down = len.saturating_sub(8);
                 Wavetable::from_additive_osc(
                     osc,
-                    len,
-                    (len as f32 / (2.0 * oversampling_factor)) as usize,
+                    len_up,
+                    (len_down as f32 / (2.0 * oversampling_factor)) as usize,
+                )
+            })
+            .collect();
+        Self {
+            tables: tables.try_into().unwrap(),
+        }
+    }
+    /// Constant table length
+    /// 
+    /// Constant table length = increased precision for higher notes with less harmonics, at the cost of more aliasing for
+    /// higher harmonics on lower notes (only comparatively. )
+    pub fn from_additive_osc_2(
+        osc: &AdditiveOsc,
+        sample_rate: f32,
+        oversampling_factor: f32,
+        table_length: usize,
+    ) -> Self {
+        debug_assert!(
+            oversampling_factor >= 1.0,
+            "Oversampling factor should be 1.0 or greater"
+        );
+        let tables: Vec<Wavetable> = (0..128)
+            .into_iter()
+            .map(|x| {
+                // Number of harmonics required for note
+                (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
+                    .floor() as usize
+            })
+            .map(|harmonics| {
+                // clamp to nyquist
+                let harmonics = harmonics.min(table_length / 2);
+                Wavetable::from_additive_osc(
+                    osc,
+                    (table_length as f32 * oversampling_factor) as usize,
+                    harmonics,
                 )
             })
             .collect();

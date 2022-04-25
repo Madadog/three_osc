@@ -8,6 +8,7 @@ use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
+use self::filter::FilterModel;
 use self::oscillator::AdditiveOsc;
 use self::oscillator::SimpleSin;
 use self::oscillator::SuperVoice;
@@ -41,7 +42,7 @@ impl ThreeOsc {
             sample_rate,
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
-            wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 2.0),
+            wavetables: WavetableNotes::from_additive_osc_2(&AdditiveOsc::saw(), sample_rate as f32, 1.0, 2048),
             additive: AdditiveOsc::saw(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
@@ -102,15 +103,20 @@ impl ThreeOsc {
             }
             let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
             
-            voice.filter.set_filter_type(self.filter_controller.mode);
-    
+            voice.filter.set_filter_type(self.filter_controller.filter_type);
+            
             // filter envelope
-            out = if let Some(release_time) = voice.release_time {
-                let release_index = release_time as f32 / self.sample_rate as f32;
-                self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
-            } else {
-                self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
-            };
+            match self.filter_controller.filter_model {
+                FilterModel::None => {},
+                x => {
+                    out = if let Some(release_time) = voice.release_time {
+                        let release_index = release_time as f32 / self.sample_rate as f32;
+                        self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
+                    } else {
+                        self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
+                    };
+                }
+            }
             
             // amplitude envelope
             out = if let Some(release_time) = voice.release_time {

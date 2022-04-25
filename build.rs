@@ -327,11 +327,11 @@ impl PortList {
             ControlPort::new(
                 "model",
                 "Model",
-                Int(0, (0, 3)),
+                Int(0, (0, 4)),
             ),
             ControlPort::new(
-                "mode",
-                "Mode",
+                "type",
+                "Type",
                 Float(0.0, (0.0, 3.0)),
             ),
             ControlPort::new(
