@@ -349,10 +349,12 @@ impl WavetableNotes {
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
             .map(|x| {
+                // Required sample length for note
                 (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
                     .ceil() as usize
             })
             .map(|len| {
+                // Make sample length even
                 let len = len + len % 2;
                 Wavetable::from_additive_osc(
                     osc,
@@ -371,7 +373,7 @@ impl WavetableNotes {
 /// 
 /// The lowest-frequency signal that can be generated with all of its expected harmonics
 /// is given by sample_rate / (2.0 * N). (i.e. with 2560 sinusoids: 44100/(2.0 * 2560) = 8.613 Hz)
-pub struct AdditiveOsc<const N: usize = 2560> {
+pub struct AdditiveOsc<const N: usize = 1280> {
     amplitudes: [f32; N],
     phases: [f32; N],
 }

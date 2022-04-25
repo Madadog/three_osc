@@ -41,7 +41,7 @@ impl ThreeOsc {
             sample_rate,
             output_volume: 0.3,
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
-            wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 8.0),
+            wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 2.0),
             additive: AdditiveOsc::saw(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
@@ -73,58 +73,60 @@ impl ThreeOsc {
         output: std::iter::Zip<std::slice::IterMut<f32>, std::slice::IterMut<f32>>,
     ) {
         output.for_each(|(out_l, out_r)| {
-            self.release_voices();
-            for voice in self.voices.iter_mut() {
-                voice.advance();
-                let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
-                let mut out = 0.0;
-                let velocity = voice.velocity as f32 / 128.0;
-                let index = voice.id as usize;
-
-                let osc2_out = if let Some(osc) = self.oscillators.get(1) {
-                    let phases = osc.unison_phases(&mut voice.osc_voice[1], 0.0, 0.0, self.sample_rate as f32);
-                    let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
-                    out += osc_out * osc.amp * velocity;
-                    osc_out
-                } else {
-                    unreachable!("Osc2 wasn't found...");
-                };
-                
-                if let Some(osc) = self.oscillators.get(0) {
-                    let phases = osc.unison_phases(&mut voice.osc_voice[0],
-                        osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
-                    let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
-                    out += osc_out * osc.amp * velocity;
-                }
-                let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
-                
-                voice.filter.set_filter_type(self.filter_controller.mode);
-
-                // filter envelope
-                out = if let Some(release_time) = voice.release_time {
-                    let release_index = release_time as f32 / self.sample_rate as f32;
-                    self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
-                } else {
-                    self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
-                };
-                
-                // amplitude envelope
-                out = if let Some(release_time) = voice.release_time {
-                    let release_index = release_time as f32 / self.sample_rate as f32;
-                    out * self
-                        .gain_envelope
-                        .sample_released(release_index, envelope_index)
-                } else {
-                    out * self.gain_envelope.sample_held(envelope_index)
-                };
-
-                *out_l += out;
-                *out_r += out;
-            }
-            // *out_l = self.filter.process(*out_l) * self.output_volume;
-            *out_l = *out_l * self.output_volume;
-            *out_r = *out_l;
+            self.run_voices(out_l, out_r);
         })
+    }
+    pub fn run_voices(&mut self, out_l: &mut f32, out_r: &mut f32) {
+        self.release_voices();
+        for voice in self.voices.iter_mut() {
+            voice.advance();
+            let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
+            let mut out = 0.0;
+            let velocity = voice.velocity as f32 / 128.0;
+            let index = voice.id as usize;
+    
+            let osc2_out = if let Some(osc) = self.oscillators.get(1) {
+                let phases = osc.unison_phases(&mut voice.osc_voice[1], 0.0, 0.0, self.sample_rate as f32);
+                let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                out += osc_out * osc.amp * velocity;
+                osc_out
+            } else {
+                unreachable!("Osc2 wasn't found...");
+            };
+            
+            if let Some(osc) = self.oscillators.get(0) {
+                let phases = osc.unison_phases(&mut voice.osc_voice[0],
+                    osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
+                let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                out += osc_out * osc.amp * velocity;
+            }
+            let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
+            
+            voice.filter.set_filter_type(self.filter_controller.mode);
+    
+            // filter envelope
+            out = if let Some(release_time) = voice.release_time {
+                let release_index = release_time as f32 / self.sample_rate as f32;
+                self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
+            } else {
+                self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
+            };
+            
+            // amplitude envelope
+            out = if let Some(release_time) = voice.release_time {
+                let release_index = release_time as f32 / self.sample_rate as f32;
+                out * self
+                    .gain_envelope
+                    .sample_released(release_index, envelope_index)
+            } else {
+                out * self.gain_envelope.sample_held(envelope_index)
+            };
+    
+            *out_l += out;
+            *out_r += out;
+        }
+        *out_l *= self.output_volume;
+        *out_r *= self.output_volume;
     }
     pub fn pitch_bend(&mut self, bend: u16) {
         let bend = (bend as i32 - 8192) as f32 / 8192.0 * self.bend_range;
