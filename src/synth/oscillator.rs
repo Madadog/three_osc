@@ -337,33 +337,48 @@ impl WavetableNotes {
     pub fn frequency_to_note(frequency: f32) -> usize {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
+    /// Create a bandlimited wavetable for each midi note from a base additive function.
+    /// 
+    /// Each note is given a wavetable with the exact number of samples required to reproduce the note and all its harmonics.
+    /// The table size will be multiplied by `max_oversample` (to reduce aliasing from linear interpolation) but limited by
+    /// min and max `table_len`. 
+    /// 
+    /// Limiting `max_table_len` mostly prevents low notes from growing too big (given you have `(sample_rate * max_oversample) / note_freq` samples per table)
+    /// at the expense of sample quality.
+    /// 
+    /// Increasing `min_table_len` emulates increased oversampling for higher notes which, for reasons I don't fully understand, require much more oversampling
+    /// than the middle notes to achieve comparative noise reduction. E.g. a note at 2000 Hz requires 22.05 samples, so a `min_table_len` of 2560 is equivalent
+    /// to 116 times oversampling which is usually enough.
+    /// 
+    /// Note that all other wavetable synths just use wavetable lengths that are powers of two, because they use FFTs. Of course, a need for FFTs implies
+    /// that you're reading user samples or doing spectral manipulation, both of which are beyond the scope of this synth. Inverse FFTs, on the other hand, will
+    /// allow me to stop summing sine waves manually, speeding up table generation to realtime speeds...  
     pub fn from_additive_osc(
         osc: &AdditiveOsc,
         sample_rate: f32,
-        oversampling_factor: f32,
+        max_oversample: f32,
+        max_table_len: usize,
+        min_table_len: usize,
     ) -> Self {
         debug_assert!(
-            oversampling_factor >= 1.0,
+            max_oversample >= 1.0,
             "Oversampling factor should be 1.0 or greater"
         );
-        // let oversampling_factor = 8.0; // Reduce lerp aliasing
         let tables: Vec<Wavetable> = (0..128)
             .into_iter()
             .map(|x| {
-                // Required sample length for note
-                (oversampling_factor * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
+                // Sample length required for note
+                (max_oversample * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
                     .ceil() as usize
             })
             .map(|len| {
-                // Make sample length even
-                // let len_up = len + 2 + len % 2;
-                // let len_down = len - 2 - len % 2;
-                let len_up = len.saturating_add(8);
-                let len_down = len.saturating_sub(8);
+                let clamped_len = len.clamp(min_table_len, max_table_len);
+                // Ensure waveform is bandlimited
+                let harmonics = ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len/2);
                 Wavetable::from_additive_osc(
                     osc,
-                    len_up,
-                    (len_down as f32 / (2.0 * oversampling_factor)) as usize,
+                    clamped_len,
+                    harmonics,
                 )
             })
             .collect();
@@ -371,10 +386,9 @@ impl WavetableNotes {
             tables: tables.try_into().unwrap(),
         }
     }
-    /// Constant table length
+    /// `WavetableNotes::from_additive_osc()` with constant table length
     /// 
-    /// Constant table length = increased precision for higher notes with less harmonics, at the cost of more aliasing for
-    /// higher harmonics on lower notes (only comparatively. )
+    /// I will migrate to this once I start using fast fourier transforms.
     pub fn from_additive_osc_2(
         osc: &AdditiveOsc,
         sample_rate: f32,
