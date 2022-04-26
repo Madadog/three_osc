@@ -1,3 +1,5 @@
+use self::ladder::LadderFilter;
+
 use super::lerp;
 
 use super::envelopes::AdsrEnvelope;
@@ -7,7 +9,7 @@ use std::f32::consts::PI;
 #[derive(Debug, Default, Clone)]
 /// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
 ///
-pub(crate) struct TestFilter {
+pub struct TestFilter {
     pub(crate) stage0: f32,
     pub(crate) stage1: f32,
     pub(crate) a0: f32, // gain compensation
@@ -173,6 +175,15 @@ impl FilterController {
     }
 }
 
+#[derive(Debug, Clone)]
+// TODO: There must be a better way to do this.
+pub enum FilterContainer {
+    None,
+    RcFilter(RcFilter),
+    LadderFilter(LadderFilter),
+    BiquadFilter(TestFilter),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FilterModel {
     None,
@@ -195,6 +206,7 @@ pub enum FilterOrder {
 }
 
 /// Port of the LMMS RC filters (originally from https://github.com/LMMS/lmms/blob/master/include/BasicFilters.h)
+#[derive(Debug, Clone)]
 pub struct RcFilter {
     rca: f32,
     rcb: f32,
@@ -378,3 +390,5 @@ impl Default for RcFilter {
         }
     }
 }
+
+mod ladder;
