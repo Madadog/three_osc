@@ -25,6 +25,8 @@ use crate::synth::filter::ladder::Iir::IirFilter;
 use crate::synth::filter::FilterType;
 use fastrand::Rng;
 
+use super::Filter;
+
 // pade 3/2 approximant for tanh
 #[inline]
 pub fn tanh_pade32(x: f64) -> f64 {
@@ -90,9 +92,9 @@ impl Default for LadderFilter {
             resonance: 0.5,
             ladder_filter_mode: FilterType::Lowpass,
             sample_rate: 44100.0,
-            dt: integration_rate(44100.0, 2, 0.25),
+            dt: integration_rate(44100.0, 3, 0.25),
             ladder_integration_method: IntegrationMethod::PredictorCorrectorFullTanh,
-            oversampling_factor: 2,
+            oversampling_factor: 3,
             decimator_order: IIR_DOWNSAMPLE_ORDER,
             p0: 0.0,
             p1: 0.0,
@@ -245,6 +247,26 @@ impl LadderFilter {
         self.IIRLowpass.decimator_order = self.decimator_order;
 
         self.set_integration_rate();
+    }
+}
+
+impl Filter for LadderFilter {
+    fn process(&mut self, input: f32) -> f32 {
+        self.process_sample(input as f64);
+        (self.output() * 1.414) as f32
+    }
+
+    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
+        // The original module expected a cutoff frequency from 0.001 -> 2.25.
+        // 22000 / 2.25 = 9800.0
+        self.cutoff_frequency = (cutoff as f64 / 9800.0) + 0.001;
+        // Self-resonance starts at resonance >= 0.5
+        self.resonance = (resonance / 10.0) as f64;
+        self.set_sample_rate(sample_rate as f64);
+    }
+
+    fn set_filter_type(&mut self, filter_type: FilterType) {
+        self.set_filtermode(filter_type);
     }
 }
 

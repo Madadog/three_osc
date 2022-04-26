@@ -39,6 +39,7 @@ struct Ports {
     fil1_type: InputPort<Control>,
     fil1_cutoff: InputPort<Control>,
     fil1_resonance: InputPort<Control>,
+    fil1_drive: InputPort<Control>,
     fil1_keytrack: InputPort<Control>,
     fil1_env_amount: InputPort<Control>,
     fil1_attack: InputPort<Control>,
@@ -112,8 +113,9 @@ impl Plugin for SynthLv2 {
         self.synth.filter_controller.cutoff_envelope.sustain_level = *ports.fil1_sustain;
         self.synth.filter_controller.cutoff_envelope.release_time = *ports.fil1_release;
         self.synth.filter_controller.cutoff_envelope.slope = 2.0_f32.powf(*ports.fil1_slope);
-        self.synth.filter_controller.cutoff = *ports.fil1_cutoff;
+        self.synth.filter_controller.target_cutoff = *ports.fil1_cutoff;
         self.synth.filter_controller.resonance = *ports.fil1_resonance;
+        self.synth.filter_controller.drive = *ports.fil1_drive;
         self.synth.filter_controller.filter_type = match *ports.fil1_type {
             x if x < 1.0 => {FilterType::Lowpass},
             x if x < 2.0 => {FilterType::Bandpass},
@@ -218,7 +220,7 @@ impl Plugin for SynthLv2 {
                     let id: u8 = note.into();
                     let velocity: u8 = velocity.into();
                     self.synth.note_on(id, velocity);
-                    println!("received note_on {note:?}");
+                    println!("received note_on {note:?} (vel: {velocity:?})");
                     println!("there are {} voices...", self.synth.voices.len());
                 },
                 MidiMessage::NoteOff(_, note, velocity) => {

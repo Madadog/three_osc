@@ -80,6 +80,7 @@ impl ThreeOsc {
     }
     pub fn run_voices(&mut self, out_l: &mut f32, out_r: &mut f32) {
         self.release_voices();
+        self.filter_controller.lerp_cutoff(0.15);
         for voice in self.voices.iter_mut() {
             voice.advance();
             let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
@@ -105,20 +106,17 @@ impl ThreeOsc {
             }
             let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
             
+            voice.filter.set(self.filter_controller.filter_model);
             voice.filter.set_filter_type(self.filter_controller.filter_type);
             
             // filter envelope
-            match self.filter_controller.filter_model {
-                FilterModel::None => {},
-                x => {
-                    out = if let Some(release_time) = voice.release_time {
-                        let release_index = release_time as f32 / self.sample_rate as f32;
-                        self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
-                    } else {
-                        self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
-                    };
-                }
-            }
+            out = if let Some(release_time) = voice.release_time {
+                let release_index = release_time as f32 / self.sample_rate as f32;
+                self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
+            } else {
+                self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
+            };
+
             
             // amplitude envelope
             out = if let Some(release_time) = voice.release_time {
@@ -145,12 +143,13 @@ impl ThreeOsc {
 }
 
 /// An individual note press.
+// TODO: Separate phase, oscillator, and filter from note data.
 pub struct Voice {
     id: u32,
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 2],
-    filter: filter::RcFilter,
+    filter: filter::FilterContainer,
     velocity: u8,
 }
 impl Voice {
@@ -172,7 +171,7 @@ impl Voice {
             release_time: None,
             osc_voice,
             velocity,
-            filter: filter::RcFilter::default(),
+            filter: filter::FilterContainer::None,
         }
     }
     pub fn release(&mut self) {

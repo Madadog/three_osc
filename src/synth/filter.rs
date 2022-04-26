@@ -98,8 +98,10 @@ pub(crate) trait Filter {
 pub(crate) struct FilterController {
     pub(crate) cutoff_envelope: AdsrEnvelope,
     pub(crate) envelope_amount: f32,
-    pub(crate) cutoff: f32,
+    cutoff: f32,
+    pub(crate) target_cutoff: f32,
     pub(crate) resonance: f32,
+    pub(crate) drive: f32,
     pub(crate) keytrack: f32,
     pub(crate) filter_type: FilterType,
     pub(crate) filter_model: FilterModel,
@@ -111,11 +113,16 @@ impl FilterController {
             cutoff_envelope: AdsrEnvelope::new(0.0, 0.0, 0.0, 1.0, 1.0),
             envelope_amount: 0.0,
             cutoff: 100.0,
+            target_cutoff: 100.0,
             resonance: 0.1,
+            drive: 1.0,
             keytrack: 0.0,
             filter_type: FilterType::Lowpass,
             filter_model: FilterModel::RcFilter,
         }
+    }
+    pub(crate) fn lerp_cutoff(&mut self, amount: f32) {
+        self.cutoff = lerp(self.cutoff, self.target_cutoff, amount);
     }
     pub(crate) fn process_envelope_held(
         &mut self,
@@ -133,7 +140,7 @@ impl FilterController {
                 .clamp(1.0, 22000.0),
             self.resonance,
         );
-        let out = filter.process(input);
+        let out = filter.process(input * self.drive);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
         out
     }
@@ -157,7 +164,7 @@ impl FilterController {
                 .clamp(1.0, 22000.0),
             self.resonance,
         );
-        let out = filter.process(input);
+        let out = filter.process(input * self.drive);
         filter.set_params(sample_rate, self.cutoff, self.resonance);
         out
     }
@@ -176,6 +183,7 @@ impl FilterController {
 }
 
 #[derive(Debug, Clone)]
+/// A filter that can be switched between multiple filter modes.
 // TODO: There must be a better way to do this.
 pub enum FilterContainer {
     None,
@@ -183,8 +191,49 @@ pub enum FilterContainer {
     LadderFilter(LadderFilter),
     BiquadFilter(TestFilter),
 }
+impl FilterContainer {
+    pub fn set(&mut self, filter_model: FilterModel) {
+        match (self, filter_model) {
+            (FilterContainer::RcFilter(_), FilterModel::RcFilter) => {},
+            (FilterContainer::LadderFilter(_), FilterModel::LadderFilter) => {},
+            (FilterContainer::BiquadFilter(_), FilterModel::BiquadFilter) => {},
+            (x, FilterModel::RcFilter) => {*x = FilterContainer::RcFilter(RcFilter::default())},
+            (x, FilterModel::LadderFilter) => {*x = FilterContainer::LadderFilter(LadderFilter::default())},
+            (x, FilterModel::BiquadFilter) => {*x = FilterContainer::BiquadFilter(TestFilter::default())},
+            (x, FilterModel::None) => {*x = FilterContainer::None},
+            (_, _) => {unreachable!("Forgot to set a FilterModel for FilterContainer")}
+        }
+    }
+}
+impl Filter for FilterContainer {
+    fn process(&mut self, input: f32) -> f32 {
+        match self {
+            FilterContainer::RcFilter(x) => x.process(input),
+            FilterContainer::LadderFilter(x) => x.process(input),
+            FilterContainer::BiquadFilter(x) => x.process(input),
+            _ => {input}
+        }
+    }
+    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
+        match self {
+            FilterContainer::RcFilter(x) => x.set_params(sample_rate, cutoff, resonance),
+            FilterContainer::LadderFilter(x) => x.set_params(sample_rate, cutoff, resonance),
+            FilterContainer::BiquadFilter(x) => x.set_params(sample_rate, cutoff, resonance),
+            _ => {}
+        }
+    }
+    fn set_filter_type(&mut self, filter_type: FilterType) {
+        match self {
+            FilterContainer::RcFilter(x) => x.set_filter_type(filter_type),
+            FilterContainer::LadderFilter(x) => x.set_filter_type(filter_type),
+            FilterContainer::BiquadFilter(x) => x.set_filter_type(filter_type),
+            _ => {}
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
+/// Used to select FilterContainer without creating a filter.
 pub enum FilterModel {
     None,
     RcFilter,
