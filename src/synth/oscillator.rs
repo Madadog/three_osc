@@ -120,7 +120,7 @@ impl BasicOscillator {
         sample_rate: f32,
     ) -> &'a [f32] {
         let constant = sample_rate / (2.0 * PI);
-        let delta = ((voices.delta) * (1.0 + pm) * constant + fm * 100.0) / constant;
+        let delta = ((voices.delta) * (1.0 + pm) * constant + fm * 100.0) / constant; // what is `constant` doing here???
         voices.add_phase(
             self.pitch_mult_delta(delta),
             self.voice_count.into(),

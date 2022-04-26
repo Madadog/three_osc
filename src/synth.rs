@@ -80,7 +80,7 @@ impl ThreeOsc {
     }
     pub fn run_voices(&mut self, out_l: &mut f32, out_r: &mut f32) {
         self.release_voices();
-        self.filter_controller.lerp_cutoff(0.15);
+        self.filter_controller.interpolate_cutoff(0.15 * 44100.0 / self.sample_rate as f32);
         for voice in self.voices.iter_mut() {
             voice.advance();
             let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
@@ -104,10 +104,17 @@ impl ThreeOsc {
                 // let osc_out = self.additive.generate(phases[0], (22050.0/(2.0*440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0))) as usize);
                 out += osc_out * osc.amp * velocity;
             }
-            let voice_freq = (440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0)) * self.filter_controller.keytrack;
+            let voice_freq = 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
             
             voice.filter.set(self.filter_controller.filter_model);
             voice.filter.set_filter_type(self.filter_controller.filter_type);
+
+            match voice.filter {
+                // Hack to keep biquad filter / none at same level as others
+                filter::FilterContainer::BiquadFilter(_)
+                | filter::FilterContainer::None => self.filter_controller.drive = self.filter_controller.drive.min(1.0),
+                _ => {}
+            };
             
             // filter envelope
             out = if let Some(release_time) = voice.release_time {

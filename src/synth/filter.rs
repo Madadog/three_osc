@@ -121,8 +121,9 @@ impl FilterController {
             filter_model: FilterModel::RcFilter,
         }
     }
-    pub(crate) fn lerp_cutoff(&mut self, amount: f32) {
-        self.cutoff = lerp(self.cutoff, self.target_cutoff, amount);
+    pub(crate) fn interpolate_cutoff(&mut self, amount: f32) {
+        let max_change = self.cutoff.abs() * 2.0 + 1.0;
+        self.cutoff = lerp(self.cutoff, self.target_cutoff, amount).clamp(-max_change, max_change);
     }
     pub(crate) fn process_envelope_held(
         &mut self,
@@ -135,7 +136,7 @@ impl FilterController {
         filter.set_params(
             sample_rate,
             (self.cutoff
-                + keytrack_freq
+                * keytrack_freq
                 + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount)
                 .clamp(1.0, 22000.0),
             self.resonance,
@@ -156,7 +157,7 @@ impl FilterController {
         filter.set_params(
             sample_rate,
             (self.cutoff
-                + keytrack_freq
+                * keytrack_freq
                 + self
                     .cutoff_envelope
                     .sample_released(release_index, envelope_index)
