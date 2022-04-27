@@ -14,6 +14,7 @@ impl MidiNote {
             age: 0,
         }
     }
+    pub fn age(&self) -> u32 {self.age}
     pub fn midi_to_freq(id: u8) -> f32 {
         440.0 * 2.0_f32.powf(((id as i16 - 69) as f32) / 12.0)
     }

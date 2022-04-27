@@ -103,8 +103,7 @@ impl ThreeOsc {
                 .for_each(|voice| {
                     let nearest_note = self.notes.notes.iter()
                         .reduce(|accum, note| {
-                            let diff = voice.id.abs_diff(note.id as u32);
-                            if diff < voice.id.abs_diff(accum.id as u32) {
+                            if note.age() < accum.age() {
                                 note
                             } else {
                                 accum
