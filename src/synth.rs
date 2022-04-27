@@ -9,6 +9,8 @@ use std::hash::Hasher;
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
 use self::filter::FilterModel;
+use self::notes::MidiNote;
+use self::notes::Notes;
 use self::oscillator::AdditiveOsc;
 use self::oscillator::SimpleSin;
 use self::oscillator::SuperVoice;
@@ -16,11 +18,13 @@ use self::oscillator::BasicOscillator;
 use self::oscillator::OscVoice;
 use self::oscillator::Wavetable;
 use self::oscillator::WavetableNotes;
+use self::oscillator::modulate_delta;
 
 const DEFAULT_SRATE: f32 = 44100.0;
 
 pub struct ThreeOsc {
     pub voices: Vec<Voice>,
+    pub notes: Notes,
     pub gain_envelope: AdsrEnvelope,
     pub(crate) filter_controller: filter::FilterController,
     pub sample_rate: f64,
@@ -31,12 +35,14 @@ pub struct ThreeOsc {
     pub osc1_pm: f32,
     pub osc1_fm: f32,
     pub bend_range: f32,
+    pub polyphony: Polyphony,
 }
 
 impl ThreeOsc {
     pub fn new(sample_rate: f64) -> Self {
         Self {
             voices: Vec::with_capacity(64),
+            notes: Notes::new(),
             gain_envelope: AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0),
             filter_controller: filter::FilterController::new(),
             sample_rate,
@@ -48,20 +54,63 @@ impl ThreeOsc {
             osc1_pm: 0.0,
             osc1_fm: 0.0,
             bend_range: 2.0,
+            polyphony: Polyphony::Legato,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
+        self.notes.note_on(note, velocity);
+        
+        if matches!(self.polyphony, Polyphony::Legato) {
+            if let Some(voice) = self.voices.last_mut() {
+                
+                voice.id = note as u32;
+                voice.velocity = velocity;
+
+                // If the note is released, repress it.
+                if let Some(_) = voice.release_time {
+                    voice.release_time = None;
+                    voice.runtime = 0;
+                }
+                return;
+            }
+        }
         self.voices
-            .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
+        .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
     }
     pub fn note_off(&mut self, note: u8, velocity: u8) {
-        self.voices
-            .iter_mut()
-            .filter(|voice| voice.id == note as u32)
-            .for_each(|voice| voice.release())
+        self.notes.note_off(note);
+
+        if matches!(self.polyphony, Polyphony::Legato) {
+            self.voices
+                .iter_mut()
+                .filter(|voice| voice.id == note as u32)
+                .for_each(|voice| {
+                    let nearest_note = self.notes.notes.iter()
+                        .reduce(|accum, note| {
+                            let diff = voice.id.abs_diff(note.id as u32);
+                            if diff < voice.id.abs_diff(accum.id as u32) {
+                                note
+                            } else {
+                                accum
+                            }
+                        });
+                    if let Some(note) = nearest_note {
+                        voice.id = note.id as u32;
+                    } else {
+                        voice.release();
+                    }
+                })
+        } else {
+            self.voices
+                .iter_mut()
+                .filter(|voice| voice.id == note as u32)
+                .for_each(|voice| voice.release())
+        }
+
     }
     pub fn release_voices(&mut self) {
         let duration = (self.gain_envelope.release_time * self.sample_rate as f32) as u32;
+
         self.voices.retain(|voice| {
             if let Some(release_time) = voice.release_time {
                 voice.runtime - release_time < duration
@@ -89,7 +138,9 @@ impl ThreeOsc {
             let index = voice.id as usize;
     
             let osc2_out = if let Some(osc) = self.oscillators.get(1) {
-                let phases = osc.unison_phases(&mut voice.osc_voice[1], 0.0, 0.0, self.sample_rate as f32);
+                let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
+                // let delta = modulate_delta(delta, 0.0, 0.0, self.sample_rate as f32);
+                let phases = osc.unison_phases(&mut voice.osc_voice[1], delta);
                 let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity;
                 osc_out
@@ -98,8 +149,9 @@ impl ThreeOsc {
             };
             
             if let Some(osc) = self.oscillators.get(0) {
-                let phases = osc.unison_phases(&mut voice.osc_voice[0],
-                    osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
+                let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
+                let delta = modulate_delta(delta, osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
+                let phases = osc.unison_phases(&mut voice.osc_voice[0], delta);
                 let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 // let osc_out = self.additive.generate(phases[0], (22050.0/(2.0*440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0))) as usize);
                 out += osc_out * osc.amp * velocity;
@@ -149,6 +201,14 @@ impl ThreeOsc {
     }
 }
 
+mod notes;
+
+pub enum Polyphony {
+    Polyphonic,
+    Monophonic,
+    Legato,
+}
+
 /// An individual note press.
 // TODO: Separate phase, oscillator, and filter from note data.
 pub struct Voice {
@@ -162,7 +222,7 @@ pub struct Voice {
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
         // w = (2pi*f) / sample_rate
-        let mut osc_voice = [SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
+        let mut osc_voice = [SuperVoice::new(MidiNote::midi_to_delta(index, sample_rate),
             osc[0].phase,
             osc[0].phase_rand,
         ),
@@ -186,9 +246,11 @@ impl Voice {
             self.release_time = Some(self.runtime)
         }
     }
-
     pub fn advance(&mut self) {
         self.runtime += 1;
+    }
+    pub fn voice_delta(&self, sample_rate: f32) -> f32 {
+        2.0 * PI * 440.0 * 2.0_f32.powf(((self.id as i16 - 69) as f32) / 12.0) / sample_rate
     }
 }
 

@@ -84,7 +84,7 @@ pub struct BasicOscillator {
     pub pitch_bend: f32,
 }
 impl BasicOscillator {
-    fn pitch_mult_delta(&self, delta: f32) -> f32 {
+    pub fn pitch_mult_delta(&self, delta: f32) -> f32 {
         delta
             * 2.0_f32.powf((self.semitone + self.pitch_bend) / 12.0 + self.octave as f32)
             * self.multiplier
@@ -115,14 +115,10 @@ impl BasicOscillator {
     pub fn unison_phases<'a>(
         &self,
         voices: &'a mut SuperVoice,
-        pm: f32,
-        fm: f32,
-        sample_rate: f32,
+        delta: f32,
     ) -> &'a [f32] {
-        let constant = sample_rate / (2.0 * PI);
-        let delta = ((voices.delta) * (1.0 + pm) * constant + fm * 100.0) / constant; // what is `constant` doing here???
         voices.add_phase(
-            self.pitch_mult_delta(delta),
+            delta,
             self.voice_count.into(),
             self.voices_detune,
         );
@@ -195,6 +191,16 @@ impl OscWave {
             }
         }
     }
+}
+
+pub fn modulate_delta(
+    delta: f32,
+    pm: f32,
+    fm: f32,
+    sample_rate: f32,
+) -> f32 {
+    let constant = sample_rate / (2.0 * PI);
+    ((delta) * (1.0 + pm) * constant + fm * 100.0) / constant
 }
 
 /// Efficient sine approximation for constant frequency.
