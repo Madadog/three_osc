@@ -200,7 +200,8 @@ pub fn modulate_delta(
     sample_rate: f32,
 ) -> f32 {
     let constant = sample_rate / (2.0 * PI);
-    ((delta) * (1.0 + pm) * constant + fm * 100.0) / constant
+    let delta = ((delta) * (1.0 + pm) * constant + fm * 100.0) / constant;
+    delta % (2.0 * PI)
 }
 
 /// Efficient sine approximation for constant frequency.
@@ -428,6 +429,39 @@ impl WavetableNotes {
     }
 }
 
+pub struct WavetableSet {
+    pub wavetables: Vec<WavetableNotes>,
+}
+impl WavetableSet {
+    pub fn new(
+        sample_rate: f32,
+        max_oversample: f32,
+        max_table_len: usize,
+        min_table_len: usize,
+    ) -> Self {
+        Self {
+            wavetables: vec![
+                WavetableNotes::from_additive_osc(&AdditiveOsc::sine(), sample_rate, max_oversample, max_table_len, min_table_len),
+                WavetableNotes::from_additive_osc(&AdditiveOsc::triangle(), sample_rate, max_oversample, max_table_len, min_table_len),
+                WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate, max_oversample, max_table_len, min_table_len),
+                WavetableNotes::from_additive_osc(&AdditiveOsc::fake_exp(), sample_rate, max_oversample, max_table_len, min_table_len),
+                WavetableNotes::from_additive_osc(&AdditiveOsc::square(), sample_rate, max_oversample, max_table_len, min_table_len),
+            ]
+        }
+    }
+    pub fn select(&self, wave: &OscWave) -> &WavetableNotes {
+        let wave_index = match wave {
+            OscWave::Sine => 0,
+            OscWave::Tri => 1,
+            OscWave::Saw => 2,
+            OscWave::Exp => 3,
+            OscWave::Square => 4,
+            _ => 0,
+        };
+        &self.wavetables[wave_index]
+    }
+}
+
 /// Oscillator which generates waves by summing sines.
 /// 
 /// The lowest-frequency signal that can be generated with all of its expected harmonics
@@ -452,12 +486,37 @@ impl<const N: usize> AdditiveOsc<N> {
             *sample = self.generate(delta * i as f32, harmonics);
         }
     }
+    pub fn sine() -> Self {
+        let mut amplitudes = [0.0; N];
+        amplitudes[0] = 1.0;
+        let phases = [0.0; N];
+        Self { amplitudes, phases }
+    }
+    pub fn triangle() -> Self {
+        let mut amplitudes = [-1.0; N];
+        amplitudes.iter_mut().enumerate().for_each(|(i, x)| {
+            *x /= ((i + 1) as f32).powi(2);
+            *x = *x * ((i + 1) % 2) as f32;
+            *x = x.powf((i) as f32 / 2.0)
+        });
+        let phases = [0.0; N];
+        Self { amplitudes, phases }
+    }
     pub fn saw() -> Self {
         let mut amplitudes = [1.0; N];
         amplitudes
             .iter_mut()
             .enumerate()
             .for_each(|(i, x)| *x /= (i + 1) as f32);
+        let phases = [0.0; N];
+        Self { amplitudes, phases }
+    }
+    pub fn fake_exp() -> Self {
+        let mut amplitudes = [1.0; N];
+        amplitudes
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, x)| *x /= ((i + 1) as f32).powi(2));
         let phases = [0.0; N];
         Self { amplitudes, phases }
     }

@@ -18,6 +18,7 @@ use self::oscillator::BasicOscillator;
 use self::oscillator::OscVoice;
 use self::oscillator::Wavetable;
 use self::oscillator::WavetableNotes;
+use self::oscillator::WavetableSet;
 use self::oscillator::modulate_delta;
 
 const DEFAULT_SRATE: f32 = 44100.0;
@@ -31,6 +32,7 @@ pub struct ThreeOsc {
     pub output_volume: f32,
     pub oscillators: [BasicOscillator; 2],
     pub wavetables: WavetableNotes,
+    pub waves: WavetableSet,
     additive: AdditiveOsc,
     pub osc1_pm: f32,
     pub osc1_fm: f32,
@@ -50,6 +52,7 @@ impl ThreeOsc {
             oscillators: [BasicOscillator::default(), BasicOscillator::default()],
             // wavetables: WavetableNotes::from_additive_osc_2(&AdditiveOsc::saw(), sample_rate as f32, 1.0, 2048),
             wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 32.0, 2048, 256),
+            waves: WavetableSet::new(sample_rate as f32, 32.0, 2048, 256),
             additive: AdditiveOsc::saw(),
             osc1_pm: 0.0,
             osc1_fm: 0.0,
@@ -96,6 +99,8 @@ impl ThreeOsc {
                 .filter(|voice| voice.id == note as u32)
                 .for_each(|voice| voice.release())
             },
+            // TODO: This currently assumes all notes are unoccupied / free to snap to,
+            // but some notes will have a voice already playing.
             Polyphony::Legato | Polyphony::Monophonic => {
                 self.voices
                 .iter_mut()
@@ -151,7 +156,7 @@ impl ThreeOsc {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
                 // let delta = modulate_delta(delta, 0.0, 0.0, self.sample_rate as f32);
                 let phases = osc.unison_phases(&mut voice.osc_voice[1], delta);
-                let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity;
                 osc_out
             } else {
@@ -162,7 +167,8 @@ impl ThreeOsc {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
                 let delta = modulate_delta(delta, osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
                 let phases = osc.unison_phases(&mut voice.osc_voice[0], delta);
-                let osc_out = self.wavetables.tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+
+                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 // let osc_out = self.additive.generate(phases[0], (22050.0/(2.0*440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0))) as usize);
                 out += osc_out * osc.amp * velocity;
             }

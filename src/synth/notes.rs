@@ -1,10 +1,13 @@
 use std::f32::consts::PI;
 
-/// Single midi note. `id` is pitch, `velocity` is midi velocity, `age` is how many notes ago this note was created.
+/// Single midi note. `id` is pitch, `velocity` is midi velocity,
+/// `age` is how many notes ago this note was created. `empty` is
+/// an indicator of whether a midinote has an associated voice or not
 pub struct MidiNote {
     pub id: u8,
     pub velocity: u8,
     age: u32,
+    empty: bool,
 }
 impl MidiNote {
     pub fn new(id: u8, velocity: u8) -> Self {
@@ -12,6 +15,7 @@ impl MidiNote {
             id,
             velocity,
             age: 0,
+            empty: false,
         }
     }
     pub fn age(&self) -> u32 {self.age}
