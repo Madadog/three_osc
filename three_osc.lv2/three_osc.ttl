@@ -410,6 +410,16 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 42 ;
+                lv2:symbol "polyphony" ;
+                lv2:name "Polyphony" ;
+                lv2:default 0 ;
+                lv2:minimum 0 ;
+                lv2:maximum 2 ;
+                lv2:portProperty lv2:integer ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 43 ;
                 lv2:symbol "output_gain" ;
                 lv2:name "Output Gain" ;
                 lv2:default -18.000 ;
@@ -418,7 +428,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 43 ;
+                lv2:index 44 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Master Pitch" ;
                 lv2:default 0 ;
@@ -428,7 +438,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 44 ;
+                lv2:index 45 ;
                 lv2:symbol "bend_range" ;
                 lv2:name "Bend Range" ;
                 lv2:default 2 ;

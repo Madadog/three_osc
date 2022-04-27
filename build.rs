@@ -238,6 +238,11 @@ impl PortList {
     fn global() -> PortList {
         Self(vec![
             ControlPort::new(
+                "polyphony",
+                "Polyphony",
+                Int(0, (0, 2)),
+            ),
+            ControlPort::new(
                 "output_gain",
                 "Output Gain",
                 Float(-18.0, (-90.0, 0.0)),

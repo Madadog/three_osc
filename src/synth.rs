@@ -60,28 +60,44 @@ impl ThreeOsc {
     pub fn note_on(&mut self, note: u8, velocity: u8) {
         self.notes.note_on(note, velocity);
         
-        if matches!(self.polyphony, Polyphony::Legato) {
-            if let Some(voice) = self.voices.last_mut() {
-                
-                voice.id = note as u32;
-                voice.velocity = velocity;
-
-                // If the note is released, repress it.
-                if let Some(_) = voice.release_time {
-                    voice.release_time = None;
-                    voice.runtime = 0;
+        match &self.polyphony {
+            Polyphony::Polyphonic => {
+                self.voices
+                    .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
+                },
+            polyphony => {
+                if let Some(voice) = self.voices.last_mut() {
+                    voice.id = note as u32;
+                    voice.velocity = velocity;
+                    
+                    if matches!(polyphony, Polyphony::Monophonic) {
+                        // Monophonic always re-presses notes.
+                        voice.release_time = None;
+                        voice.runtime = 0;
+                    } else if let Some(_) = voice.release_time {
+                        // If the note is released, re-press it.
+                        voice.release_time = None;
+                        voice.runtime = 0;
+                    }
+                } else {
+                    self.voices
+                        .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
                 }
-                return;
-            }
+            },
         }
-        self.voices
-        .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
     }
     pub fn note_off(&mut self, note: u8, velocity: u8) {
         self.notes.note_off(note);
 
-        if matches!(self.polyphony, Polyphony::Legato) {
-            self.voices
+        match self.polyphony {
+            Polyphony::Polyphonic => {
+                self.voices
+                .iter_mut()
+                .filter(|voice| voice.id == note as u32)
+                .for_each(|voice| voice.release())
+            },
+            Polyphony::Legato | Polyphony::Monophonic => {
+                self.voices
                 .iter_mut()
                 .filter(|voice| voice.id == note as u32)
                 .for_each(|voice| {
@@ -100,13 +116,8 @@ impl ThreeOsc {
                         voice.release();
                     }
                 })
-        } else {
-            self.voices
-                .iter_mut()
-                .filter(|voice| voice.id == note as u32)
-                .for_each(|voice| voice.release())
+            },
         }
-
     }
     pub fn release_voices(&mut self) {
         let duration = (self.gain_envelope.release_time * self.sample_rate as f32) as u32;
