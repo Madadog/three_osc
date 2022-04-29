@@ -49,18 +49,20 @@ Coming soon...
 * Portamento
 * Bandpass and highpass filter modes for biquad filter
 * Independent attack slope for ADSR envelopes
+* Rescale resonance control max from 10.0 to 1.0
+* Adjust ladder filter cutoff range so it's more consistent with the other filters
 * Group controls in LV2 UI
 * Add amplitude modulation
 * Add vibrato control / LFO
 * PWM
 * Stereo
-* Figure out how many controls I can fit on the UI before the Ardour horizontal scroll bar shows up
+* Figure out how many controls can fit on the UI before Ardour adds a scroll bar
 * Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
 * User-friendly envelope declicking
 * Generate wavetables with FFT, at compile time, rather than at load time.
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
 * Adjust more knobs to sensible values / defaults
-* Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonable nice)
+* Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonably nice)
 * Switch between Naive, Wavetable, and Additive synthesis with a control
 * Make the build system nicer
 * Tools for working with the harmonic series
