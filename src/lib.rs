@@ -89,14 +89,13 @@ struct SynthLv2 {
     urids: URIDs,
 }
 
-// Every plugin struct implements the `Plugin` trait. This trait contains both the methods that are called by the hosting application and the collection types for the ports and the used host features. This plugin does not use additional host features and therefore, we set both feature collection types to `()`. Other plugins may define separate structs with their required and optional features and set it here.
 impl Plugin for SynthLv2 {
     type Ports = Ports;
 
     type InitFeatures = Features<'static>;
     type AudioFeatures = ();
 
-    // The `new` method is called by the plugin backend when it creates a new plugin instance. The host passes the plugin URI, sample rate, and bundle path for plugins that need to load additional resources (e.g. waveforms). The features parameter contains host-provided features defined in LV2 extensions, but this simple plugin does not use any. This method is in the “instantiation” threading class, so no other methods on this instance will be called concurrently with it.
+    /// Create the plugin. Does initial setup (i.e. necessary allocation to stay realtime safe)
     fn new(plugin_info: &PluginInfo, features: &mut Features<'static>) -> Option<Self> {
         println!("Sample rate was: {}", plugin_info.sample_rate());
         Some(Self {
@@ -104,13 +103,16 @@ impl Plugin for SynthLv2 {
             urids: features.map.populate_collection()?,
         })
     }
-    // The `run()` method is the main process function of the plugin. It processes a block of audio in the audio context. Since this plugin is `lv2:hardRTCapable`, `run()` must be real-time safe, so blocking (e.g. with a mutex) or memory allocation are not allowed.
+
+    /// Read parameters from LV2 control ports, update actual synth parameters,
+    /// then generate audio.
     fn run(&mut self, ports: &mut Ports, _features: &mut (), _sample_count: u32) {
         let coef = if *(ports.output_gain) > -90.0 {
             10.0_f32.powf(*(ports.output_gain) * 0.05)
         } else {
             0.0
         };
+        self.synth.output_volume = coef;
         self.synth.bend_range = *ports.bend_range;
         self.synth.polyphony = match *ports.polyphony {
             x if x < 1.0 => Polyphony::Polyphonic,
@@ -148,8 +150,6 @@ impl Plugin for SynthLv2 {
             x if x <= 4.0 => {FilterModel::BiquadFilter},
             _ => {FilterModel::None}
         };
-
-        //self.synth.gain_envelope.limits();
 
         // apply oscillator ports
         // ... TODO: write a macro for all this
@@ -253,13 +253,8 @@ impl Plugin for SynthLv2 {
             }
         }
 
-        // change output volume
-        self.synth.output_volume = coef;
-
         // run synthesiser
         self.synth.run(ports.out_l.iter_mut().zip(ports.out_r.iter_mut()));
-        
-
     }
 }
 // The `lv2_descriptors` macro creates the entry point to the plugin library. It takes structs that implement `Plugin` and exposes them. The host will load the library and call a generated function to find all the plugins defined in the library.

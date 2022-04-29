@@ -94,7 +94,8 @@ pub(crate) trait Filter {
 }
 
 #[derive(Debug)]
-/// Filter in series
+/// Applies an envelope to something that implements the `Filter` trait. 
+/// Also handles keytrack.
 pub(crate) struct FilterController {
     pub(crate) cutoff_envelope: AdsrEnvelope,
     pub(crate) envelope_amount: f32,
@@ -122,6 +123,12 @@ impl FilterController {
         }
     }
     pub(crate) fn interpolate_cutoff(&mut self, amount: f32) {
+        // This is my partially successful attempt to remove clicking
+        // from my biquad implementation, which works until the filter
+        // cutoff is changed by greater or less than 100 times its
+        // previous value.
+
+        // Change by at most an octave per sample, +1 to accelerate changes low cutoff freqs < 1.
         let max_change = self.cutoff.abs() * 2.0 + 1.0;
         self.cutoff = lerp(self.cutoff, self.target_cutoff, amount).clamp(-max_change, max_change);
     }

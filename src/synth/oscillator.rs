@@ -204,6 +204,9 @@ pub fn modulate_delta(
     // PM is multiplicative / relative, so it's unaffected, but
     // FM is not. 
     let constant = sample_rate / (2.0 * PI);
+
+    // TODO: pm needs to be scaled so its multiplying above one, dividing below.
+    // TODO: figure out what this equation actually needs to be.
     let delta = ((delta) * (1.0 + pm) * constant + fm) / constant;
     delta % (2.0 * PI)
 }
