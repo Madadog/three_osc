@@ -30,12 +30,10 @@ pub struct ThreeOsc {
     pub(crate) filter_controller: filter::FilterController,
     pub sample_rate: f64,
     pub output_volume: f32,
-    pub oscillators: [BasicOscillator; 2],
+    pub oscillators: [BasicOscillator; 3],
     pub wavetables: WavetableNotes,
     pub waves: WavetableSet,
     additive: AdditiveOsc,
-    pub osc1_pm: f32,
-    pub osc1_fm: f32,
     pub bend_range: f32,
     pub polyphony: Polyphony,
 }
@@ -49,13 +47,11 @@ impl ThreeOsc {
             filter_controller: filter::FilterController::new(),
             sample_rate,
             output_volume: 0.3,
-            oscillators: [BasicOscillator::default(), BasicOscillator::default()],
+            oscillators: [BasicOscillator::default(), BasicOscillator::default(), BasicOscillator::default()],
             // wavetables: WavetableNotes::from_additive_osc_2(&AdditiveOsc::saw(), sample_rate as f32, 1.0, 2048),
             wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 32.0, 2048, 256),
             waves: WavetableSet::new(sample_rate as f32, 32.0, 2048, 256),
             additive: AdditiveOsc::saw(),
-            osc1_pm: 0.0,
-            osc1_fm: 0.0,
             bend_range: 2.0,
             polyphony: Polyphony::Legato,
         }
@@ -99,8 +95,10 @@ impl ThreeOsc {
                 .filter(|voice| voice.id == note as u32)
                 .for_each(|voice| voice.release())
             },
-            // TODO: This currently assumes all notes are unoccupied / free to snap to,
-            // but some notes will have a voice already playing.
+            // TODO: If there are two notes each with their own voice playing, when one is released
+            // it will snap to the other note, resulting in two voices playing the same note at the
+            // same time, which sounds bad. Stop this behaviour by filtering out notes with voices
+            // currently playing.
             Polyphony::Legato | Polyphony::Monophonic => {
                 self.voices
                 .iter_mut()
@@ -152,9 +150,19 @@ impl ThreeOsc {
             let velocity = voice.velocity as f32 / 128.0;
             let index = voice.id as usize;
     
+            let osc3_out = if let Some(osc) = self.oscillators.get(2) {
+                let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
+                let phases = osc.unison_phases(&mut voice.osc_voice[2], delta);
+                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                out += osc_out * osc.amp * velocity;
+                osc_out
+            } else {
+                unreachable!("Osc3 wasn't found...");
+            };
+            
             let osc2_out = if let Some(osc) = self.oscillators.get(1) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                // let delta = modulate_delta(delta, 0.0, 0.0, self.sample_rate as f32);
+                let delta = modulate_delta(delta, osc3_out * osc.pm, osc3_out * osc.fm, self.sample_rate as f32);
                 let phases = osc.unison_phases(&mut voice.osc_voice[1], delta);
                 let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity;
@@ -165,7 +173,7 @@ impl ThreeOsc {
             
             if let Some(osc) = self.oscillators.get(0) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta = modulate_delta(delta, osc2_out * self.osc1_pm, osc2_out * self.osc1_fm, self.sample_rate as f32);
+                let delta = modulate_delta(delta, osc2_out * osc.pm, osc2_out * osc.fm, self.sample_rate as f32);
                 let phases = osc.unison_phases(&mut voice.osc_voice[0], delta);
 
                 let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
@@ -231,20 +239,27 @@ pub struct Voice {
     id: u32,
     runtime: u32,
     release_time: Option<u32>,
-    osc_voice: [SuperVoice; 2],
+    osc_voice: [SuperVoice; 3],
     filter: filter::FilterContainer,
     velocity: u8,
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
         // w = (2pi*f) / sample_rate
-        let mut osc_voice = [SuperVoice::new(MidiNote::midi_to_delta(index, sample_rate),
+        let mut osc_voice = [SuperVoice::new(
+            // MidiNote::midi_to_delta(index, sample_rate),
             osc[0].phase,
             osc[0].phase_rand,
         ),
-        SuperVoice::new((2.0 * PI * 440.0 * 2.0_f32.powf(((index as i16 - 69) as f32) / 12.0)) / sample_rate,
+        SuperVoice::new(
+            // MidiNote::midi_to_delta(index, sample_rate),
             osc[1].phase,
             osc[1].phase_rand,
+        ),
+        SuperVoice::new(
+            // MidiNote::midi_to_delta(index, sample_rate),
+            osc[2].phase,
+            osc[2].phase_rand,
         ),
         ];
  

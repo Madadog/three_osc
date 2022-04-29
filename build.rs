@@ -3,6 +3,30 @@ use std::f32::consts::PI;
 use std::fs;
 use std::path::Path;
 
+/// WARNING: Do not read, this code sucks.
+/// 
+/// The following build script generates a "three_osc.ttl" file (needed by LV2
+/// hosts) which is copied into the three_osc.lv2 directory at the root of this
+/// project.
+///
+/// The file contains a list of metadata, including Control Ports which describe
+/// the plugin's LV2 UI which is automatically generated from these ports by LV2
+/// hosts when they load the plugin.
+///
+/// This build script also generates a file called "portstruct.rs", which must
+/// manually be copied into "lib.rs" replacing the `Ports` struct whenever ANY
+/// ports are moved or added (changing default values / range is fine). I tried
+/// to automate this (not very hard, admittedly) but couldn't come up with any
+/// solution better than 'manual copy' because the `include!` macro doesn't work
+/// with `#[derive(PortCollection)]` which is needed by the `lv2` crate.
+/// 
+/// Yes, there is probably a much better way of doing all this, but it is not
+/// supplied by the `lv2` crate. Hopefully future versions of the crate will
+/// automatically handle .ttl stuff for you.
+
+// What a better build system would look like:
+// * Automatic synchronisation of YOUR_LV2.ttl and `#[derive(PortCollection)]` struct
+// * Annotate ports with default values, names, ranges and properties directly inside the `#[derive(PortCollection)]` struct
 fn main() {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").unwrap();
@@ -19,26 +43,30 @@ fn main() {
     let mut ttl = ttl_header;
     let mut portstruct = portstruct_header;
 
-    // format oscillator duplicates
-    let mut oscillators = Vec::new();
-    for i in 1..=2 {
-        oscillators.push(PortList::oscillator().prefix(&format!("osc{i}_"), &format!("Osc{i} ")))
-    }
-
-
-    // format oscillator duplicates
-    let mut oscillators = Vec::new();
-    for i in 1..=2 {
-        oscillators.push(PortList::oscillator().prefix(&format!("osc{i}_"), &format!("Osc{i} ")))
-    }
-    
     // start at 3 because of midi in + stereo output ports
-    let mut ttl_index = 3; 
+    let mut port_index = 3; 
+
+    // format oscillator duplicates
+    let mut oscillators = Vec::new();
+    for i in 1..=3 {
+        let (amp, wave) = if i == 1 {
+            (100.0, 2) // first osc defaults to saw
+        } else {
+            (0.0, 0) // other oscs are silent
+        };
+        if i == 3 {
+            // third osc cannot be modulated
+            oscillators.push(PortList::oscillator_no_mod(amp, wave).prefix(&format!("osc{i}_"), &format!("Osc {i} ")))
+        } else {
+            oscillators.push(PortList::oscillator(amp, wave).prefix(&format!("osc{i}_"), &format!("Osc {i} ")))
+        }
+    }
+
     // add oscillator ports
     for control in oscillators.iter().map(|x| &x.0).flatten() {
         ttl.push_str(&ttl_control_divider);
-        ttl.push_str(&control.to_ttl(ttl_index));
-        ttl_index += 1;
+        ttl.push_str(&control.to_ttl(port_index));
+        port_index += 1;
         portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
@@ -47,8 +75,8 @@ fn main() {
     let mut filter_envelope = PortList::filter_envelope().prefix("fil1_", "Filter 1 ");
     for control in filter_controls.0.iter().chain(filter_envelope.0.iter()) {
         ttl.push_str(&ttl_control_divider);
-        ttl.push_str(&control.to_ttl(ttl_index));
-        ttl_index += 1;
+        ttl.push_str(&control.to_ttl(port_index));
+        port_index += 1;
         portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
@@ -59,8 +87,8 @@ fn main() {
     // add global ports
     for control in volume_envelope.0.iter().chain(global_controls.0.iter()) {
         ttl.push_str(&ttl_control_divider);
-        ttl.push_str(&control.to_ttl(ttl_index));
-        ttl_index += 1;
+        ttl.push_str(&control.to_ttl(port_index));
+        port_index += 1;
         portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
@@ -93,7 +121,7 @@ impl ControlPort {
     fn with_properties(self, properties: Vec<PortProperty>) -> Self { Self {properties, ..self}}
     fn logarithmic(self) -> Self { self.with_properties(vec![PortProperty::Logarithmic]) }
     fn to_ttl(&self, index: usize) -> String {
-        let mut buf = String::with_capacity(1000);
+        let mut buf = String::with_capacity(2000);
         buf.push_str(&format!("                lv2:index {index} ;\n"));
         buf.push_str(&format!("                lv2:symbol {} ;\n", self.symbol()));
         buf.push_str(&format!("                lv2:name {} ;\n", self.name()));
@@ -102,6 +130,24 @@ impl ControlPort {
         buf.push_str(&format!("                lv2:maximum {} ;", self.range.max()));
         if matches!(self.range, ControlRange::Int(_, (_, _))) {
             buf.push_str("\n                lv2:portProperty lv2:integer ;")
+        }
+        match &self.range {
+            Int(_, _) => {
+                buf.push_str("\n                lv2:portProperty lv2:integer ;")
+            },
+            ControlRange::Enum(_, entries) => {
+                buf.push_str("\n                lv2:portProperty lv2:integer ;");
+                buf.push_str("\n                lv2:portProperty lv2:enumeration ;");
+                buf.push_str("\n                lv2:scalePoint [");
+                for (i, string) in entries.iter().enumerate() {
+                    if i > 0 {buf.push_str(" ,\n                [")};
+                    buf.push_str(&format!("\n                    rdfs:label  \"{string}\" ;"));
+                    buf.push_str(&format!("\n                    rdf:value {i} ;"));
+                    buf.push_str("\n                ]");
+                }
+                buf.push_str(" ;");
+            },
+            _ => {},
         }
         for property in self.properties.iter() {
             match property {
@@ -131,25 +177,30 @@ enum ControlRange {
     /// (default, (min, max))
     Int(i32, (i32, i32)),
     /// (default, (min, max))
-    Float(f32, (f32, f32))
+    Float(f32, (f32, f32)),
+    /// (default index, enum entries)
+    Enum(usize, Vec<String>),
 }
 impl ControlRange {
     fn default(&self) -> String {
         match self {
             ControlRange::Int(x, _) => x.to_string(),
             ControlRange::Float(x, _) => format!("{x:.3}"),
+            ControlRange::Enum(x, _) => x.to_string(),
         }
     }
     fn min(&self) -> String {
         match self {
             ControlRange::Int(_, (x, _)) => x.to_string(),
             ControlRange::Float(_, (x, _)) => format!("{x:.3}"),
+            ControlRange::Enum(_, _) => 0.to_string(),
         }
     }
     fn max(&self) -> String {
         match self {
             ControlRange::Int(_, (_, x)) => x.to_string(),
             ControlRange::Float(_, (_, x)) => format!("{x:.3}"),
+            ControlRange::Enum(_, x) => x.len().to_string(),
         }
     }
 }
@@ -176,16 +227,28 @@ impl PortList {
         }
         self
     }
-    fn oscillator() -> Self {
+    fn oscillator(default_amp: f32, default_wave: usize) -> Self {
         Self(vec![
+            ControlPort::new(
+                "wave",
+                "Wave",
+                // Int(0, (0, 6)),
+                ControlRange::Enum(default_wave, vec![
+                    "Sine".to_string(),
+                    "Triangle".to_string(),
+                    "Saw".to_string(),
+                    "Exponential".to_string(),
+                    "Square".to_string(),
+                ]),
+            ),
             ControlPort::new(
                 "amp",
                 "Amplitude",
-                Float(100.0, (0.0, 100.0)),
+                Float(default_amp, (0.0, 100.0)),
             ),
             ControlPort::new(
                 "semitone",
-                "Semitone",
+                "Detune",
                 Float(0.0, (-24.0, 24.0)),
             ),
             ControlPort::new(
@@ -199,19 +262,19 @@ impl PortList {
                 Int(0, (-64, 64)),
             ),
             ControlPort::new(
-                "wave",
-                "Wave",
-                Int(0, (0, 6)),
-            ),
-            ControlPort::new(
                 "pm",
                 "PM",
-                Float(0.0, (0.0, 20.0)),
+                Float(0.0, (0.0, 1.0)),
             ),
             ControlPort::new(
                 "fm",
                 "FM",
-                Float(0.0, (0.0, 20.0)),
+                Float(0.0, (0.0, 1.0)),
+            ),
+            ControlPort::new(
+                "am",
+                "AM",
+                Float(0.0, (0.0, 1.0)),
             ),
             ControlPort::new(
                 "voices",
@@ -226,12 +289,68 @@ impl PortList {
             ControlPort::new(
                 "phase",
                 "Phase",
-                Float(0.0, (0.0, PI * 2.0)),
+                Float(0.0, (0.0, 100.0)),
             ),
             ControlPort::new(
                 "phase_rand",
                 "Phase Rand.",
-                Float(PI * 2.0, (0.0, PI * 2.0)),
+                Float(100.0, (0.0, 100.0)),
+            ),
+        ])
+    }
+    fn oscillator_no_mod(default_amp: f32, default_wave: usize) -> Self {
+        Self(vec![
+            ControlPort::new(
+                "wave",
+                "Wave",
+                // Int(0, (0, 6)),
+                ControlRange::Enum(default_wave, vec![
+                    "Sine".to_string(),
+                    "Triangle".to_string(),
+                    "Saw".to_string(),
+                    "Exponential".to_string(),
+                    "Square".to_string(),
+                ]),
+            ),
+            ControlPort::new(
+                "amp",
+                "Amplitude",
+                Float(default_amp, (0.0, 100.0)),
+            ),
+            ControlPort::new(
+                "semitone",
+                "Detune",
+                Float(0.0, (-24.0, 24.0)),
+            ),
+            ControlPort::new(
+                "octave",
+                "Octave",
+                Int(0, (-8, 8)),
+            ),
+            ControlPort::new(
+                "multiplier",
+                "Freq. Mult",
+                Int(0, (-64, 64)),
+            ),
+            ControlPort::new(
+                "voices",
+                "Voices",
+                Int(1, (1, 128)),
+            ),
+            ControlPort::new(
+                "super_detune",
+                "Super Detune",
+                Float(21.0, (0.0, 100.0)),
+            ),
+            ControlPort::new(
+                "phase",
+                "Phase",
+                Float(0.0, (0.0, 100.0)),
+            ),
+            ControlPort::new(
+                "phase_rand",
+                "Phase Rand.",
+                Float(100.0, (0.0, 100.0)),
             ),
         ])
     }
@@ -240,7 +359,12 @@ impl PortList {
             ControlPort::new(
                 "polyphony",
                 "Polyphony",
-                Int(0, (0, 2)),
+                // Int(0, (0, 2)),
+                ControlRange::Enum(0, vec![
+                    "Polyphonic".to_string(),
+                    "Monophonic".to_string(),
+                    "Legato".to_string(),
+                ]),
             ),
             ControlPort::new(
                 "output_gain",
@@ -332,7 +456,13 @@ impl PortList {
             ControlPort::new(
                 "model",
                 "Model",
-                Int(0, (0, 4)),
+                // Int(0, (0, 4)),
+                ControlRange::Enum(0, vec![
+                    "None".to_string(),
+                    "RC".to_string(),
+                    "Ladder".to_string(),
+                    "Digital".to_string(),
+                ]),
             ),
             ControlPort::new(
                 "type",

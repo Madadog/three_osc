@@ -31,14 +31,11 @@ impl OscVoice {
 /// Implemented as a buffer of independent phases with a common base frequency
 /// (delta) which differs for each phase according to the `detune` parameter in
 /// `add_phase()`.
-///
-/// TODO: Remove delta. `SuperVoice` should only track phase.
 pub struct SuperVoice {
     pub voice_phases: [f32; 128],
-    pub delta: f32,
 }
 impl SuperVoice {
-    pub fn new(delta: f32, phase: f32, phase_random: f32) -> Self {
+    pub fn new(phase: f32, phase_random: f32) -> Self {
         let mut voice_phases = [phase; 128];
         let rng = fastrand::Rng::new();
 
@@ -47,7 +44,6 @@ impl SuperVoice {
         }
         Self {
             voice_phases,
-            delta,
         }
     }
     pub fn add_phase(&mut self, delta: f32, voice_count: usize, detune: f32) {
@@ -82,35 +78,20 @@ pub struct BasicOscillator {
     pub phase: f32,
     pub phase_rand: f32,
     pub pitch_bend: f32,
+
+    // Modulation multipliers. Not actually used by `BasicOscillator` itself, but it's
+    // closely associated and I have no idea where else to put it since there's no
+    // "modulation matrix" yet.
+    pub fm: f32,
+    pub pm: f32,
+    pub am: f32,
+
 }
 impl BasicOscillator {
     pub fn pitch_mult_delta(&self, delta: f32) -> f32 {
         delta
             * 2.0_f32.powf((self.semitone + self.pitch_bend) / 12.0 + self.octave as f32)
             * self.multiplier
-    }
-    pub fn unison<T: Fn(f32) -> f32>(
-        &self,
-        voices: &mut SuperVoice,
-        wave: T,
-        pm: f32,
-        fm: f32,
-    ) -> f32 {
-        let constant = 7018.73299; // sample_rate / 2pi
-        let delta = ((voices.delta) * (1.0 + pm) * constant + fm * 100.0) / constant;
-        voices.add_phase(
-            self.pitch_mult_delta(delta),
-            self.voice_count.into(),
-            self.voices_detune,
-        );
-        voices
-            .voice_phases
-            .iter_mut()
-            .take(self.voice_count.into())
-            .enumerate()
-            .map(|(i, phase)| wave(*phase))
-            .sum::<f32>()
-            / self.voice_count as f32
     }
     pub fn unison_phases<'a>(
         &self,
@@ -138,6 +119,9 @@ impl Default for BasicOscillator {
             phase: 0.0,
             phase_rand: PI * 2.0,
             pitch_bend: 0.0,
+            fm: 0.0,
+            pm: 0.0,
+            am: 0.0,
         }
     }
 }
@@ -191,6 +175,18 @@ impl OscWave {
             }
         }
     }
+    pub fn from_index(index: f32) -> Self {
+        match index {
+            x if x < 1.0 => OscWave::Sine,
+            x if x < 2.0 => OscWave::Tri,
+            x if x < 3.0 => OscWave::Saw,
+            x if x < 4.0 => OscWave::Exp,
+            x if x < 5.0 => OscWave::Square,
+            x if x < 6.0 => OscWave::PulseQuarter,
+            x if x < 7.0 => OscWave::PulseEighth,
+            _ => OscWave::Sine,
+        }
+    }
 }
 
 pub fn modulate_delta(
@@ -199,8 +195,16 @@ pub fn modulate_delta(
     fm: f32,
     sample_rate: f32,
 ) -> f32 {
+    // `pm` and `fm` are expected to be between -1.0 and 1.0,
+    // must be stretched out.
+    let pm = pm * 20.0;
+    let fm = fm * 100.0 * 5.0;
+
+    // `constant` is required because delta varies with sample rate.
+    // PM is multiplicative / relative, so it's unaffected, but
+    // FM is not. 
     let constant = sample_rate / (2.0 * PI);
-    let delta = ((delta) * (1.0 + pm) * constant + fm * 100.0) / constant;
+    let delta = ((delta) * (1.0 + pm) * constant + fm) / constant;
     delta % (2.0 * PI)
 }
 

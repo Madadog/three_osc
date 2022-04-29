@@ -6,8 +6,8 @@ Currently WIP, but usable.
 
 ## Features
 
-* 3 oscillators which can modulate eachother with PM, FM and AM (todo: 3rd oscillator and AM)
-* 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope
+* 3 oscillators which can modulate eachother with PM, FM and AM (todo: AM)
+* 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope (todo: multimode biquad)
 * Unlimited polyphony
 * Legato
 * ADSR envelopes with adjustable slopes
@@ -38,28 +38,33 @@ Coming soon...
     * Controls are spread out over multiple tabs / screens.
     * Surge is a little bit aggressive.
     * Sometimes you want to quickly make simple and predictable sounds.
-* The original Triple Oscillator also has several issues:
+* The original Triple Oscillator solves these problems, but has issues of its own:
     * A bit loud.
     * Volume envelope is optional.
     * No phase randomness.
     * No bandlimited wave generation.
 
 ## TODO
-* Label / dropdown menu for filter model, polyphony, and osc wave controls in LV2 UI
+* Fix strange PM/FM bug where one half of the waveform is zero, unless the note has been playing for over a minute in which case it suddenly works as expected.
 * Portamento
 * Bandpass and highpass filter modes for biquad filter
 * Independent attack slope for ADSR envelopes
 * Group controls in LV2 UI
-* Add third oscillator, work out oscillator modulation interface
+* Add amplitude modulation
+* Add vibrato control / LFO
 * PWM
 * Stereo
+* Figure out how many controls I can fit on the UI before the Ardour horizontal scroll bar shows up
 * Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
 * User-friendly envelope declicking
-* Fix strange PM/FM bug at wave loop point
 * Generate wavetables with FFT, at compile time, rather than at load time.
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
+* Adjust more knobs to sensible values / defaults
+* Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonable nice)
 * Switch between Naive, Wavetable, and Additive synthesis with a control
 * Make the build system nicer
+* Tools for working with the harmonic series
+* Optimise
 * Delete LV2, switch to VST and add gui with egui
 
 ## LICENSE
