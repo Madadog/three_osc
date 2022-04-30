@@ -173,7 +173,7 @@ impl ThreeOsc {
             
             if let Some(osc) = self.oscillators.get(0) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta = modulate_delta(delta, osc2_out * osc.pm, osc2_out * osc.fm, self.sample_rate as f32);
+                let delta = modulate_delta(delta, osc2_out * osc.pm, osc2_out * osc.fm, self.sample_rate as f32).abs();
                 let phases = osc.unison_phases(&mut voice.osc_voice[0], delta);
 
                 let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;

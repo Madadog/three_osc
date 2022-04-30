@@ -171,9 +171,9 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[0].phase = *ports.osc1_phase * 2.0 * PI / 100.0;
             self.synth.oscillators[0].phase_rand = *ports.osc1_phase_rand * 2.0 * PI / 100.0;
             self.synth.oscillators[0].wave = OscWave::from_index(*ports.osc1_wave);
-            self.synth.oscillators[0].pm = *ports.osc1_pm;
-            self.synth.oscillators[0].fm = *ports.osc1_fm;
-            self.synth.oscillators[0].am = *ports.osc1_am;
+            self.synth.oscillators[0].pm = (*ports.osc1_pm).powi(2);
+            self.synth.oscillators[0].fm = (*ports.osc1_fm).powi(2);
+            self.synth.oscillators[0].am = (*ports.osc1_am).powi(2);
 
             // osc2
             self.synth.oscillators[1].amp = *ports.osc2_amp / 100.0;
@@ -189,9 +189,9 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[1].phase = *ports.osc2_phase * 2.0 * PI / 100.0;
             self.synth.oscillators[1].phase_rand = *ports.osc2_phase_rand * 2.0 * PI / 100.0;
             self.synth.oscillators[1].wave = OscWave::from_index(*ports.osc2_wave);
-            self.synth.oscillators[1].pm = *ports.osc2_pm;
-            self.synth.oscillators[1].fm = *ports.osc2_fm;
-            self.synth.oscillators[1].am = *ports.osc2_am;
+            self.synth.oscillators[1].pm = (*ports.osc2_pm).powi(2);
+            self.synth.oscillators[1].fm = (*ports.osc2_fm).powi(2);
+            self.synth.oscillators[1].am = (*ports.osc2_am).powi(2);
 
             // osc3
             self.synth.oscillators[2].amp = *ports.osc3_amp / 100.0;
