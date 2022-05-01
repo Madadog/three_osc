@@ -504,7 +504,6 @@ impl<const N: usize> AdditiveOsc<N> {
         .for_each(|(i, x)| {
             *x = if i % 4 == 0 {1.0} else {-1.0}; 
             *x /= ((i + 1) as f32).powi(2);
-            println!("{i}, {x}");
         });
         let phases = [0.0; N];
         Self { amplitudes, phases }

@@ -20,6 +20,60 @@ pub struct TestFilter {
     pub(crate) b2: f32,
     pub(crate) target_a: (f32, f32, f32),
     pub(crate) target_b: (f32, f32, f32),
+    pub(crate) lerp_amount: f32,
+}
+impl TestFilter {
+    fn lerp_params(&mut self, amount: f32) {
+        self.a0 = lerp(self.a0, self.target_a.0, amount);
+        self.a1 = lerp(self.a1, self.target_a.1, amount);
+        self.a2 = lerp(self.a2, self.target_a.2, amount);
+        self.b0 = lerp(self.b0, self.target_b.0, amount);
+        self.b1 = lerp(self.b1, self.target_b.1, amount);
+        self.b2 = lerp(self.b2, self.target_b.2, amount);
+    }
+    pub fn with_params(cutoff: f32, resonance: f32, sample_rate: f32) -> TestFilter {
+        let mut filter = TestFilter::default();
+        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate);
+
+        filter.a0 = coeffs.0;
+        filter.a1 = coeffs.1;
+        filter.a2 = coeffs.2;
+        filter.b0 = coeffs.3;
+        filter.b1 = coeffs.4;
+        filter.b2 = coeffs.5;
+
+        filter.lerp_amount = 176.4 / sample_rate;
+
+        filter
+    }
+    /// Outputs biquad coefficients in the format (a0, a1, a2, b0, b1, b2)
+    pub fn calc_coef(cutoff: f32, resonance: f32, sample_rate: f32) -> (f32, f32, f32, f32, f32, f32) {
+        // Biquad is less stable than other filters at low frequencies, clamp to 30 Hz minimum
+        let cutoff =  cutoff.max(30.0);
+
+        // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
+
+        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)."
+
+        // [This notice should be placed within redistributed or derivative software code or text when appropriate. This particular formulation became active on May 13, 2015, and edited for clarity 7 April, 2021, superseding the 2002 version.]
+        // Audio Eq Cookbook: https://www.w3.org/TR/audio-eq-cookbook/
+        // Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute of Technology, European Research Consortium for Informatics and Mathematics, Keio University, Beihang). All Rights Reserved. This work is distributed under the W3C® Software and Document License [1] in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+        // [1] http://www.w3.org/Consortium/Legal/copyright-software
+
+        let phase_change = 2.0 * PI * cutoff / sample_rate;
+        let (sin, cos) = phase_change.sin_cos();
+        let a = sin / (2.0 * resonance);
+
+        let b0 = (1.0 - cos) / 2.0;
+        let b1 = 1.0 - cos;
+        let b2 = (1.0 - cos) / 2.0;
+
+        let a0 = 1.0 + a;
+        let a1 = -2.0 * cos;
+        let a2 = 1.0 - a;
+
+        (a0, a1, a2, b0, b1, b2)
+    }
 }
 
 impl Filter for TestFilter {
@@ -32,6 +86,16 @@ impl Filter for TestFilter {
             self.stage0 = 0.0;
             self.stage1 = 0.0;
         }
+        // println!("filter params: {}, {}, {}, {}, {}, {}, ",
+        //     self.a0,
+        //     self.a1,
+        //     self.a2,
+        //     self.b0,
+        //     self.b1,
+        //     self.b2,
+        // );
+        self.lerp_params(self.lerp_amount);
+        // self.filter_params(0.5);
 
         let previous_previous_sample = self.stage1;
         let previous_sample = self.stage0;
@@ -46,27 +110,15 @@ impl Filter for TestFilter {
             / self.a0
     }
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
+        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate);
 
-        // "This software or document includes material copied from or derived from Audio Eq Cookbook (https://www.w3.org/TR/audio-eq-cookbook/). Copyright © 2021 W3C® (MIT, ERCIM, Keio, Beihang)."
+        self.target_a.0 = coeffs.0;
+        self.target_a.1 = coeffs.1;
+        self.target_a.2 = coeffs.2;
 
-        // [This notice should be placed within redistributed or derivative software code or text when appropriate. This particular formulation became active on May 13, 2015, and edited for clarity 7 April, 2021, superseding the 2002 version.]
-        // Audio Eq Cookbook: https://www.w3.org/TR/audio-eq-cookbook/
-        // Copyright © 2021 World Wide Web Consortium, (Massachusetts Institute of Technology, European Research Consortium for Informatics and Mathematics, Keio University, Beihang). All Rights Reserved. This work is distributed under the W3C® Software and Document License [1] in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-        // [1] http://www.w3.org/Consortium/Legal/copyright-software
-
-        let phase_change = 2.0 * PI * cutoff / sample_rate;
-        let (sin, cos) = phase_change.sin_cos();
-        let a = sin / (2.0 * resonance);
-
-        self.b0 = (1.0 - cos) / 2.0;
-        self.b1 = 1.0 - cos;
-        self.b2 = (1.0 - cos) / 2.0;
-
-        // self.a0 = 1.0 + a;
-        self.a0 = 1.0 + a;
-        self.a1 = -2.0 * cos;
-        self.a2 = 1.0 - a;
+        self.target_b.0 = coeffs.3;
+        self.target_b.1 = coeffs.4;
+        self.target_b.2 = coeffs.5;
     }
 }
 
@@ -123,14 +175,21 @@ impl FilterController {
         }
     }
     pub(crate) fn interpolate_cutoff(&mut self, amount: f32) {
-        // This is my partially successful attempt to remove clicking
-        // from my biquad implementation, which works until the filter
-        // cutoff is changed by greater or less than 100 times its
-        // previous value.
+        // First attempt to remove clicking from my biquad implementation.
+        // Only stops clicking under a very specific set of circumstances
 
         // Change by at most an octave per sample, +1 to accelerate changes low cutoff freqs < 1.
         let max_change = self.cutoff.abs() * 2.0 + 1.0;
         self.cutoff = lerp(self.cutoff, self.target_cutoff, amount).clamp(-max_change, max_change);
+    }
+    pub fn get_cutoff(&self, cutoff_mult: f32, envelope_index: f32, release_index: Option<u32>, sample_rate: f32) -> f32 {
+        let envelope = if let Some(release_index) = release_index {
+            let release_time = release_index as f32 / sample_rate as f32;
+            self.cutoff_envelope.sample_released(release_time, envelope_index) * self.envelope_amount
+        } else {
+            self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount
+        };
+        (self.cutoff * cutoff_mult + envelope).clamp(10.0, 22000.0)
     }
     pub(crate) fn process_envelope_held(
         &mut self,
@@ -200,14 +259,14 @@ pub enum FilterContainer {
     BiquadFilter(TestFilter),
 }
 impl FilterContainer {
-    pub fn set(&mut self, filter_model: FilterModel) {
+    pub fn set(&mut self, filter_model: FilterModel, cutoff: f32, resonance: f32, sample_rate: f32) {
         match (self, filter_model) {
             (FilterContainer::RcFilter(_), FilterModel::RcFilter) => {},
             (FilterContainer::LadderFilter(_), FilterModel::LadderFilter) => {},
             (FilterContainer::BiquadFilter(_), FilterModel::BiquadFilter) => {},
             (x, FilterModel::RcFilter) => {*x = FilterContainer::RcFilter(RcFilter::default())},
             (x, FilterModel::LadderFilter) => {*x = FilterContainer::LadderFilter(LadderFilter::default())},
-            (x, FilterModel::BiquadFilter) => {*x = FilterContainer::BiquadFilter(TestFilter::default())},
+            (x, FilterModel::BiquadFilter) => {*x = FilterContainer::BiquadFilter(TestFilter::with_params(cutoff, resonance, sample_rate))},
             (x, FilterModel::None) => {*x = FilterContainer::None},
             (_, _) => {unreachable!("Forgot to set a FilterModel for FilterContainer")}
         }

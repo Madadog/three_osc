@@ -181,26 +181,25 @@ impl ThreeOsc {
                 // let osc_out = self.additive.generate(phases[0], (22050.0/(2.0*440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0))) as usize);
                 out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
             }
+
+            // Update filter controls, calculate keytrack
             let voice_freq = 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
             
-            voice.filter.set(self.filter_controller.filter_model);
+            let cutoff = self.filter_controller.get_cutoff(voice_freq, envelope_index, voice.release_time, self.sample_rate as f32);
+            voice.filter.set(self.filter_controller.filter_model, cutoff, self.filter_controller.resonance, self.sample_rate as f32);
             voice.filter.set_filter_type(self.filter_controller.filter_type);
 
             match voice.filter {
-                // Hack to keep biquad filter / none at same level as others
+                // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
+                // keep the levels the same when switching filter.
                 filter::FilterContainer::BiquadFilter(_)
                 | filter::FilterContainer::None => self.filter_controller.drive = self.filter_controller.drive.min(1.0),
                 _ => {}
             };
-            
-            // filter envelope
-            out = if let Some(release_time) = voice.release_time {
-                let release_index = release_time as f32 / self.sample_rate as f32;
-                self.filter_controller.process_envelope_released(&mut voice.filter, voice_freq, out, envelope_index, release_index, self.sample_rate as f32)
-            } else {
-                self.filter_controller.process_envelope_held(&mut voice.filter, voice_freq, out, envelope_index, self.sample_rate as f32)
-            };
 
+            // Process filter
+            voice.filter.set_params(self.sample_rate as f32, cutoff, self.filter_controller.resonance);
+            out = voice.filter.process(out * self.filter_controller.drive);
             
             // amplitude envelope
             out = if let Some(release_time) = voice.release_time {
@@ -312,6 +311,7 @@ mod envelopes {
         pub release_time: f32,
         pub sustain_level: f32,
         pub slope: f32,
+        pub attack_slope: f32,
     }
     impl AdsrEnvelope {
         pub fn new(
@@ -326,13 +326,22 @@ mod envelopes {
                 decay_time,
                 release_time,
                 sustain_level,
-                slope,
+                slope: Self::slope(slope),
+                attack_slope: Self::slope(-slope),
             }
+        }
+        /// 0 is linear, positive is biased towards zero, negative is biased towards max.
+        fn slope(slope: f32) -> f32 {
+            2.0_f32.powf(slope)
+        }
+        pub fn set_slope(&mut self, slope: f32) {
+            self.slope = Self::slope(slope);
+            self.attack_slope = Self::slope(-slope);
         }
         /// Returns the envelope CV (between 0.0 and 1.0) associated with the given index
         pub fn sample_held(&self, index: f32) -> f32 {
             if index <= self.attack_time {
-                (index / self.attack_time).powf(self.slope)
+                (index / self.attack_time).powf(self.attack_slope)
             } else if index - self.attack_time <= self.decay_time {
                 (1.0 - (index - self.attack_time) / self.decay_time).powf(self.slope)
                     * (1.0 - self.sustain_level)
