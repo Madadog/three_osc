@@ -499,11 +499,12 @@ impl<const N: usize> AdditiveOsc<N> {
         Self { amplitudes, phases }
     }
     pub fn triangle() -> Self {
-        let mut amplitudes = [-1.0; N];
-        amplitudes.iter_mut().enumerate().for_each(|(i, x)| {
+        let mut amplitudes = [0.0; N];
+        amplitudes.iter_mut().enumerate().step_by(2)
+        .for_each(|(i, x)| {
+            *x = if i % 4 == 0 {1.0} else {-1.0}; 
             *x /= ((i + 1) as f32).powi(2);
-            *x = *x * ((i + 1) % 2) as f32;
-            *x = x.powf((i) as f32 / 2.0)
+            println!("{i}, {x}");
         });
         let phases = [0.0; N];
         Self { amplitudes, phases }
