@@ -164,7 +164,8 @@ impl ThreeOsc {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
                 let delta = modulate_delta(delta, osc3_out * osc.pm, osc3_out * osc.fm, self.sample_rate as f32);
                 let phases = osc.unison_phases(&mut voice.osc_voice[1], delta);
-                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                let mut osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                osc_out *=  lerp(1.0, osc3_out, osc.am);
                 out += osc_out * osc.amp * velocity;
                 osc_out
             } else {
@@ -178,7 +179,7 @@ impl ThreeOsc {
 
                 let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 // let osc_out = self.additive.generate(phases[0], (22050.0/(2.0*440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0))) as usize);
-                out += osc_out * osc.amp * velocity;
+                out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
             }
             let voice_freq = 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
             

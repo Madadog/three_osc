@@ -45,7 +45,6 @@ Coming soon...
     * No bandlimited wave generation.
 
 ## TODO
-* Fix strange PM/FM bug where one half of the waveform is zero, unless the note has been playing for over a minute in which case it suddenly works as expected.
 * Portamento
 * Bandpass and highpass filter modes for biquad filter
 * Independent attack slope for ADSR envelopes

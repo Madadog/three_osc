@@ -197,7 +197,7 @@ pub fn modulate_delta(
 ) -> f32 {
     // `pm` and `fm` are expected to be between -1.0 and 1.0,
     // must be stretched out.
-    let pm = pm * 100.0 * 1.5;
+    let pm = pm * 125.0;
     let fm = fm * 10000.0 * 1.5;
 
     // `constant` is required because delta varies with sample rate.
