@@ -42,7 +42,7 @@ impl TestFilter {
         filter.b1 = coeffs.4;
         filter.b2 = coeffs.5;
 
-        filter.lerp_amount = 176.4 / sample_rate;
+        filter.lerp_amount = 705.6 / sample_rate;
 
         filter
     }
