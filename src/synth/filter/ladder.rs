@@ -253,15 +253,18 @@ impl LadderFilter {
 impl Filter for LadderFilter {
     fn process(&mut self, input: f32) -> f32 {
         self.process_sample(input as f64);
-        (self.output() * 1.414) as f32
+        (self.output() * 1.8) as f32
     }
 
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
         // The original module expected a cutoff frequency from 0.001 -> 2.25.
         // 22000 / 2.25 = 9800.0
-        self.cutoff_frequency = (cutoff as f64 / 9800.0) + 0.001;
+        // ... which is consistently out of tune for some reason.
+        // rough retune: 9800.0 / 1.4 = 7000.00
+        // Retune makes pitch accurate when resonance == 0.5
+        self.cutoff_frequency = (cutoff as f64 / 7000.0) + 0.0001;
         // Self-resonance starts at resonance >= 0.5
-        self.resonance = (resonance / 10.0) as f64;
+        self.resonance = (resonance / 10.0).powi(2) as f64;
         self.set_sample_rate(sample_rate as f64);
     }
 
