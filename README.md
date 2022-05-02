@@ -13,7 +13,7 @@ Currently a work in progress, but usable nevertheless.
 * 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope (todo: multimode biquad)
 * Unlimited polyphony
 * Legato
-* ADSR envelopes with adjustable slopes
+* ADSR envelopes with smoothly adjustable slopes
 * Sine, triangle, exponential, saw, and square waves
 * Bandlimited wave generation using a combination of wavetables and additive synthesis.
 * Detunable super with (up to) 128 voices for each oscillator
@@ -36,9 +36,10 @@ Coming soon...
 3. Load it into your preferred LV2 host (Ardour, Carla, LMMS) and have fun.
 
 ## Tips and Tricks
-* 
-* The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Set drive below 1 and sweep the filters very slowly for a 'harmonic snap' effect.
+* Increasing envelope slope makes it steeper, decreasing it does the opposite. Slope = 1 gives perceptually-linear (logarithmic) volume decay.
+* The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Underdriving the filters (i.e. drive below 1) and sweeping them very slowly gives a 'harmonic snap' effect.
 * Setting octave detune to -0.0028 gives near perfect fifths. 0.0342 gives near perfect major thirds.
+* FM changes frequency with the modulator's waveform, PM changes frequency with the derivative of the modulator's waveform. (I.E. PM by triangle == FM by square wave)
 
 ## Why did you make this?
 * I'm currently migrating from LMMS to Ardour. Surge and ZynAddSubFx are great synths, but...
@@ -52,6 +53,7 @@ Coming soon...
     * Originally had no bandlimited wave generation.
 
 ## TODO
+* Choose oscillator wavetable using delta instead of midi input pitch.
 * Find a compromise between biquad filter clicking and allowable envelope steepness (i.e. replace filter with the LMMS default lowpass filter, but force cutoff above ~25 Hz to stop DC spikes)
 * Portamento
 * Bandpass and highpass filter modes for biquad filter
