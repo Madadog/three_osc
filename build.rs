@@ -367,6 +367,11 @@ impl PortList {
                 ]),
             ),
             ControlPort::new(
+                "octave_detune",
+                "Octave Detune",
+                Float(0.0, (-0.05, 0.05)),
+            ),
+            ControlPort::new(
                 "output_gain",
                 "Output Gain",
                 Float(-18.0, (-90.0, 0.0)),

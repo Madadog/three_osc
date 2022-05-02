@@ -32,6 +32,9 @@ Coming soon...
 2. Run `copy_lv2.sh`. This automatically does the manual instructions, copying `./three_osc.lv2` into your home `YOUR_HOME_DIRECTORY/.lv2/` directory. *Only works on linux because the script looks for `libthree_osc.so`, but should work on windows if you edit the script and change the copied file name to `libthree_osc.dll`.*
 3. Load it into your preferred LV2 host (Ardour, Carla, LMMS) and have fun.
 
+## Tips and Tricks
+* The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Set drive below 1 and sweep the filters very slowly for a 'harmonic snap' effect.
+* Setting octave detune to -0.0028 gives almost perfect fifths. 0.0342 gives near perfect major thirds.
 
 ## Why did you make this?
 * I'm currently migrating from LMMS to Ardour. Surge and ZynAddSubFx are great synths, but...

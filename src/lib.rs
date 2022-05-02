@@ -67,6 +67,7 @@ struct Ports {
     vol_release: InputPort<Control>,
     vol_slope: InputPort<Control>,
     polyphony: InputPort<Control>,
+    octave_detune: InputPort<Control>,
     output_gain: InputPort<Control>,
     global_pitch: InputPort<Control>,
     bend_range: InputPort<Control>,
@@ -120,6 +121,8 @@ impl Plugin for SynthLv2 {
             x if x < 2.0 => Polyphony::Monophonic,
             _ => Polyphony::Legato
         };
+        // multiplies delta: smaller = higher pitch
+        self.synth.octave_detune = 1.0 - *ports.octave_detune;
 
         // adjust master gain envelope
         self.synth.gain_envelope.attack_time = *ports.vol_attack;

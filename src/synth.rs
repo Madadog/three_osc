@@ -36,6 +36,7 @@ pub struct ThreeOsc {
     additive: AdditiveOsc,
     pub bend_range: f32,
     pub polyphony: Polyphony,
+    pub octave_detune: f32,
 }
 
 impl ThreeOsc {
@@ -54,6 +55,7 @@ impl ThreeOsc {
             additive: AdditiveOsc::saw(),
             bend_range: 2.0,
             polyphony: Polyphony::Legato,
+            octave_detune: 1.0
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -149,6 +151,7 @@ impl ThreeOsc {
             let mut out = 0.0;
             let velocity = voice.velocity as f32 / 128.0;
             let index = voice.id as usize;
+            voice.detune = self.octave_detune;
     
             let osc3_out = if let Some(osc) = self.oscillators.get(2) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
@@ -242,6 +245,7 @@ pub struct Voice {
     osc_voice: [SuperVoice; 3],
     filter: filter::FilterContainer,
     velocity: u8,
+    detune: f32,
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
@@ -270,6 +274,7 @@ impl Voice {
             osc_voice,
             velocity,
             filter: filter::FilterContainer::None,
+            detune: 0.0,
         }
     }
     pub fn release(&mut self) {
@@ -281,7 +286,7 @@ impl Voice {
         self.runtime += 1;
     }
     pub fn voice_delta(&self, sample_rate: f32) -> f32 {
-        2.0 * PI * 440.0 * 2.0_f32.powf(((self.id as i16 - 69) as f32) / 12.0) / sample_rate
+        2.0 * PI * 440.0 * 2.0_f32.powf(((self.id as i16 - 69) as f32 * self.detune) / 12.0) / sample_rate //* (1.0 + self.detune)
     }
 }
 
