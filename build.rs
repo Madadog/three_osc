@@ -58,7 +58,8 @@ fn main() {
             // third osc cannot be modulated
             oscillators.push(PortList::oscillator_no_mod(amp, wave).prefix(&format!("osc{i}_"), &format!("Osc {i} ")))
         } else {
-            oscillators.push(PortList::oscillator(amp, wave).prefix(&format!("osc{i}_"), &format!("Osc {i} ")))
+            let modulator = format!("Osc {}", i + 1);
+            oscillators.push(PortList::oscillator(amp, wave, &modulator).prefix(&format!("osc{i}_"), &format!("Osc {i} ")))
         }
     }
 
@@ -227,7 +228,7 @@ impl PortList {
         }
         self
     }
-    fn oscillator(default_amp: f32, default_wave: usize) -> Self {
+    fn oscillator(default_amp: f32, default_wave: usize, modulator: &str) -> Self {
         Self(vec![
             ControlPort::new(
                 "wave",
@@ -263,17 +264,17 @@ impl PortList {
             ),
             ControlPort::new(
                 "pm",
-                "PM",
+                &format!("<- {modulator} PM"),
                 Float(0.0, (0.0, 1.0)),
             ),
             ControlPort::new(
                 "fm",
-                "FM",
+                &format!("<- {modulator} FM"),
                 Float(0.0, (0.0, 1.0)),
             ),
             ControlPort::new(
                 "am",
-                "AM",
+                &format!("<- {modulator} AM"),
                 Float(0.0, (0.0, 1.0)),
             ),
             ControlPort::new(
@@ -413,7 +414,7 @@ impl PortList {
             ControlPort::new(
                 "slope",
                 "Slope",
-                Float(0.0, (-1.0, 1.0)),
+                Float(1.0, (-8.0, 8.0)),
             ),
         ])
     }
@@ -432,7 +433,7 @@ impl PortList {
             ControlPort::new(
                 "attack",
                 "Attack",
-                Float(0.001, (0.0, 15.0)),
+                Float(0.0, (0.0, 15.0)),
             ).logarithmic(),
             ControlPort::new(
                 "decay",
@@ -442,7 +443,7 @@ impl PortList {
             ControlPort::new(
                 "sustain",
                 "Sustain",
-                Float(1.0, (0.0, 1.0)),
+                Float(0.0, (0.0, 1.0)),
             ),
             ControlPort::new(
                 "release",
@@ -452,7 +453,7 @@ impl PortList {
             ControlPort::new(
                 "slope",
                 "Slope",
-                Float(0.0, (-1.0, 1.0)),
+                Float(1.0, (-8.0, 8.0)),
             ),
         ])
     }
@@ -462,7 +463,7 @@ impl PortList {
                 "model",
                 "Model",
                 // Int(0, (0, 4)),
-                ControlRange::Enum(0, vec![
+                ControlRange::Enum(3, vec![
                     "None".to_string(),
                     "RC".to_string(),
                     "Ladder".to_string(),
@@ -472,7 +473,11 @@ impl PortList {
             ControlPort::new(
                 "type",
                 "Type",
-                Float(0.0, (0.0, 3.0)),
+                ControlRange::Enum(0, vec![
+                    "Lowpass".to_string(),
+                    "Bandpass".to_string(),
+                    "Highpass".to_string(),
+                ]),
             ),
             ControlPort::new(
                 "cutoff",
@@ -482,7 +487,7 @@ impl PortList {
             ControlPort::new(
                 "resonance",
                 "Resonance",
-                Float(0.1, (0.01, 10.0)),
+                Float(0.6, (0.01, 10.0)),
             ),
             ControlPort::new(
                 "drive",

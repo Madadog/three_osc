@@ -115,7 +115,7 @@
                     lv2:ControlPort ;
                 lv2:index 8 ;
                 lv2:symbol "osc1_pm" ;
-                lv2:name "Osc 1 PM" ;
+                lv2:name "Osc 1 <- Osc 2 PM" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -124,7 +124,7 @@
                     lv2:ControlPort ;
                 lv2:index 9 ;
                 lv2:symbol "osc1_fm" ;
-                lv2:name "Osc 1 FM" ;
+                lv2:name "Osc 1 <- Osc 2 FM" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -133,7 +133,7 @@
                     lv2:ControlPort ;
                 lv2:index 10 ;
                 lv2:symbol "osc1_am" ;
-                lv2:name "Osc 1 AM" ;
+                lv2:name "Osc 1 <- Osc 2 AM" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -251,7 +251,7 @@
                     lv2:ControlPort ;
                 lv2:index 20 ;
                 lv2:symbol "osc2_pm" ;
-                lv2:name "Osc 2 PM" ;
+                lv2:name "Osc 2 <- Osc 3 PM" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -260,7 +260,7 @@
                     lv2:ControlPort ;
                 lv2:index 21 ;
                 lv2:symbol "osc2_fm" ;
-                lv2:name "Osc 2 FM" ;
+                lv2:name "Osc 2 <- Osc 3 FM" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -269,7 +269,7 @@
                     lv2:ControlPort ;
                 lv2:index 22 ;
                 lv2:symbol "osc2_am" ;
-                lv2:name "Osc 2 AM" ;
+                lv2:name "Osc 2 <- Osc 3 AM" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -426,7 +426,7 @@
                 lv2:index 36 ;
                 lv2:symbol "fil1_model" ;
                 lv2:name "Filter 1 Model" ;
-                lv2:default 0 ;
+                lv2:default 3 ;
                 lv2:minimum 0 ;
                 lv2:maximum 4 ;
                 lv2:portProperty lv2:integer ;
@@ -453,9 +453,23 @@
                 lv2:index 37 ;
                 lv2:symbol "fil1_type" ;
                 lv2:name "Filter 1 Type" ;
-                lv2:default 0.000 ;
-                lv2:minimum 0.000 ;
-                lv2:maximum 3.000 ;
+                lv2:default 0 ;
+                lv2:minimum 0 ;
+                lv2:maximum 3 ;
+                lv2:portProperty lv2:integer ;
+                lv2:portProperty lv2:enumeration ;
+                lv2:scalePoint [
+                    rdfs:label  "Lowpass" ;
+                    rdf:value 0 ;
+                ] ,
+                [
+                    rdfs:label  "Bandpass" ;
+                    rdf:value 1 ;
+                ] ,
+                [
+                    rdfs:label  "Highpass" ;
+                    rdf:value 2 ;
+                ] ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -472,7 +486,7 @@
                 lv2:index 39 ;
                 lv2:symbol "fil1_resonance" ;
                 lv2:name "Filter 1 Resonance" ;
-                lv2:default 0.100 ;
+                lv2:default 0.600 ;
                 lv2:minimum 0.010 ;
                 lv2:maximum 10.000 ;
         ] , [
@@ -508,7 +522,7 @@
                 lv2:index 43 ;
                 lv2:symbol "fil1_attack" ;
                 lv2:name "Filter 1 Attack" ;
-                lv2:default 0.001 ;
+                lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 15.000 ;
                 lv2:portProperty props:logarithmic ;
@@ -528,7 +542,7 @@
                 lv2:index 45 ;
                 lv2:symbol "fil1_sustain" ;
                 lv2:name "Filter 1 Sustain" ;
-                lv2:default 1.000 ;
+                lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
         ] , [
@@ -547,9 +561,9 @@
                 lv2:index 47 ;
                 lv2:symbol "fil1_slope" ;
                 lv2:name "Filter 1 Slope" ;
-                lv2:default 0.000 ;
-                lv2:minimum -1.000 ;
-                lv2:maximum 1.000 ;
+                lv2:default 1.000 ;
+                lv2:minimum -8.000 ;
+                lv2:maximum 8.000 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -595,9 +609,9 @@
                 lv2:index 52 ;
                 lv2:symbol "vol_slope" ;
                 lv2:name "Vol Slope" ;
-                lv2:default 0.000 ;
-                lv2:minimum -1.000 ;
-                lv2:maximum 1.000 ;
+                lv2:default 1.000 ;
+                lv2:minimum -8.000 ;
+                lv2:maximum 8.000 ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
