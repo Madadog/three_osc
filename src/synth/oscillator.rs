@@ -314,9 +314,6 @@ impl Wavetable {
     }
     #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
-        if phase >= 2.0 * PI {
-            panic!("Phase was greater than 2.0 * PI")
-        };
         (phase / (2.0 * PI)) * self.table.len() as f32
     }
     #[inline]
