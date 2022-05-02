@@ -2,11 +2,14 @@
 
 An LV2 clone of [Triple Oscillator](https://github.com/LMMS/lmms), a polyphonic subtractive synthesizer with three oscillators that can modulate each other in various ways.
 
-Currently WIP, but usable. 
+Currently a work in progress, but usable nevertheless. 
+
+![alt text](/images/three_osc_v1.png "Ardour hosting a bass preset which uses the ladder filter.")
+
 
 ## Features
 
-* 3 oscillators which can modulate eachother with PM, FM and AM (todo: AM)
+* 3 oscillators which can modulate eachother with PM, FM and AM
 * 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope (todo: multimode biquad)
 * Unlimited polyphony
 * Legato
@@ -33,35 +36,33 @@ Coming soon...
 3. Load it into your preferred LV2 host (Ardour, Carla, LMMS) and have fun.
 
 ## Tips and Tricks
+* 
 * The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Set drive below 1 and sweep the filters very slowly for a 'harmonic snap' effect.
-* Setting octave detune to -0.0028 gives almost perfect fifths. 0.0342 gives near perfect major thirds.
+* Setting octave detune to -0.0028 gives near perfect fifths. 0.0342 gives near perfect major thirds.
 
 ## Why did you make this?
 * I'm currently migrating from LMMS to Ardour. Surge and ZynAddSubFx are great synths, but...
     * Controls are spread out over multiple tabs / screens.
     * Surge is a little bit aggressive.
     * Sometimes you want to quickly make simple and predictable sounds.
-* The original Triple Oscillator solves these problems, but has issues of its own:
+* The original Triple Oscillator mostly solves these problems, but has issues of its own:
     * A bit loud.
     * Volume envelope is optional.
     * No phase randomness.
-    * No bandlimited wave generation.
+    * Originally had no bandlimited wave generation.
 
 ## TODO
+* Find a compromise between biquad filter clicking and allowable envelope steepness (i.e. replace filter with the LMMS default lowpass filter, but force cutoff above ~25 Hz to stop DC spikes)
 * Portamento
 * Bandpass and highpass filter modes for biquad filter
-* Independent attack slope for ADSR envelopes
 * Rescale resonance control max from 10.0 to 1.0
-* Adjust ladder filter cutoff range so it's more consistent with the other filters
-* Group controls in LV2 UI
-* Add amplitude modulation
 * Add vibrato control / LFO
 * PWM
 * Stereo
 * Figure out how many controls can fit on the UI before Ardour adds a scroll bar
 * Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
 * User-friendly envelope declicking
-* Generate wavetables with FFT, at compile time, rather than at load time.
+* Generate wavetables at constant length with FFT at compile time, not at load time.
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
 * Adjust more knobs to sensible values / defaults
 * Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonably nice)
