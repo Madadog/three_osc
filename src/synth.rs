@@ -335,8 +335,15 @@ mod envelopes {
             2.0_f32.powf(slope)
         }
         pub fn set_slope(&mut self, slope: f32) {
-            self.slope = Self::slope(slope);
-            self.attack_slope = Self::slope(-slope);
+            // The inverted / negative slope flares up too quickly compared to the 
+            // positive slope, so we divide the negative slope by an arbitrary number
+            if slope.is_sign_positive() {
+                self.slope = Self::slope(slope);
+                self.attack_slope = Self::slope(-slope / 4.0);
+            } else {
+                self.slope = Self::slope(slope / 4.0);
+                self.attack_slope = Self::slope(-slope);
+            }
         }
         /// Returns the envelope CV (between 0.0 and 1.0) associated with the given index
         pub fn sample_held(&self, index: f32) -> f32 {

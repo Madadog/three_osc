@@ -126,7 +126,7 @@ impl Plugin for SynthLv2 {
         self.synth.gain_envelope.decay_time = *ports.vol_decay;
         self.synth.gain_envelope.sustain_level = *ports.vol_sustain;
         self.synth.gain_envelope.release_time = *ports.vol_release;
-        self.synth.gain_envelope.set_slope(*ports.vol_slope);
+        self.synth.gain_envelope.set_slope(*ports.vol_slope * 8.0);
 
         self.synth.filter_controller.envelope_amount = (*ports.fil1_env_amount).powi(2) * 22000.0;
         self.synth.filter_controller.keytrack = *ports.fil1_keytrack;
@@ -134,7 +134,7 @@ impl Plugin for SynthLv2 {
         self.synth.filter_controller.cutoff_envelope.decay_time = *ports.fil1_decay;
         self.synth.filter_controller.cutoff_envelope.sustain_level = *ports.fil1_sustain;
         self.synth.filter_controller.cutoff_envelope.release_time = *ports.fil1_release;
-        self.synth.filter_controller.cutoff_envelope.set_slope(*ports.fil1_slope);
+        self.synth.filter_controller.cutoff_envelope.set_slope(*ports.fil1_slope * 8.0);
         self.synth.filter_controller.target_cutoff = *ports.fil1_cutoff;
         self.synth.filter_controller.resonance = *ports.fil1_resonance;
         self.synth.filter_controller.drive = *ports.fil1_drive;

@@ -408,7 +408,7 @@ impl PortList {
             ControlPort::new(
                 "slope",
                 "Slope",
-                Float(0.0, (-3.0, 8.0)),
+                Float(0.0, (-1.0, 1.0)),
             ),
         ])
     }
@@ -447,7 +447,7 @@ impl PortList {
             ControlPort::new(
                 "slope",
                 "Slope",
-                Float(0.0, (-3.0, 8.0)),
+                Float(0.0, (-1.0, 1.0)),
             ),
         ])
     }
