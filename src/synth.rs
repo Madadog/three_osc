@@ -152,7 +152,7 @@ impl ThreeOsc {
     
             let osc3_out = if let Some(osc) = self.oscillators.get(2) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let phases = osc.unison_phases(&mut voice.osc_voice[2], delta);
+                let phases = voice.osc_voice[2].unison_phases(delta, osc.voice_count.into(), osc.voices_detune);
                 let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity;
                 osc_out
@@ -162,10 +162,11 @@ impl ThreeOsc {
             
             let osc2_out = if let Some(osc) = self.oscillators.get(1) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta = modulate_delta(delta, osc3_out * osc.pm, osc3_out * osc.fm, self.sample_rate as f32);
-                let phases = osc.unison_phases(&mut voice.osc_voice[1], delta);
-                let mut osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
-                osc_out *=  lerp(1.0, osc3_out, osc.am);
+                let delta = modulate_delta(delta, osc3_out * osc.fm, 0.0, self.sample_rate as f32);
+                let phases = voice.osc_voice[1].unison_phases_pm(delta, osc.voice_count.into(), osc.voices_detune, osc3_out * osc.pm);
+                
+                let mut osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(&phases, osc.voice_count.into()) / osc.voice_count as f32;
+                osc_out *= lerp(1.0, osc3_out, osc.am);
                 out += osc_out * osc.amp * velocity;
                 osc_out
             } else {
@@ -174,11 +175,10 @@ impl ThreeOsc {
             
             if let Some(osc) = self.oscillators.get(0) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta = modulate_delta(delta, osc2_out * osc.pm, osc2_out * osc.fm, self.sample_rate as f32).abs();
-                let phases = osc.unison_phases(&mut voice.osc_voice[0], delta);
+                let delta = modulate_delta(delta, osc2_out * osc.fm, 0.0, self.sample_rate as f32).abs();
+                let phases = voice.osc_voice[0].unison_phases_pm(delta, osc.voice_count.into(), osc.voices_detune, osc2_out * osc.pm);
 
-                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
-                // let osc_out = self.additive.generate(phases[0], (22050.0/(2.0*440.0 * 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0))) as usize);
+                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(&phases, osc.voice_count.into()) / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
             }
 

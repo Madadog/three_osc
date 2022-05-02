@@ -59,6 +59,38 @@ impl SuperVoice {
                 *phase = (*phase + delta) % (2.0 * PI);
             });
     }
+    pub fn unison_phases(
+        &mut self,
+        delta: f32,
+        voice_count: usize,
+        voices_detune: f32,
+    ) -> &[f32] {
+        self.add_phase(
+            delta,
+            voice_count,
+            voices_detune,
+        );
+        &self.voice_phases
+    }
+    pub fn unison_phases_pm(
+        &mut self,
+        delta: f32,
+        voice_count: usize,
+        voices_detune: f32,
+        pm: f32,
+    ) -> [f32; 128] {
+        self.add_phase(
+            delta,
+            voice_count,
+            voices_detune,
+        );
+        let pm = pm * 150.0;
+        let mut out = self.voice_phases;
+        for phase in out.iter_mut().take(voice_count) {
+            *phase = (*phase + pm).rem_euclid(2.0 * PI);
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,18 +124,6 @@ impl BasicOscillator {
         delta
             * 2.0_f32.powf((self.semitone + self.pitch_bend) / 12.0 + self.octave as f32)
             * self.multiplier
-    }
-    pub fn unison_phases<'a>(
-        &self,
-        voices: &'a mut SuperVoice,
-        delta: f32,
-    ) -> &'a [f32] {
-        voices.add_phase(
-            delta,
-            self.voice_count.into(),
-            self.voices_detune,
-        );
-        &voices.voice_phases
     }
 }
 impl Default for BasicOscillator {
@@ -191,21 +211,20 @@ impl OscWave {
 
 pub fn modulate_delta(
     delta: f32,
-    pm: f32,
-    fm: f32,
+    linear_fm: f32,
+    constant_fm: f32,
     sample_rate: f32,
 ) -> f32 {
-    // `pm` and `fm` are expected to be between -1.0 and 1.0,
+    // `linear_fm` and `constant_fm` are expected to be between -1.0 and 1.0,
     // must be stretched out.
-    let pm = pm * 125.0;
-    let fm = fm * 10000.0 * 1.5;
+    let linear_fm = linear_fm * 125.0;
+    let constant_fm = constant_fm * 10000.0 * 1.5;
 
-    // `constant` is required because delta varies with sample rate.
-    // PM is multiplicative / relative, so it's unaffected, but
-    // FM is not. 
-    let constant = sample_rate / (2.0 * PI);
+    // `delta_to_freq` is required because delta varies with sample rate. Constant FM
+    // requires this, but linear FM is multiplicative / relative, so it's unaffected. 
+    let delta_to_freq = sample_rate / (2.0 * PI);
 
-    let delta = ((delta) * (1.0 + pm) * constant + fm) / constant;
+    let delta = ((delta) * (1.0 + linear_fm) * delta_to_freq + constant_fm) / delta_to_freq;
     // `rem_euclid()` doesn't allow negatives, while regular modulo does
     delta.rem_euclid(2.0 * PI)
 }
