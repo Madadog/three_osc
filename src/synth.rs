@@ -142,7 +142,7 @@ impl ThreeOsc {
     }
     pub fn run_voices(&mut self, out_l: &mut f32, out_r: &mut f32) {
         self.release_voices();
-        self.filter_controller.interpolate_cutoff(0.15 * 44100.0 / self.sample_rate as f32);
+        self.filter_controller.cutoff = self.filter_controller.target_cutoff;
         for voice in self.voices.iter_mut() {
             voice.advance();
             let envelope_index = voice.runtime as f32 / self.sample_rate as f32;

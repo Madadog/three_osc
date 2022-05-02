@@ -151,7 +151,7 @@ pub(crate) trait Filter {
 pub(crate) struct FilterController {
     pub(crate) cutoff_envelope: AdsrEnvelope,
     pub(crate) envelope_amount: f32,
-    cutoff: f32,
+    pub(crate) cutoff: f32,
     pub(crate) target_cutoff: f32,
     pub(crate) resonance: f32,
     pub(crate) drive: f32,
