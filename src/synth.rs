@@ -1,27 +1,14 @@
-use std::collections::hash_map::DefaultHasher;
-use std::convert::TryFrom;
-use std::convert::TryInto;
 use std::f32::consts::PI;
-use std::f64::consts::PI as PI64;
-use std::hash::Hash;
-use std::hash::Hasher;
 
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
-use self::filter::FilterModel;
-use self::notes::MidiNote;
 use self::notes::Notes;
+use self::oscillator::modulate_delta;
 use self::oscillator::AdditiveOsc;
-use self::oscillator::SimpleSin;
-use self::oscillator::SuperVoice;
 use self::oscillator::BasicOscillator;
-use self::oscillator::OscVoice;
-use self::oscillator::Wavetable;
+use self::oscillator::SuperVoice;
 use self::oscillator::WavetableNotes;
 use self::oscillator::WavetableSet;
-use self::oscillator::modulate_delta;
-
-const DEFAULT_SRATE: f32 = 44100.0;
 
 pub struct ThreeOsc {
     pub voices: Vec<Voice>,
@@ -33,7 +20,6 @@ pub struct ThreeOsc {
     pub oscillators: [BasicOscillator; 3],
     pub wavetables: WavetableNotes,
     pub waves: WavetableSet,
-    additive: AdditiveOsc,
     pub bend_range: f32,
     pub polyphony: Polyphony,
     pub octave_detune: f32,
@@ -48,29 +34,38 @@ impl ThreeOsc {
             filter_controller: filter::FilterController::new(),
             sample_rate,
             output_volume: 0.3,
-            oscillators: [BasicOscillator::default(), BasicOscillator::default(), BasicOscillator::default()],
+            oscillators: [
+                BasicOscillator::default(),
+                BasicOscillator::default(),
+                BasicOscillator::default(),
+            ],
             // wavetables: WavetableNotes::from_additive_osc_2(&AdditiveOsc::saw(), sample_rate as f32, 1.0, 2048),
-            wavetables: WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate as f32, 32.0, 2048, 256),
+            wavetables: WavetableNotes::from_additive_osc(
+                &AdditiveOsc::saw(),
+                sample_rate as f32,
+                32.0,
+                2048,
+                256,
+            ),
             waves: WavetableSet::new(sample_rate as f32, 32.0, 2048, 256),
-            additive: AdditiveOsc::saw(),
             bend_range: 2.0,
             polyphony: Polyphony::Legato,
-            octave_detune: 1.0
+            octave_detune: 1.0,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
         self.notes.note_on(note, velocity);
-        
+
         match &self.polyphony {
             Polyphony::Polyphonic => {
                 self.voices
-                    .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
-                },
+                    .push(Voice::from_midi_note(note, velocity, &self.oscillators))
+            }
             polyphony => {
                 if let Some(voice) = self.voices.last_mut() {
                     voice.id = note as u32;
                     voice.velocity = velocity;
-                    
+
                     if matches!(polyphony, Polyphony::Monophonic) {
                         // Monophonic always re-presses notes.
                         voice.release_time = None;
@@ -82,45 +77,42 @@ impl ThreeOsc {
                     }
                 } else {
                     self.voices
-                        .push(Voice::from_midi_note(note, velocity, self.sample_rate as f32, &self.oscillators))
+                        .push(Voice::from_midi_note(note, velocity, &self.oscillators))
                 }
-            },
+            }
         }
     }
-    pub fn note_off(&mut self, note: u8, velocity: u8) {
+    pub fn note_off(&mut self, note: u8, _velocity: u8) {
         self.notes.note_off(note);
 
         match self.polyphony {
-            Polyphony::Polyphonic => {
-                self.voices
+            Polyphony::Polyphonic => self
+                .voices
                 .iter_mut()
                 .filter(|voice| voice.id == note as u32)
-                .for_each(|voice| voice.release())
-            },
+                .for_each(|voice| voice.release()),
             // TODO: If there are two notes each with their own voice playing, when one is released
             // it will snap to the other note, resulting in two voices playing the same note at the
             // same time, which sounds bad. Stop this behaviour by filtering out notes with voices
             // currently playing.
-            Polyphony::Legato | Polyphony::Monophonic => {
-                self.voices
+            Polyphony::Legato | Polyphony::Monophonic => self
+                .voices
                 .iter_mut()
                 .filter(|voice| voice.id == note as u32)
                 .for_each(|voice| {
-                    let nearest_note = self.notes.notes.iter()
-                        .reduce(|accum, note| {
-                            if note.age() < accum.age() {
-                                note
-                            } else {
-                                accum
-                            }
-                        });
+                    let nearest_note = self.notes.notes.iter().reduce(|accum, note| {
+                        if note.age() < accum.age() {
+                            note
+                        } else {
+                            accum
+                        }
+                    });
                     if let Some(note) = nearest_note {
                         voice.id = note.id as u32;
                     } else {
                         voice.release();
                     }
-                })
-            },
+                }),
         }
     }
     pub fn release_voices(&mut self) {
@@ -152,58 +144,98 @@ impl ThreeOsc {
             let velocity = voice.velocity as f32 / 128.0;
             let index = voice.id as usize;
             voice.detune = self.octave_detune;
-    
+
             let osc3_out = if let Some(osc) = self.oscillators.get(2) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let phases = voice.osc_voice[2].unison_phases(delta, osc.voice_count.into(), osc.voices_detune);
-                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(phases, osc.voice_count.into()) / osc.voice_count as f32;
+                let phases = voice.osc_voice[2].unison_phases(
+                    delta,
+                    osc.voice_count.into(),
+                    osc.voices_detune,
+                );
+                let osc_out = self.waves.select(&osc.wave).tables[index]
+                    .generate_multi(phases, osc.voice_count.into())
+                    / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity;
                 osc_out
             } else {
                 unreachable!("Osc3 wasn't found...");
             };
-            
+
             let osc2_out = if let Some(osc) = self.oscillators.get(1) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
                 let delta = modulate_delta(delta, osc3_out * osc.fm, 0.0, self.sample_rate as f32);
-                let phases = voice.osc_voice[1].unison_phases_pm(delta, osc.voice_count.into(), osc.voices_detune, osc3_out * osc.pm);
-                
-                let mut osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(&phases, osc.voice_count.into()) / osc.voice_count as f32;
+                let phases = voice.osc_voice[1].unison_phases_pm(
+                    delta,
+                    osc.voice_count.into(),
+                    osc.voices_detune,
+                    osc3_out * osc.pm,
+                );
+
+                let mut osc_out = self.waves.select(&osc.wave).tables[index]
+                    .generate_multi(&phases, osc.voice_count.into())
+                    / osc.voice_count as f32;
                 osc_out *= lerp(1.0, osc3_out, osc.am);
                 out += osc_out * osc.amp * velocity;
                 osc_out
             } else {
                 unreachable!("Osc2 wasn't found...");
             };
-            
+
             if let Some(osc) = self.oscillators.get(0) {
                 let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta = modulate_delta(delta, osc2_out * osc.fm, 0.0, self.sample_rate as f32).abs();
-                let phases = voice.osc_voice[0].unison_phases_pm(delta, osc.voice_count.into(), osc.voices_detune, osc2_out * osc.pm);
+                let delta =
+                    modulate_delta(delta, osc2_out * osc.fm, 0.0, self.sample_rate as f32).abs();
+                let phases = voice.osc_voice[0].unison_phases_pm(
+                    delta,
+                    osc.voice_count.into(),
+                    osc.voices_detune,
+                    osc2_out * osc.pm,
+                );
 
-                let osc_out = self.waves.select(&osc.wave).tables[index].generate_multi(&phases, osc.voice_count.into()) / osc.voice_count as f32;
+                let osc_out = self.waves.select(&osc.wave).tables[index]
+                    .generate_multi(&phases, osc.voice_count.into())
+                    / osc.voice_count as f32;
                 out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
             }
 
             // Update filter controls, calculate keytrack
-            let voice_freq = 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
-            
-            let cutoff = self.filter_controller.get_cutoff(voice_freq, envelope_index, voice.release_time, self.sample_rate as f32);
-            voice.filter.set(self.filter_controller.filter_model, cutoff, self.filter_controller.resonance, self.sample_rate as f32, self.filter_controller.filter_type);
-            voice.filter.set_filter_type(self.filter_controller.filter_type);
+            let voice_freq =
+                2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
+
+            let cutoff = self.filter_controller.get_cutoff(
+                voice_freq,
+                envelope_index,
+                voice.release_time,
+                self.sample_rate as f32,
+            );
+            voice.filter.set(
+                self.filter_controller.filter_model,
+                cutoff,
+                self.filter_controller.resonance,
+                self.sample_rate as f32,
+                self.filter_controller.filter_type,
+            );
+            voice
+                .filter
+                .set_filter_type(self.filter_controller.filter_type);
 
             match voice.filter {
                 // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
                 // keep the levels the same when switching filter.
-                filter::FilterContainer::BiquadFilter(_)
-                | filter::FilterContainer::None => self.filter_controller.drive = self.filter_controller.drive.min(1.0),
+                filter::FilterContainer::BiquadFilter(_) | filter::FilterContainer::None => {
+                    self.filter_controller.drive = self.filter_controller.drive.min(1.0)
+                }
                 _ => {}
             };
 
             // Process filter
-            voice.filter.set_params(self.sample_rate as f32, cutoff, self.filter_controller.resonance);
+            voice.filter.set_params(
+                self.sample_rate as f32,
+                cutoff,
+                self.filter_controller.resonance,
+            );
             out = voice.filter.process(out * self.filter_controller.drive);
-            
+
             // amplitude envelope
             out = if let Some(release_time) = voice.release_time {
                 let release_index = release_time as f32 / self.sample_rate as f32;
@@ -213,7 +245,7 @@ impl ThreeOsc {
             } else {
                 out * self.gain_envelope.sample_held(envelope_index)
             };
-    
+
             *out_l += out;
             *out_r += out;
         }
@@ -248,25 +280,13 @@ pub struct Voice {
     detune: f32,
 }
 impl Voice {
-    pub fn from_midi_note(index: u8, velocity: u8, sample_rate: f32, osc: &[BasicOscillator]) -> Self {
-        // w = (2pi*f) / sample_rate
-        let mut osc_voice = [SuperVoice::new(
-            // MidiNote::midi_to_delta(index, sample_rate),
-            osc[0].phase,
-            osc[0].phase_rand,
-        ),
-        SuperVoice::new(
-            // MidiNote::midi_to_delta(index, sample_rate),
-            osc[1].phase,
-            osc[1].phase_rand,
-        ),
-        SuperVoice::new(
-            // MidiNote::midi_to_delta(index, sample_rate),
-            osc[2].phase,
-            osc[2].phase_rand,
-        ),
+    pub fn from_midi_note(index: u8, velocity: u8, osc: &[BasicOscillator]) -> Self {
+        let osc_voice = [
+            SuperVoice::new(osc[0].phase, osc[0].phase_rand),
+            SuperVoice::new(osc[1].phase, osc[1].phase_rand),
+            SuperVoice::new(osc[2].phase, osc[2].phase_rand),
         ];
- 
+
         Self {
             id: index.into(),
             runtime: 0,
@@ -286,29 +306,14 @@ impl Voice {
         self.runtime += 1;
     }
     pub fn voice_delta(&self, sample_rate: f32) -> f32 {
-        2.0 * PI * 440.0 * 2.0_f32.powf(((self.id as i16 - 69) as f32 * self.detune) / 12.0) / sample_rate //* (1.0 + self.detune)
+        2.0 * PI * 440.0 * 2.0_f32.powf(((self.id as i16 - 69) as f32 * self.detune) / 12.0)
+            / sample_rate //* (1.0 + self.detune)
     }
-}
-
-
-
-fn delta(sample_rate: f64) -> f64 {
-    1.0 / sample_rate
-}
-
-/// converts a certain number of samples to an f32 time in seconds
-fn samples_to_time(samples: u32, delta: f64) -> f64 {
-    samples as f64 * delta
-}
-fn time_to_samples(time: f64, delta: f64) -> u32 {
-    (time / delta) as u32
 }
 
 pub mod oscillator;
 
 mod envelopes {
-    use lyon_geom::{CubicBezierSegment, Monotonic};
-
     #[derive(Debug, Clone)]
     pub struct AdsrEnvelope {
         pub attack_time: f32,
@@ -340,7 +345,7 @@ mod envelopes {
             2.0_f32.powf(slope)
         }
         pub fn set_slope(&mut self, slope: f32) {
-            // The inverted / negative slope flares up too quickly compared to the 
+            // The inverted / negative slope flares up too quickly compared to the
             // positive slope, so we divide the negative slope by an arbitrary number
             if slope.is_sign_positive() {
                 self.slope = Self::slope(slope);
@@ -371,27 +376,8 @@ mod envelopes {
                 (1.0 - (index - release_index) / self.release_time).powf(self.slope) * level
             }
         }
-        /// Modifies the envelope to prevent negative times and sustain levels outside of 0 to 1
-        pub fn limits(&mut self) {
-            self.attack_time = self.attack_time.max(0.0);
-            self.decay_time = self.decay_time.max(0.0);
-            self.release_time = self.release_time.max(0.0);
-            self.sustain_level = self.sustain_level.clamp(0.0, 1.0);
-            self.slope = self.sustain_level.max(0.0001);
-        }
     }
-
-    /// An ADSR envelope with adjustable curves
-    pub struct BezierEnvelope {
-        attack: Monotonic<CubicBezierSegment<f32>>,
-        decay: Monotonic<CubicBezierSegment<f32>>,
-        release: Monotonic<CubicBezierSegment<f32>>,
-        sustain_level: f32,
-    }
-    impl BezierEnvelope {}
 }
-
-
 
 pub(crate) mod filter;
 

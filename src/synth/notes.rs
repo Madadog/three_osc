@@ -7,18 +7,21 @@ pub struct MidiNote {
     pub id: u8,
     pub velocity: u8,
     age: u32,
-    empty: bool,
+    _empty: bool,
 }
+#[allow(dead_code)]
 impl MidiNote {
     pub fn new(id: u8, velocity: u8) -> Self {
         Self {
             id,
             velocity,
             age: 0,
-            empty: false,
+            _empty: false,
         }
     }
-    pub fn age(&self) -> u32 {self.age}
+    pub fn age(&self) -> u32 {
+        self.age
+    }
     pub fn midi_to_freq(id: u8) -> f32 {
         440.0 * 2.0_f32.powf(((id as i16 - 69) as f32) / 12.0)
     }

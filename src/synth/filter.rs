@@ -1,4 +1,4 @@
-use self::ladder::{LadderFilter, tanh_pade32, tanh_pade32_f32};
+use self::ladder::{tanh_pade32_f32, LadderFilter};
 
 use super::lerp;
 
@@ -9,7 +9,7 @@ use std::f32::consts::PI;
 #[derive(Debug, Default, Clone)]
 /// Reproduced from https://ccrma.stanford.edu/~jos/filters/Direct_Form_II.html
 ///
-pub struct TestFilter {
+pub struct BiquadFilter {
     pub(crate) stage0: f32,
     pub(crate) stage1: f32,
     pub(crate) a0: f32, // gain compensation
@@ -23,7 +23,7 @@ pub struct TestFilter {
     pub(crate) lerp_amount: f32,
     pub(crate) filter_type: FilterType,
 }
-impl TestFilter {
+impl BiquadFilter {
     fn lerp_params(&mut self, amount: f32) {
         self.a0 = lerp(self.a0, self.target_a.0, amount);
         self.a1 = lerp(self.a1, self.target_a.1, amount);
@@ -32,9 +32,14 @@ impl TestFilter {
         self.b1 = lerp(self.b1, self.target_b.1, amount);
         self.b2 = lerp(self.b2, self.target_b.2, amount);
     }
-    pub fn with_params(cutoff: f32, resonance: f32, sample_rate: f32, filter_type: FilterType) -> TestFilter {
-        let mut filter = TestFilter::default();
-        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate, &filter_type);
+    pub fn with_params(
+        cutoff: f32,
+        resonance: f32,
+        sample_rate: f32,
+        filter_type: FilterType,
+    ) -> BiquadFilter {
+        let mut filter = BiquadFilter::default();
+        let coeffs = BiquadFilter::calc_coef(cutoff, resonance, sample_rate, &filter_type);
 
         filter.a0 = coeffs.0;
         filter.a1 = coeffs.1;
@@ -48,9 +53,14 @@ impl TestFilter {
         filter
     }
     /// Outputs biquad coefficients in the format (a0, a1, a2, b0, b1, b2)
-    pub fn calc_coef(cutoff: f32, resonance: f32, sample_rate: f32, filter_type: &FilterType) -> (f32, f32, f32, f32, f32, f32) {
+    pub fn calc_coef(
+        cutoff: f32,
+        resonance: f32,
+        sample_rate: f32,
+        filter_type: &FilterType,
+    ) -> (f32, f32, f32, f32, f32, f32) {
         // Biquad is less stable than other filters at low frequencies, clamp to 30 Hz minimum.
-        let cutoff =  cutoff.max(30.0);
+        let cutoff = cutoff.max(30.0);
 
         // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
 
@@ -64,7 +74,7 @@ impl TestFilter {
         let phase_change = 2.0 * PI * cutoff / sample_rate;
         let (sin, cos) = phase_change.sin_cos();
         let alpha = sin / (2.0 * resonance);
-        
+
         let a0 = 1.0 + alpha;
         let a1 = -2.0 * cos / a0;
         let a2 = (1.0 - alpha) / a0;
@@ -74,36 +84,34 @@ impl TestFilter {
                 let b1 = (1.0 - cos) / a0;
                 let b0 = b1 / 2.0;
                 (b0, b1, b0)
-            },
+            }
             FilterType::Bandpass => {
                 let b0 = sin / 2.0 / a0;
                 (b0, 0.0, -b0)
-            },
+            }
             FilterType::Highpass => {
                 let b1 = (-1.0 - cos) / a0;
                 let b0 = -b1 / 2.0;
                 (b0, b1, b0)
-            },
+            }
         };
 
         (a0, a1, a2, b0, b1, b2)
     }
 }
 
-impl Filter for TestFilter {
+impl Filter for BiquadFilter {
     fn process(&mut self, input: f32) -> f32 {
-        
         self.lerp_params(self.lerp_amount);
-        
+
         let previous_previous_sample = self.stage1;
         let previous_sample = self.stage0;
         let current_sample = input - self.a1 * self.stage0 - self.a2 * self.stage1;
-        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
-        
+
         // Propogate
         self.stage0 = current_sample;
         self.stage1 = previous_sample;
-        
+
         if !(self.stage1.is_finite() && self.stage0.is_finite()) {
             println!(
                 "Warning: filters were unstable, {} and {}",
@@ -112,11 +120,11 @@ impl Filter for TestFilter {
             self.stage0 = 0.0;
             self.stage1 = 0.0;
         }
-        
+
         self.b0 * self.stage0 + self.b1 * self.stage1 + self.b2 * previous_previous_sample
     }
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate, &self.filter_type);
+        let coeffs = BiquadFilter::calc_coef(cutoff, resonance, sample_rate, &self.filter_type);
 
         self.target_a.0 = coeffs.0;
         self.target_a.1 = coeffs.1;
@@ -134,8 +142,8 @@ impl Filter for TestFilter {
 #[derive(Debug, Default)]
 /// Filter in series
 pub(crate) struct CascadeFilter {
-    pub(crate) filter_1: TestFilter,
-    pub(crate) filter_2: TestFilter,
+    pub(crate) filter_1: BiquadFilter,
+    pub(crate) filter_2: BiquadFilter,
 }
 
 impl Filter for CascadeFilter {
@@ -146,16 +154,20 @@ impl Filter for CascadeFilter {
         self.filter_1.set_params(sample_rate, cutoff, resonance);
         self.filter_2.set_params(sample_rate, cutoff, resonance);
     }
+    fn set_filter_type(&mut self, filter_type: FilterType) {
+        self.filter_1.set_filter_type(filter_type);
+        self.filter_2.set_filter_type(filter_type);
+    }
 }
 
 pub(crate) trait Filter {
     fn process(&mut self, input: f32) -> f32;
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32);
-    fn set_filter_type(&mut self, filter_type: FilterType) {}
+    fn set_filter_type(&mut self, filter_type: FilterType);
 }
 
 #[derive(Debug)]
-/// Applies an envelope to something that implements the `Filter` trait. 
+/// Applies an envelope to something that implements the `Filter` trait.
 /// Also handles keytrack.
 pub(crate) struct FilterController {
     pub(crate) cutoff_envelope: AdsrEnvelope,
@@ -183,78 +195,22 @@ impl FilterController {
             filter_model: FilterModel::RcFilter,
         }
     }
-    pub(crate) fn interpolate_cutoff(&mut self, amount: f32) {
-        // First attempt to remove clicking from my biquad implementation.
-        // Only stops clicking under a very specific set of circumstances
-
-        // Change by at most an octave per sample, +1 to accelerate changes low cutoff freqs < 1.
-        let max_change = self.cutoff.abs() * 2.0 + 1.0;
-        self.cutoff = lerp(self.cutoff, self.target_cutoff, amount).clamp(-max_change, max_change);
-    }
-    pub fn get_cutoff(&self, cutoff_mult: f32, envelope_index: f32, release_index: Option<u32>, sample_rate: f32) -> f32 {
+    pub fn get_cutoff(
+        &self,
+        cutoff_mult: f32,
+        envelope_index: f32,
+        release_index: Option<u32>,
+        sample_rate: f32,
+    ) -> f32 {
         let envelope = if let Some(release_index) = release_index {
             let release_time = release_index as f32 / sample_rate as f32;
-            self.cutoff_envelope.sample_released(release_time, envelope_index) * self.envelope_amount
+            self.cutoff_envelope
+                .sample_released(release_time, envelope_index)
+                * self.envelope_amount
         } else {
             self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount
         };
         (self.cutoff * cutoff_mult + envelope).clamp(10.0, 22000.0)
-    }
-    pub(crate) fn process_envelope_held(
-        &mut self,
-        filter: &mut impl Filter,
-        keytrack_freq: f32,
-        input: f32,
-        envelope_index: f32,
-        sample_rate: f32,
-    ) -> f32 {
-        filter.set_params(
-            sample_rate,
-            (self.cutoff
-                * keytrack_freq
-                + self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount)
-                .clamp(1.0, 22000.0),
-            self.resonance,
-        );
-        let out = filter.process(input * self.drive);
-        filter.set_params(sample_rate, self.cutoff, self.resonance);
-        out
-    }
-    pub(crate) fn process_envelope_released(
-        &mut self,
-        filter: &mut impl Filter,
-        keytrack_freq: f32,
-        input: f32,
-        envelope_index: f32,
-        release_index: f32,
-        sample_rate: f32,
-    ) -> f32 {
-        filter.set_params(
-            sample_rate,
-            (self.cutoff
-                * keytrack_freq
-                + self
-                    .cutoff_envelope
-                    .sample_released(release_index, envelope_index)
-                    * self.envelope_amount)
-                .clamp(1.0, 22000.0),
-            self.resonance,
-        );
-        let out = filter.process(input * self.drive);
-        filter.set_params(sample_rate, self.cutoff, self.resonance);
-        out
-    }
-
-    pub(crate) fn lerp_controls(
-        &mut self,
-        filter: &mut TestFilter,
-        sample_rate: f32,
-        target_cutoff: f32,
-        target_resonance: f32,
-    ) {
-        self.cutoff = lerp(self.cutoff, target_cutoff, 500.0 / sample_rate);
-        self.resonance = lerp(self.cutoff, target_resonance, 500.0 / sample_rate);
-        filter.set_params(sample_rate, self.cutoff, self.resonance);
     }
 }
 
@@ -265,19 +221,38 @@ pub enum FilterContainer {
     None,
     RcFilter(RcFilter),
     LadderFilter(LadderFilter),
-    BiquadFilter(TestFilter),
+    BiquadFilter(BiquadFilter),
 }
 impl FilterContainer {
-    pub fn set(&mut self, filter_model: FilterModel, cutoff: f32, resonance: f32, sample_rate: f32, filter_type: FilterType) {
+    pub fn set(
+        &mut self,
+        filter_model: FilterModel,
+        cutoff: f32,
+        resonance: f32,
+        sample_rate: f32,
+        filter_type: FilterType,
+    ) {
         match (self, filter_model) {
-            (FilterContainer::RcFilter(_), FilterModel::RcFilter) => {},
-            (FilterContainer::LadderFilter(_), FilterModel::LadderFilter) => {},
-            (FilterContainer::BiquadFilter(_), FilterModel::BiquadFilter) => {},
-            (x, FilterModel::RcFilter) => {*x = FilterContainer::RcFilter(RcFilter::default())},
-            (x, FilterModel::LadderFilter) => {*x = FilterContainer::LadderFilter(LadderFilter::default())},
-            (x, FilterModel::BiquadFilter) => {*x = FilterContainer::BiquadFilter(TestFilter::with_params(cutoff, resonance, sample_rate, filter_type))},
-            (x, FilterModel::None) => {*x = FilterContainer::None},
-            (_, _) => {unreachable!("Forgot to set a FilterModel for FilterContainer")}
+            (FilterContainer::RcFilter(_), FilterModel::RcFilter) => {}
+            (FilterContainer::LadderFilter(_), FilterModel::LadderFilter) => {}
+            (FilterContainer::BiquadFilter(_), FilterModel::BiquadFilter) => {}
+            (x, FilterModel::RcFilter) => *x = FilterContainer::RcFilter(RcFilter::default()),
+            (x, FilterModel::LadderFilter) => {
+                *x = FilterContainer::LadderFilter(LadderFilter::default())
+            }
+            (x, FilterModel::BiquadFilter) => {
+                *x = FilterContainer::BiquadFilter(BiquadFilter::with_params(
+                    cutoff,
+                    resonance,
+                    sample_rate,
+                    filter_type,
+                ))
+            }
+            (x, FilterModel::None) => *x = FilterContainer::None,
+            #[allow(unreachable_patterns)]
+            (_, _) => {
+                unreachable!("Forgot to set a FilterModel for FilterContainer")
+            }
         }
     }
 }
@@ -287,7 +262,7 @@ impl Filter for FilterContainer {
             FilterContainer::RcFilter(x) => x.process(input),
             FilterContainer::LadderFilter(x) => x.process(input / 2.0) * 2.0,
             FilterContainer::BiquadFilter(x) => x.process(input),
-            _ => {input}
+            _ => input,
         }
     }
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
@@ -309,6 +284,7 @@ impl Filter for FilterContainer {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 /// Used to select FilterContainer without creating a filter.
 pub enum FilterModel {
     None,
@@ -318,6 +294,7 @@ pub enum FilterModel {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum FilterType {
     Lowpass,
     Bandpass,
@@ -358,6 +335,7 @@ pub struct RcFilter {
     order: FilterOrder,
     filter_type: FilterType,
 }
+#[allow(dead_code)]
 impl RcFilter {
     /// Filters a single sample through the RC filter's first stage
     #[inline]
@@ -379,7 +357,7 @@ impl RcFilter {
         let lp = (temp_in * self.rcb + self.lp1 * self.rca).clamp(-1.0, 1.0);
         let hp = (self.rcc * (self.hp1 + temp_in - self.last1)).clamp(-1.0, 1.0);
         let bp = (hp * self.rcb + self.bp1 * self.rca).clamp(-1.0, 1.0);
-        
+
         self.last1 = temp_in;
         self.lp1 = lp;
         self.hp1 = hp;
@@ -390,10 +368,12 @@ impl RcFilter {
     fn step_first_stage_tanh(&mut self, input: f32) {
         let tanh_scale = 4.0;
         let temp_in = tanh_pade32_f32((input + self.bp0 * self.rcq) / tanh_scale) * tanh_scale;
-        let lp = tanh_pade32_f32((temp_in * self.rcb + self.lp0 * self.rca) / tanh_scale) * tanh_scale;
-        let hp = tanh_pade32_f32((self.rcc * (self.hp0 + temp_in - self.last0)) / tanh_scale) * tanh_scale;
+        let lp =
+            tanh_pade32_f32((temp_in * self.rcb + self.lp0 * self.rca) / tanh_scale) * tanh_scale;
+        let hp = tanh_pade32_f32((self.rcc * (self.hp0 + temp_in - self.last0)) / tanh_scale)
+            * tanh_scale;
         let bp = tanh_pade32_f32((hp * self.rcb + self.bp0 * self.rca) / tanh_scale) * tanh_scale;
-        
+
         self.last0 = temp_in;
         self.lp0 = lp;
         self.hp0 = hp;
@@ -404,10 +384,12 @@ impl RcFilter {
     fn step_second_stage_tanh(&mut self, input: f32) {
         let tanh_scale = 4.0;
         let temp_in = tanh_pade32_f32((input + self.bp1 * self.rcq) / tanh_scale) * tanh_scale;
-        let lp = tanh_pade32_f32((temp_in * self.rcb + self.lp1 * self.rca) / tanh_scale) * tanh_scale;
-        let hp = tanh_pade32_f32((self.rcc * (self.hp1 + temp_in - self.last1)) / tanh_scale) * tanh_scale;
+        let lp =
+            tanh_pade32_f32((temp_in * self.rcb + self.lp1 * self.rca) / tanh_scale) * tanh_scale;
+        let hp = tanh_pade32_f32((self.rcc * (self.hp1 + temp_in - self.last1)) / tanh_scale)
+            * tanh_scale;
         let bp = tanh_pade32_f32((hp * self.rcb + self.bp1 * self.rca) / tanh_scale) * tanh_scale;
-        
+
         self.last1 = temp_in;
         self.lp1 = lp;
         self.hp1 = hp;
@@ -476,19 +458,11 @@ impl Filter for RcFilter {
             },
             FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
         }
-        // match &self.order {
-        //     FilterOrder::_12dB => match &self.filter_type {
-        //         FilterType::Lowpass => self.filter_all_tanh(input).0,
-        //         FilterType::Bandpass => self.filter_all_tanh(input).1,
-        //         FilterType::Highpass => self.filter_all_tanh(input).2,
-        //     },
-        //     FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
-        // }
     }
 
     fn set_params(&mut self, sample_rate: f32, mut cutoff: f32, resonance: f32) {
         cutoff = cutoff.clamp(5.0, 22000.0);
-        let delta = (1.0 / sample_rate) / 4.0; // division by 4.0 occurs because of oversampling when processing... 
+        let delta = (1.0 / sample_rate) / 4.0; // division by 4.0 occurs because of oversampling when processing...
         let freq = 1.0 / (cutoff * PI * 2.0);
 
         self.rca = 1.0 - delta / (freq + delta);
@@ -496,7 +470,6 @@ impl Filter for RcFilter {
         self.rcc = freq / (freq + delta);
 
         self.rcq = resonance * 0.25;
-        // println!("rcq: {}", self.rcq);
     }
     fn set_filter_type(&mut self, filter_type: FilterType) {
         self.filter_type = filter_type;

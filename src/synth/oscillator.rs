@@ -1,28 +1,9 @@
 use std::{
     convert::TryInto,
-    f32::consts::{FRAC_1_SQRT_2, FRAC_2_PI, PI},
-    ops::Add,
+    f32::consts::{FRAC_1_SQRT_2, PI},
 };
 
 use super::lerp;
-
-/// A single instance of a playing oscillator. Maintains phase for fm / pm stuff
-///
-/// TODO: Use this somewhere or clean it up.
-#[derive(Debug, Clone, Copy)]
-pub struct OscVoice {
-    pub phase: f32,
-    pub delta: f32,
-}
-impl OscVoice {
-    pub fn new(phase: f32, delta: f32) -> Self {
-        Self { phase, delta }
-    }
-    pub fn add_phase(&mut self, delta: f32) -> f32 {
-        self.phase = (self.phase + delta) % (2.0 * PI);
-        self.phase
-    }
-}
 
 #[derive(Debug, Clone)]
 /// Brute force approach to oscillator super (playing multiple detuned copies
@@ -42,9 +23,7 @@ impl SuperVoice {
         for phase in voice_phases.iter_mut() {
             *phase += rng.f32() * phase_random;
         }
-        Self {
-            voice_phases,
-        }
+        Self { voice_phases }
     }
     pub fn add_phase(&mut self, delta: f32, voice_count: usize, detune: f32) {
         // self.phase = (self.phase + delta) % (2.0 * PI);
@@ -59,19 +38,11 @@ impl SuperVoice {
                 *phase = (*phase + delta) % (2.0 * PI);
             });
     }
-    pub fn unison_phases(
-        &mut self,
-        delta: f32,
-        voice_count: usize,
-        voices_detune: f32,
-    ) -> &[f32] {
-        self.add_phase(
-            delta,
-            voice_count,
-            voices_detune,
-        );
+    pub fn unison_phases(&mut self, delta: f32, voice_count: usize, voices_detune: f32) -> &[f32] {
+        self.add_phase(delta, voice_count, voices_detune);
         &self.voice_phases
     }
+    /// TODO: this duplicates all 128 phases, every time. 
     pub fn unison_phases_pm(
         &mut self,
         delta: f32,
@@ -79,11 +50,7 @@ impl SuperVoice {
         voices_detune: f32,
         pm: f32,
     ) -> [f32; 128] {
-        self.add_phase(
-            delta,
-            voice_count,
-            voices_detune,
-        );
+        self.add_phase(delta, voice_count, voices_detune);
         let pm = pm * 150.0;
         let mut out = self.voice_phases;
         for phase in out.iter_mut().take(voice_count) {
@@ -117,7 +84,6 @@ pub struct BasicOscillator {
     pub fm: f32,
     pub pm: f32,
     pub am: f32,
-
 }
 impl BasicOscillator {
     pub fn pitch_mult_delta(&self, delta: f32) -> f32 {
@@ -157,6 +123,7 @@ pub enum OscWave {
     PulseQuarter,
     PulseEighth,
 }
+#[allow(dead_code)]
 impl OscWave {
     pub fn generate(&self, phase: f32) -> f32 {
         use OscWave::*;
@@ -209,19 +176,14 @@ impl OscWave {
     }
 }
 
-pub fn modulate_delta(
-    delta: f32,
-    linear_fm: f32,
-    constant_fm: f32,
-    sample_rate: f32,
-) -> f32 {
+pub fn modulate_delta(delta: f32, linear_fm: f32, constant_fm: f32, sample_rate: f32) -> f32 {
     // `linear_fm` and `constant_fm` are expected to be between -1.0 and 1.0,
     // must be stretched out.
     let linear_fm = linear_fm * 125.0;
     let constant_fm = constant_fm * 10000.0 * 1.5;
 
     // `delta_to_freq` is required because delta varies with sample rate. Constant FM
-    // requires this, but linear FM is multiplicative / relative, so it's unaffected. 
+    // requires this, but linear FM is multiplicative / relative, so it's unaffected.
     let delta_to_freq = sample_rate / (2.0 * PI);
 
     let delta = ((delta) * (1.0 + linear_fm) * delta_to_freq + constant_fm) / delta_to_freq;
@@ -229,20 +191,22 @@ pub fn modulate_delta(
     delta.rem_euclid(2.0 * PI)
 }
 
-/// Efficient sine approximation for constant frequency.
+/// Efficient constant frequency sine approximation.
 ///
 /// From https://www.iquilezles.org/www/articles/sincos/sincos.htm
 ///
 /// SimpleSin decays and approaches zero faster with higher delta,
 /// due to floating point precision issues. I briefly tried f64 but
 /// didn't notice much of an improvement.
-pub struct SimpleSin {
+#[allow(dead_code)]
+pub struct SinApprox {
     sin_dt: f32,
     cos_dt: f32,
     sin: f32,
     cos: f32,
 }
-impl SimpleSin {
+#[allow(dead_code)]
+impl SinApprox {
     pub fn new(phase: f32, delta: f32) -> Self {
         let (sin_dt, cos_dt) = delta.sin_cos();
         let (sin, cos) = phase.sin_cos();
@@ -285,6 +249,7 @@ impl SimpleSin {
 pub struct Wavetable {
     pub table: Vec<f32>,
 }
+#[allow(dead_code)]
 impl Wavetable {
     pub fn new(table: Vec<f32>) -> Self {
         Self { table }
@@ -302,33 +267,28 @@ impl Wavetable {
         let to = self.table[index_2];
         lerp(from, to, index.fract())
     }
-    pub fn index_lagrange(&self, index: f32) -> f32 {
-        // let index_0 = self.table[((index - 2.0) % self.table.len() as f32) as usize];
-        let index_1 = self.table[((index - 1.0) % self.table.len() as f32) as usize];
-        let index_2 = self.table[(index % self.table.len() as f32) as usize];
-        let index_3 = self.table[((index + 1.0) % self.table.len() as f32) as usize];
-        let index = index % 1.0 + 1.0;
-        index_1 * (index - 2.0) / (-1.0) * (index - 3.0) / (-2.0)
-            + index_2 * (index - 1.0) / (1.0) * (index - 3.0) / (-1.0)
-            + index_3 * (index - 1.0) / (2.0) * (index - 2.0) / (1.0)
-    }
     #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
         (phase / (2.0 * PI)) * self.table.len() as f32
     }
     #[inline]
     pub fn generate(&self, phase: f32) -> f32 {
-        // self.index(self.phase_to_index(phase) as usize)
         self.index_lerp(self.phase_to_index(phase))
-        // self.index_lagrange(self.phase_to_index(phase))
     }
     #[inline]
     pub fn generate_multi(&self, phases: &[f32], max: usize) -> f32 {
-        phases.iter().take(max).map(|phase| self.index_lerp(self.phase_to_index(*phase))).sum()
+        phases
+            .iter()
+            .take(max)
+            .map(|phase| self.generate(*phase))
+            .sum()
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
-        assert!(harmonics <= (len / 2), "Generated {harmonics} harmonics with {len} len");
+        assert!(
+            harmonics <= (len / 2),
+            "Generated {harmonics} harmonics with {len} len"
+        );
         let table: Vec<f32> = (0..len)
             .into_iter()
             .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
@@ -350,35 +310,37 @@ impl Wavetable {
 /// This reduces the amplitude of the artifacts and makes them more harmonically distant from
 /// the source. 8 times oversampling seems to provide reasonable artifact suppression (-60 dB or
 /// lower compared to the fundamental).
-/// 
+///
 /// Of course, all this is made sort of irrelevant by the fact that you can just use additive
 /// synthesis while rendering since you have unlimited time to generate the sound, thus providing
-/// completely alias-free oscillators. But it was fun to implement, and it's fun to perform in 
+/// completely alias-free oscillators. But it was fun to implement, and it's fun to perform in
 /// realtime because of how cheap it is to sample + lerp.
-/// 
+///
 /// The artifacts could be reduced further by using better interpolation (with a derivative closer
 /// to that of the original signal).
 pub struct WavetableNotes {
     pub tables: [Wavetable; 128],
 }
+#[allow(dead_code)]
 impl WavetableNotes {
-    // 440.0 * 2.0_f32.powf(index / 12.0)
+    /// Returns `index` from the equation
+    /// `440.0 * 2.0_f32.powf(index / 12.0) = frequency`
     pub fn frequency_to_note(frequency: f32) -> usize {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
     }
     /// Create a bandlimited wavetable for each midi note from a base additive function.
-    /// 
+    ///
     /// Each note is given a wavetable with the exact number of samples required to reproduce the note and all its harmonics.
     /// The table size will be multiplied by `max_oversample` (to reduce aliasing from linear interpolation) but limited by
-    /// min and max `table_len`. 
-    /// 
+    /// min and max `table_len`.
+    ///
     /// Limiting `max_table_len` mostly prevents low notes from growing too big (given you have `(sample_rate * max_oversample) / note_freq` samples per table)
     /// at the expense of sample quality.
-    /// 
+    ///
     /// Increasing `min_table_len` emulates increased oversampling for higher notes which, for reasons I don't fully understand, require much more oversampling
     /// than the middle notes to achieve comparative noise reduction. E.g. a note at 2000 Hz requires 22.05 samples, so a `min_table_len` of 2560 is equivalent
     /// to 116 times oversampling which is usually enough.
-    /// 
+    ///
     /// Note that all other wavetable synths just use wavetable lengths that are powers of two, because they use FFTs. Of course, a need for FFTs implies
     /// that you're reading user samples or doing spectral manipulation, both of which are beyond the scope of this synth. Inverse FFTs, on the other hand, will
     /// allow me to stop summing sine waves manually, speeding up table generation to realtime speeds...  
@@ -403,12 +365,9 @@ impl WavetableNotes {
             .map(|len| {
                 let clamped_len = len.clamp(min_table_len, max_table_len);
                 // Ensure waveform is bandlimited
-                let harmonics = ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len/2);
-                Wavetable::from_additive_osc(
-                    osc,
-                    clamped_len,
-                    harmonics,
-                )
+                let harmonics =
+                    ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len / 2);
+                Wavetable::from_additive_osc(osc, clamped_len, harmonics)
             })
             .collect();
         Self {
@@ -416,7 +375,7 @@ impl WavetableNotes {
         }
     }
     /// `WavetableNotes::from_additive_osc()` with constant table length
-    /// 
+    ///
     /// I will migrate to this once I start using fast fourier transforms.
     pub fn from_additive_osc_2(
         osc: &AdditiveOsc,
@@ -432,8 +391,8 @@ impl WavetableNotes {
             .into_iter()
             .map(|x| {
                 // Number of harmonics required for note
-                (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
-                    .floor() as usize
+                (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).floor()
+                    as usize
             })
             .map(|harmonics| {
                 // clamp to nyquist
@@ -463,12 +422,42 @@ impl WavetableSet {
     ) -> Self {
         Self {
             wavetables: vec![
-                WavetableNotes::from_additive_osc(&AdditiveOsc::sine(), sample_rate, max_oversample, max_table_len, min_table_len),
-                WavetableNotes::from_additive_osc(&AdditiveOsc::triangle(), sample_rate, max_oversample, max_table_len, min_table_len),
-                WavetableNotes::from_additive_osc(&AdditiveOsc::saw(), sample_rate, max_oversample, max_table_len, min_table_len),
-                WavetableNotes::from_additive_osc(&AdditiveOsc::fake_exp(), sample_rate, max_oversample, max_table_len, min_table_len),
-                WavetableNotes::from_additive_osc(&AdditiveOsc::square(), sample_rate, max_oversample, max_table_len, min_table_len),
-            ]
+                WavetableNotes::from_additive_osc(
+                    &AdditiveOsc::sine(),
+                    sample_rate,
+                    max_oversample,
+                    max_table_len,
+                    min_table_len,
+                ),
+                WavetableNotes::from_additive_osc(
+                    &AdditiveOsc::triangle(),
+                    sample_rate,
+                    max_oversample,
+                    max_table_len,
+                    min_table_len,
+                ),
+                WavetableNotes::from_additive_osc(
+                    &AdditiveOsc::saw(),
+                    sample_rate,
+                    max_oversample,
+                    max_table_len,
+                    min_table_len,
+                ),
+                WavetableNotes::from_additive_osc(
+                    &AdditiveOsc::fake_exp(),
+                    sample_rate,
+                    max_oversample,
+                    max_table_len,
+                    min_table_len,
+                ),
+                WavetableNotes::from_additive_osc(
+                    &AdditiveOsc::square(),
+                    sample_rate,
+                    max_oversample,
+                    max_table_len,
+                    min_table_len,
+                ),
+            ],
         }
     }
     pub fn select(&self, wave: &OscWave) -> &WavetableNotes {
@@ -485,13 +474,14 @@ impl WavetableSet {
 }
 
 /// Oscillator which generates waves by summing sines.
-/// 
+///
 /// The lowest-frequency signal that can be generated with all of its expected harmonics
 /// is given by sample_rate / (2.0 * N). (i.e. with 2560 sinusoids: 44100/(2.0 * 2560) = 8.613 Hz)
 pub struct AdditiveOsc<const N: usize = 1280> {
     amplitudes: [f32; N],
     phases: [f32; N],
 }
+#[allow(dead_code)]
 impl<const N: usize> AdditiveOsc<N> {
     #[inline]
     pub fn generate(&self, phase: f32, harmonics: usize) -> f32 {
@@ -516,11 +506,14 @@ impl<const N: usize> AdditiveOsc<N> {
     }
     pub fn triangle() -> Self {
         let mut amplitudes = [0.0; N];
-        amplitudes.iter_mut().enumerate().step_by(2)
-        .for_each(|(i, x)| {
-            *x = if i % 4 == 0 {1.0} else {-1.0}; 
-            *x /= ((i + 1) as f32).powi(2);
-        });
+        amplitudes
+            .iter_mut()
+            .enumerate()
+            .step_by(2)
+            .for_each(|(i, x)| {
+                *x = if i % 4 == 0 { 1.0 } else { -1.0 };
+                *x /= ((i + 1) as f32).powi(2);
+            });
         let phases = [0.0; N];
         Self { amplitudes, phases }
     }
@@ -554,11 +547,12 @@ impl<const N: usize> AdditiveOsc<N> {
 }
 
 mod tests {
-    use super::{SimpleSin, Wavetable, WavetableNotes};
+    #[allow(unused_imports)]
+    use super::*;
 
     #[test]
     fn test_simple_sin() {
-        let mut simple_sin = SimpleSin::new(0.0, 1.0 / 100_000.0);
+        let mut simple_sin = SinApprox::new(0.0, 1.0 / 100_000.0);
         for _ in 0..100_000 {
             simple_sin.next();
         }
