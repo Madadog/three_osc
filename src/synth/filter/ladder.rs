@@ -21,7 +21,7 @@
  *
  */
 
-use crate::synth::filter::ladder::Iir::IirFilter;
+use crate::synth::filter::ladder::iir::IirFilter;
 use crate::synth::filter::FilterType;
 use fastrand::Rng;
 
@@ -30,6 +30,12 @@ use super::Filter;
 // pade 3/2 approximant for tanh
 #[inline]
 pub fn tanh_pade32(x: f64) -> f64 {
+    let x = x.clamp(-3.0, 3.0);
+    // return approximant
+    x * (15.0 + x.powi(2)) / (15.0 + 6.0 * x.powi(2))
+}
+#[inline]
+pub fn tanh_pade32_f32(x: f32) -> f32 {
     let x = x.clamp(-3.0, 3.0);
     // return approximant
     x * (15.0 + x.powi(2)) / (15.0 + 6.0 * x.powi(2))
@@ -273,8 +279,12 @@ impl Filter for LadderFilter {
     }
 }
 
-mod Iir {
+mod iir {
     use std::f64::consts::PI;
+
+    use itertools::izip;
+
+    use crate::synth::filter::Filter;
 
     const IIR_MAX_ORDER: usize = 32;
     
@@ -321,20 +331,22 @@ mod Iir {
             let mut out = input;
             let mut biquad_in = 0.0;
     
-            for i in 0..(self.decimator_order/2) as usize {
+            // for i in 0..(self.decimator_order/2) as usize {
+            for ((k, a1, a2), z) in izip!(self.k, self.a1, self.a2).zip(self.z.chunks_exact_mut(2)).take(self.decimator_order/2) {
                 // compute biquad input
-                biquad_in = self.k[i]*out - self.a1[i]*self.z[i*2] - self.a2[i]*self.z[i*2+1];
+                biquad_in = k*out - a1*z[0] - a2*z[1];
                 
                 // compute biquad output
-                out = biquad_in + 2.0*self.z[i*2] + self.z[i*2+1];
+                out = biquad_in + 2.0*z[0] + z[1];
                 
                 // update delays
-                self.z[i*2+1] = self.z[i*2];
-                self.z[i*2] = biquad_in;
+                z[1] = z[0];
+                z[0] = biquad_in;
             }
     
             out
         }
+
         pub fn set_order(&mut self, order: usize) {
             self.decimator_order = order.clamp(0, IIR_MAX_ORDER);
             self.initialize_biquad_cascade();

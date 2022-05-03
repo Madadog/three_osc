@@ -1,4 +1,4 @@
-use self::ladder::LadderFilter;
+use self::ladder::{LadderFilter, tanh_pade32, tanh_pade32_f32};
 
 use super::lerp;
 
@@ -21,6 +21,7 @@ pub struct TestFilter {
     pub(crate) target_a: (f32, f32, f32),
     pub(crate) target_b: (f32, f32, f32),
     pub(crate) lerp_amount: f32,
+    pub(crate) filter_type: FilterType,
 }
 impl TestFilter {
     fn lerp_params(&mut self, amount: f32) {
@@ -48,7 +49,7 @@ impl TestFilter {
     }
     /// Outputs biquad coefficients in the format (a0, a1, a2, b0, b1, b2)
     pub fn calc_coef(cutoff: f32, resonance: f32, sample_rate: f32) -> (f32, f32, f32, f32, f32, f32) {
-        // Biquad is less stable than other filters at low frequencies, clamp to 30 Hz minimum
+        // Biquad is less stable than other filters at low frequencies, clamp to 30 Hz minimum.
         let cutoff =  cutoff.max(30.0);
 
         // Coefficients and formulas from https://www.w3.org/TR/audio-eq-cookbook/
@@ -62,15 +63,17 @@ impl TestFilter {
 
         let phase_change = 2.0 * PI * cutoff / sample_rate;
         let (sin, cos) = phase_change.sin_cos();
-        let a = sin / (2.0 * resonance);
+        let alpha = sin / (2.0 * resonance);
+        
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos / a0;
+        let a2 = (1.0 - alpha) / a0;
 
-        let b0 = (1.0 - cos) / 2.0;
-        let b1 = 1.0 - cos;
-        let b2 = (1.0 - cos) / 2.0;
+        // lowpass
+        let b1 = (1.0 - cos) / a0;
+        let b0 = b1 / 2.0;
+        let b2 = b1 / 2.0;
 
-        let a0 = 1.0 + a;
-        let a1 = -2.0 * cos;
-        let a2 = 1.0 - a;
 
         (a0, a1, a2, b0, b1, b2)
     }
@@ -78,7 +81,19 @@ impl TestFilter {
 
 impl Filter for TestFilter {
     fn process(&mut self, input: f32) -> f32 {
-        if !(self.stage0.is_finite() && self.stage1.is_finite()) {
+        
+        self.lerp_params(self.lerp_amount);
+        
+        let previous_previous_sample = self.stage1;
+        let previous_sample = self.stage0;
+        let current_sample = input - self.a1 * self.stage0 - self.a2 * self.stage1;
+        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
+        
+        // Propogate
+        self.stage0 = current_sample;
+        self.stage1 = previous_sample;
+        
+        if !(self.stage1.is_finite() && self.stage0.is_finite()) {
             println!(
                 "Warning: filters were unstable, {} and {}",
                 self.stage0, self.stage1
@@ -86,28 +101,8 @@ impl Filter for TestFilter {
             self.stage0 = 0.0;
             self.stage1 = 0.0;
         }
-        // println!("filter params: {}, {}, {}, {}, {}, {}, ",
-        //     self.a0,
-        //     self.a1,
-        //     self.a2,
-        //     self.b0,
-        //     self.b1,
-        //     self.b2,
-        // );
-        self.lerp_params(self.lerp_amount);
-        // self.filter_params(0.5);
-
-        let previous_previous_sample = self.stage1;
-        let previous_sample = self.stage0;
-        let current_sample = (input - self.a1 * self.stage0 - self.a2 * self.stage1) / self.a0;
-        //let current_sample = -self.stage0.mul_add(self.a1,  -self.stage1.mul_add(self.a2, input));
-
-        // Propogate
-        self.stage0 = current_sample;
-        self.stage1 = previous_sample;
-
-        (self.b0 * current_sample + self.b1 * previous_sample + self.b2 * previous_previous_sample)
-            / self.a0
+        
+        (self.b0 * self.stage0 + self.b1 * self.stage1 + self.b2 * previous_previous_sample)
     }
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
         let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate);
@@ -314,6 +309,11 @@ pub enum FilterType {
     Bandpass,
     Highpass,
 }
+impl Default for FilterType {
+    fn default() -> Self {
+        Self::Lowpass
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum FilterOrder {
@@ -374,11 +374,12 @@ impl RcFilter {
     /// Filters a single sample through the RC filter's first stage using tanh instead of hard clipping
     #[inline]
     fn step_first_stage_tanh(&mut self, input: f32) {
-        let temp_in = (input + self.bp0 * self.rcq).tanh();
-        let lp = (temp_in * self.rcb + self.lp0 * self.rca).tanh();
-        let hp = (self.rcc * (self.hp0 + temp_in - self.last0)).tanh();
-        let bp = (hp * self.rcb + self.bp0 * self.rca).tanh();
-
+        let tanh_scale = 4.0;
+        let temp_in = tanh_pade32_f32((input + self.bp0 * self.rcq) / tanh_scale) * tanh_scale;
+        let lp = tanh_pade32_f32((temp_in * self.rcb + self.lp0 * self.rca) / tanh_scale) * tanh_scale;
+        let hp = tanh_pade32_f32((self.rcc * (self.hp0 + temp_in - self.last0)) / tanh_scale) * tanh_scale;
+        let bp = tanh_pade32_f32((hp * self.rcb + self.bp0 * self.rca) / tanh_scale) * tanh_scale;
+        
         self.last0 = temp_in;
         self.lp0 = lp;
         self.hp0 = hp;
@@ -387,10 +388,11 @@ impl RcFilter {
     /// Filters a single sample through the RC filter's second stage using tanh instead of hard clipping
     #[inline]
     fn step_second_stage_tanh(&mut self, input: f32) {
-        let temp_in = (input + self.bp1 * self.rcq).tanh();
-        let lp = (temp_in * self.rcb + self.lp1 * self.rca).tanh();
-        let hp = (self.rcc * (self.hp1 + temp_in - self.last1)).tanh();
-        let bp = (hp * self.rcb + self.bp1 * self.rca).tanh();
+        let tanh_scale = 4.0;
+        let temp_in = tanh_pade32_f32((input + self.bp1 * self.rcq) / tanh_scale) * tanh_scale;
+        let lp = tanh_pade32_f32((temp_in * self.rcb + self.lp1 * self.rca) / tanh_scale) * tanh_scale;
+        let hp = tanh_pade32_f32((self.rcc * (self.hp1 + temp_in - self.last1)) / tanh_scale) * tanh_scale;
+        let bp = tanh_pade32_f32((hp * self.rcb + self.bp1 * self.rca) / tanh_scale) * tanh_scale;
         
         self.last1 = temp_in;
         self.lp1 = lp;
@@ -454,11 +456,11 @@ impl Filter for RcFilter {
     fn process(&mut self, input: f32) -> f32 {
         match &self.order {
             FilterOrder::_12dB => match &self.filter_type {
-                FilterType::Lowpass => self.filter_all(input).0,
-                FilterType::Bandpass => self.filter_all(input).1,
-                FilterType::Highpass => self.filter_all(input).2,
+                FilterType::Lowpass => self.filter_all_tanh(input).0,
+                FilterType::Bandpass => self.filter_all_tanh(input).1,
+                FilterType::Highpass => self.filter_all_tanh(input).2,
             },
-            FilterOrder::_24dB => self.filter_2nd_order(input),
+            FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
         }
         // match &self.order {
         //     FilterOrder::_12dB => match &self.filter_type {
