@@ -23,6 +23,8 @@ pub struct ThreeOsc {
     pub bend_range: f32,
     pub polyphony: Polyphony,
     pub octave_detune: f32,
+    pub portamento_rate: f32,
+    pub portamento_note: Option<f32>,
 }
 
 impl ThreeOsc {
@@ -49,8 +51,10 @@ impl ThreeOsc {
             ),
             waves: WavetableSet::new(sample_rate as f32, 32.0, 2048, 256),
             bend_range: 2.0,
-            polyphony: Polyphony::Legato,
+            polyphony: Polyphony::Polyphonic,
             octave_detune: 1.0,
+            portamento_rate: 1.0,
+            portamento_note: None,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
