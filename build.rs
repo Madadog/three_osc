@@ -69,7 +69,7 @@ fn main() {
     }
 
     // add oscillator ports
-    for control in oscillators.iter().map(|x| &x.0).flatten() {
+    for control in oscillators.iter().flat_map(|x| &x.0) {
         ttl.push_str(&ttl_control_divider);
         ttl.push_str(&control.to_ttl(port_index));
         port_index += 1;

@@ -227,11 +227,9 @@ impl LadderFilter {
                             - (x_k + x_k * tanh_g_xk * c_t - tanh_g_xk - c_t)
                                 / (1.0 + c_t * (tanh_g_xk + x_k * tanh_g_xk2) - tanh_g_xk2);
 
-                        if LADDER_NEWTON_BREAKING_LIMIT > 0 {
-                            if (x_k2 - x_k).abs() < 1.0e-9 {
-                                x_k = x_k2;
-                                break;
-                            }
+                        if LADDER_NEWTON_BREAKING_LIMIT > 0 && (x_k2 - x_k).abs() < 1.0e-9 {
+                            x_k = x_k2;
+                            break;
                         }
                         x_k = x_k2;
                     }

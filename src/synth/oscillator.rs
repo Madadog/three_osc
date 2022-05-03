@@ -539,7 +539,7 @@ impl<const N: usize> AdditiveOsc<N> {
         let mut amplitudes = [1.0; N];
         amplitudes.iter_mut().enumerate().for_each(|(i, x)| {
             *x /= (i + 1) as f32;
-            *x = *x * ((i + 1) % 2) as f32;
+            *x *= ((i + 1) % 2) as f32;
         });
         let phases = [0.0; N];
         Self { amplitudes, phases }

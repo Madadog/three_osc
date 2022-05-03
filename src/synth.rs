@@ -66,12 +66,8 @@ impl ThreeOsc {
                     voice.id = note as u32;
                     voice.velocity = velocity;
 
-                    if matches!(polyphony, Polyphony::Monophonic) {
-                        // Monophonic always re-presses notes.
-                        voice.release_time = None;
-                        voice.runtime = 0;
-                    } else if let Some(_) = voice.release_time {
-                        // If the note is released, re-press it.
+                    // If the note is released, or if we are in monophonic mode, re-press it.
+                    if matches!(polyphony, Polyphony::Monophonic) || voice.release_time.is_some() {
                         voice.release_time = None;
                         voice.runtime = 0;
                     }
@@ -298,7 +294,7 @@ impl Voice {
         }
     }
     pub fn release(&mut self) {
-        if let None = self.release_time {
+        if self.release_time.is_none() {
             self.release_time = Some(self.runtime)
         }
     }
