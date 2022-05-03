@@ -12,7 +12,7 @@ Currently a work in progress, but usable nevertheless.
 ## Features
 
 * 3 oscillators which can modulate eachother via phase, frequency, and amplitude modulation (PM, FM & AM) simultaneously
-* 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope (todo: multimode biquad)
+* 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with smoothly adjustable slopes
 * Sine, triangle, exponential, saw, and square waves
@@ -59,9 +59,7 @@ Coming soon...
 ## TODO
 * Add descriptions to control ports
 * Choose oscillator wavetable using delta instead of midi input pitch.
-* Find a compromise between biquad filter clicking and allowable envelope steepness (i.e. replace filter with the LMMS default lowpass filter, but force cutoff above ~25 Hz to stop DC spikes)
 * Portamento
-* Bandpass and highpass filter modes for biquad filter
 * Rescale resonance control max from 10.0 to 1.0
 * Add vibrato control / LFO
 * PWM

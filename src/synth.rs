@@ -189,7 +189,7 @@ impl ThreeOsc {
             let voice_freq = 2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
             
             let cutoff = self.filter_controller.get_cutoff(voice_freq, envelope_index, voice.release_time, self.sample_rate as f32);
-            voice.filter.set(self.filter_controller.filter_model, cutoff, self.filter_controller.resonance, self.sample_rate as f32);
+            voice.filter.set(self.filter_controller.filter_model, cutoff, self.filter_controller.resonance, self.sample_rate as f32, self.filter_controller.filter_type);
             voice.filter.set_filter_type(self.filter_controller.filter_type);
 
             match voice.filter {

@@ -32,9 +32,9 @@ impl TestFilter {
         self.b1 = lerp(self.b1, self.target_b.1, amount);
         self.b2 = lerp(self.b2, self.target_b.2, amount);
     }
-    pub fn with_params(cutoff: f32, resonance: f32, sample_rate: f32) -> TestFilter {
+    pub fn with_params(cutoff: f32, resonance: f32, sample_rate: f32, filter_type: FilterType) -> TestFilter {
         let mut filter = TestFilter::default();
-        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate);
+        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate, &filter_type);
 
         filter.a0 = coeffs.0;
         filter.a1 = coeffs.1;
@@ -48,7 +48,7 @@ impl TestFilter {
         filter
     }
     /// Outputs biquad coefficients in the format (a0, a1, a2, b0, b1, b2)
-    pub fn calc_coef(cutoff: f32, resonance: f32, sample_rate: f32) -> (f32, f32, f32, f32, f32, f32) {
+    pub fn calc_coef(cutoff: f32, resonance: f32, sample_rate: f32, filter_type: &FilterType) -> (f32, f32, f32, f32, f32, f32) {
         // Biquad is less stable than other filters at low frequencies, clamp to 30 Hz minimum.
         let cutoff =  cutoff.max(30.0);
 
@@ -69,11 +69,22 @@ impl TestFilter {
         let a1 = -2.0 * cos / a0;
         let a2 = (1.0 - alpha) / a0;
 
-        // lowpass
-        let b1 = (1.0 - cos) / a0;
-        let b0 = b1 / 2.0;
-        let b2 = b1 / 2.0;
-
+        let (b0, b1, b2) = match filter_type {
+            FilterType::Lowpass => {
+                let b1 = (1.0 - cos) / a0;
+                let b0 = b1 / 2.0;
+                (b0, b1, b0)
+            },
+            FilterType::Bandpass => {
+                let b0 = sin / 2.0 / a0;
+                (b0, 0.0, -b0)
+            },
+            FilterType::Highpass => {
+                let b1 = (-1.0 - cos) / a0;
+                let b0 = -b1 / 2.0;
+                (b0, b1, b0)
+            },
+        };
 
         (a0, a1, a2, b0, b1, b2)
     }
@@ -102,10 +113,10 @@ impl Filter for TestFilter {
             self.stage1 = 0.0;
         }
         
-        (self.b0 * self.stage0 + self.b1 * self.stage1 + self.b2 * previous_previous_sample)
+        self.b0 * self.stage0 + self.b1 * self.stage1 + self.b2 * previous_previous_sample
     }
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate);
+        let coeffs = TestFilter::calc_coef(cutoff, resonance, sample_rate, &self.filter_type);
 
         self.target_a.0 = coeffs.0;
         self.target_a.1 = coeffs.1;
@@ -114,6 +125,9 @@ impl Filter for TestFilter {
         self.target_b.0 = coeffs.3;
         self.target_b.1 = coeffs.4;
         self.target_b.2 = coeffs.5;
+    }
+    fn set_filter_type(&mut self, filter_type: FilterType) {
+        self.filter_type = filter_type;
     }
 }
 
@@ -254,14 +268,14 @@ pub enum FilterContainer {
     BiquadFilter(TestFilter),
 }
 impl FilterContainer {
-    pub fn set(&mut self, filter_model: FilterModel, cutoff: f32, resonance: f32, sample_rate: f32) {
+    pub fn set(&mut self, filter_model: FilterModel, cutoff: f32, resonance: f32, sample_rate: f32, filter_type: FilterType) {
         match (self, filter_model) {
             (FilterContainer::RcFilter(_), FilterModel::RcFilter) => {},
             (FilterContainer::LadderFilter(_), FilterModel::LadderFilter) => {},
             (FilterContainer::BiquadFilter(_), FilterModel::BiquadFilter) => {},
             (x, FilterModel::RcFilter) => {*x = FilterContainer::RcFilter(RcFilter::default())},
             (x, FilterModel::LadderFilter) => {*x = FilterContainer::LadderFilter(LadderFilter::default())},
-            (x, FilterModel::BiquadFilter) => {*x = FilterContainer::BiquadFilter(TestFilter::with_params(cutoff, resonance, sample_rate))},
+            (x, FilterModel::BiquadFilter) => {*x = FilterContainer::BiquadFilter(TestFilter::with_params(cutoff, resonance, sample_rate, filter_type))},
             (x, FilterModel::None) => {*x = FilterContainer::None},
             (_, _) => {unreachable!("Forgot to set a FilterModel for FilterContainer")}
         }
