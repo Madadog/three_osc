@@ -285,7 +285,7 @@ impl Filter for FilterContainer {
     fn process(&mut self, input: f32) -> f32 {
         match self {
             FilterContainer::RcFilter(x) => x.process(input),
-            FilterContainer::LadderFilter(x) => x.process(input),
+            FilterContainer::LadderFilter(x) => x.process(input / 2.0) * 2.0,
             FilterContainer::BiquadFilter(x) => x.process(input),
             _ => {input}
         }
