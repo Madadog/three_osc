@@ -61,13 +61,13 @@ impl ThreeOsc {
                 self.voices
                     .push(Voice::from_midi_note(note, velocity, &self.oscillators))
             }
-            polyphony => {
+            Polyphony::Legato | Polyphony::Monophonic => {
                 if let Some(voice) = self.voices.last_mut() {
                     voice.id = note as u32;
                     voice.velocity = velocity;
 
-                    // If the note is released, or if we are in monophonic mode, re-press it.
-                    if matches!(polyphony, Polyphony::Monophonic) || voice.release_time.is_some() {
+                    // If the note is released, or if we are in monophonic mode, retrigger it.
+                    if matches!(self.polyphony, Polyphony::Monophonic) || voice.release_time.is_some() {
                         voice.release_time = None;
                         voice.runtime = 0;
                     }
@@ -103,8 +103,15 @@ impl ThreeOsc {
                             accum
                         }
                     });
+
+                    
                     if let Some(note) = nearest_note {
                         voice.id = note.id as u32;
+                        // Retrigger notes when releasing keys in Monophonic mode
+                        if matches!(self.polyphony, Polyphony::Monophonic) {
+                            voice.release_time = None;
+                            voice.runtime = 0;
+                        }
                     } else {
                         voice.release();
                     }
