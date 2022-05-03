@@ -57,10 +57,10 @@ Coming soon...
     * Originally had no bandlimited wave generation.
 
 ## TODO
-* Add descriptions to control ports
 * Choose oscillator wavetable using delta instead of midi input pitch.
 * Portamento
-* Rescale resonance control max from 10.0 to 1.0
+* Process samples in buffer if possible
+* Rescale resonance control max from 10.0 to 1.0?
 * Add vibrato control / LFO
 * PWM
 * Stereo

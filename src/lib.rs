@@ -125,16 +125,22 @@ impl Plugin for SynthLv2 {
         self.synth.octave_detune = 1.0 - *ports.octave_detune;
 
         // adjust master gain envelope
-        self.synth.gain_envelope.attack_time = *ports.vol_attack;
-        self.synth.gain_envelope.decay_time = *ports.vol_decay;
+        
+        // Attack and decay's minimum value of 0.001 is manually set to 0.0. This is a workaround to
+        // make logarithmic values display nicely in Ardour (which ignores the 'logarithmic' port
+        // property when the port's minimum value is 0) while still allowing instant attack times.
+        // Naturally we don't do this for the release port.
+        // TODO: decide if the decay control needs this at all
+        self.synth.gain_envelope.attack_time = if *ports.vol_attack <= 0.001 { 0.0 } else { *ports.vol_attack };
+        self.synth.gain_envelope.decay_time = if *ports.vol_decay <= 0.001 { 0.0 } else { *ports.vol_decay };
         self.synth.gain_envelope.sustain_level = *ports.vol_sustain;
         self.synth.gain_envelope.release_time = *ports.vol_release;
         self.synth.gain_envelope.set_slope(*ports.vol_slope);
 
         self.synth.filter_controller.envelope_amount = (*ports.fil1_env_amount).powi(2) * 22000.0;
         self.synth.filter_controller.keytrack = *ports.fil1_keytrack;
-        self.synth.filter_controller.cutoff_envelope.attack_time = *ports.fil1_attack;
-        self.synth.filter_controller.cutoff_envelope.decay_time = *ports.fil1_decay;
+        self.synth.filter_controller.cutoff_envelope.attack_time =  if *ports.fil1_attack <= 0.001 { 0.0 } else { *ports.fil1_attack };
+        self.synth.filter_controller.cutoff_envelope.decay_time = if *ports.fil1_decay <= 0.001 { 0.0 } else { *ports.fil1_decay };
         self.synth.filter_controller.cutoff_envelope.sustain_level = *ports.fil1_sustain;
         self.synth.filter_controller.cutoff_envelope.release_time = *ports.fil1_release;
         self.synth.filter_controller.cutoff_envelope.set_slope(*ports.fil1_slope);
@@ -163,8 +169,7 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[0].semitone = *ports.osc1_semitone + *ports.global_pitch;
             self.synth.oscillators[0].octave = *ports.osc1_octave as i32;
             // Frequency multiplication if Freq. Mult is positive, frequency division if negative.
-            // (This is because negative multiplication would just invert the wave, which is a function
-            // that should have its own toggle switch)
+            // (This is because negative multiplication would just reverse the wave, which is not very useful)
             self.synth.oscillators[0].multiplier = if ports.osc1_multiplier.is_sign_positive() {
                 1.0 + *ports.osc1_multiplier
             } else {

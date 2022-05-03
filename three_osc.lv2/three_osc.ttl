@@ -564,11 +564,11 @@
                 lv2:index 43 ;
                 lv2:symbol "fil1_attack" ;
                 lv2:name "Filter 1 Attack" ;
-                lv2:default 0.000 ;
-                lv2:minimum 0.000 ;
-                lv2:maximum 5.000 ;
+                lv2:default 0.001 ;
+                lv2:minimum 0.001 ;
+                lv2:maximum 15.000 ;
                 lv2:portProperty props:logarithmic ;
-                rdfs:comment "Envelope start time, in seconds. This gives a \"fade in\" effect when controlling volume." ;
+                rdfs:comment "Envelope start time, in seconds. This gives a \"fade in\" effect when controlling volume. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)" ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -576,10 +576,10 @@
                 lv2:symbol "fil1_decay" ;
                 lv2:name "Filter 1 Decay" ;
                 lv2:default 0.250 ;
-                lv2:minimum 0.000 ;
-                lv2:maximum 5.000 ;
+                lv2:minimum 0.001 ;
+                lv2:maximum 15.000 ;
                 lv2:portProperty props:logarithmic ;
-                rdfs:comment "Time for envelope to reach sustain level, in seconds. This gives a \"pluck\" effect when controlling volume. Does nothing when sustain = 1." ;
+                rdfs:comment "Time for envelope to reach sustain level, in seconds. This gives a \"pluck\" effect when controlling volume. Does nothing when sustain = 1. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)" ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -618,10 +618,10 @@
                 lv2:symbol "vol_attack" ;
                 lv2:name "Vol Attack" ;
                 lv2:default 0.001 ;
-                lv2:minimum 0.000 ;
+                lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
                 lv2:portProperty props:logarithmic ;
-                rdfs:comment "Envelope start time, in seconds. This gives a \"fade in\" effect when controlling volume." ;
+                rdfs:comment "Envelope start time, in seconds. This gives a \"fade in\" effect when controlling volume. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)" ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
@@ -629,10 +629,10 @@
                 lv2:symbol "vol_decay" ;
                 lv2:name "Vol Decay" ;
                 lv2:default 0.250 ;
-                lv2:minimum 0.000 ;
+                lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
                 lv2:portProperty props:logarithmic ;
-                rdfs:comment "Time for envelope to reach sustain level, in seconds. This gives a \"pluck\" effect when controlling volume. Does nothing when sustain = 1." ;
+                rdfs:comment "Time for envelope to reach sustain level, in seconds. This gives a \"pluck\" effect when controlling volume. Does nothing when sustain = 1. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)" ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;

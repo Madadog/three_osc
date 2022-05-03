@@ -404,15 +404,15 @@ impl PortList {
             ControlPort::new(
                 "attack",
                 "Attack",
-                Float(0.001, (0.0, 15.0)),
+                Float(0.001, (0.001, 15.0)),
             ).logarithmic()
-            .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume."),
+            .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)"),
             ControlPort::new(
                 "decay",
                 "Decay",
-                Float(0.25, (0.0, 15.0)),
+                Float(0.25, (0.001, 15.0)),
             ).logarithmic()
-            .comment("Time for envelope to reach sustain level, in seconds. This gives a \\\"pluck\\\" effect when controlling volume. Does nothing when sustain = 1."),
+            .comment("Time for envelope to reach sustain level, in seconds. This gives a \\\"pluck\\\" effect when controlling volume. Does nothing when sustain = 1. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)"),
             ControlPort::new(
                 "sustain",
                 "Sustain",
@@ -446,15 +446,15 @@ impl PortList {
             ControlPort::new(
                 "attack",
                 "Attack",
-                Float(0.0, (0.0, 5.0)),
+                Float(0.001, (0.001, 15.0)),
             ).logarithmic()
-            .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume."),
+            .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)"),
             ControlPort::new(
                 "decay",
                 "Decay",
-                Float(0.25, (0.0, 5.0)),
+                Float(0.25, (0.001, 15.0)),
             ).logarithmic()
-            .comment("Time for envelope to reach sustain level, in seconds. This gives a \\\"pluck\\\" effect when controlling volume. Does nothing when sustain = 1."),
+            .comment("Time for envelope to reach sustain level, in seconds. This gives a \\\"pluck\\\" effect when controlling volume. Does nothing when sustain = 1. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)"),
             ControlPort::new(
                 "sustain",
                 "Sustain",
