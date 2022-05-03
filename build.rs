@@ -119,8 +119,16 @@ struct ControlPort {
 }
 impl ControlPort {
     fn new(symbol: &str, name: &str, range: ControlRange) -> Self { Self { symbol: symbol.to_string(), name: name.to_string(), range, properties: vec!() } }
-    fn with_properties(self, properties: Vec<PortProperty>) -> Self { Self {properties, ..self}}
-    fn logarithmic(self) -> Self { self.with_properties(vec![PortProperty::Logarithmic]) }
+    fn with_properties(mut self, properties: &[PortProperty]) -> Self {
+        self.properties.extend(properties.iter().cloned());
+        self
+    }
+    fn with_property(mut self, property: PortProperty) -> Self {
+        self.properties.push(property);
+        self
+    }
+    fn logarithmic(self) -> Self { self.with_property(PortProperty::Logarithmic) }
+    fn comment(self, comment: &str) -> Self { self.with_property(PortProperty::Comment(comment.to_string())) }
     fn to_ttl(&self, index: usize) -> String {
         let mut buf = String::with_capacity(2000);
         buf.push_str(&format!("                lv2:index {index} ;\n"));
@@ -153,6 +161,7 @@ impl ControlPort {
         for property in self.properties.iter() {
             match property {
                 PortProperty::Logarithmic => {buf.push_str("\n                lv2:portProperty props:logarithmic ;")},
+                PortProperty::Comment(comment) => {buf.push_str(&format!("\n                rdfs:comment \"{}\" ;", comment))},
                 x => {panic!("You need to add {:?} to the .to_ttl() function", x)}
             }
         }
@@ -215,6 +224,7 @@ fn prefix_ports(ports: &mut [ControlPort], symbol_prefix: &str, name_prefix: &st
 #[derive(Debug, Clone)]
 enum PortProperty {
     Logarithmic,
+    Comment(String),
 }
 
 use ControlRange::{Int, Float};
@@ -246,57 +256,57 @@ impl PortList {
                 "amp",
                 "Amplitude",
                 Float(default_amp, (0.0, 100.0)),
-            ),
+            ).comment("Oscillator output volume. Doesn't affect PM, FM or AM."),
             ControlPort::new(
                 "semitone",
                 "Detune",
                 Float(0.0, (-24.0, 24.0)),
-            ),
+            ).comment("Oscillator detune in semitones."),
             ControlPort::new(
                 "octave",
                 "Octave",
                 Int(0, (-8, 8)),
-            ),
+            ).comment("Oscillator detune in octaves."),
             ControlPort::new(
                 "multiplier",
                 "Freq. Mult",
                 Int(0, (-64, 64)),
-            ),
+            ).comment("Oscillator pitch multiplier / divider. Positive values multiply pitch, while negative values divide. A value of 0 means this control is bypassed."),
             ControlPort::new(
                 "pm",
                 &format!("<- {modulator} PM"),
                 Float(0.0, (0.0, 1.0)),
-            ),
+            ).comment("Phase modulation of this oscillator by the oscillator after it."),
             ControlPort::new(
                 "fm",
                 &format!("<- {modulator} FM"),
                 Float(0.0, (0.0, 1.0)),
-            ),
+            ).comment("Frequency modulation of this oscillator by the oscillator after it. Can be used for vibrato effects when the modulator is at a low pitch."),
             ControlPort::new(
                 "am",
                 &format!("<- {modulator} AM"),
                 Float(0.0, (0.0, 1.0)),
-            ),
+            ).comment("Amplitude modulation of this oscillator by the oscillator after it. Also known as \'Ring Modulation\'. Can be used for telephone sounds and tremelo."),
             ControlPort::new(
                 "voices",
-                "Voices",
+                "Unison",
                 Int(1, (1, 128)),
-            ),
+            ).comment("Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound."),
             ControlPort::new(
                 "super_detune",
-                "Super Detune",
+                "Unison Detune",
                 Float(21.0, (0.0, 100.0)),
-            ),
+            ).comment("Unison voice detune. Does nothing if unison = 1."),
             ControlPort::new(
                 "phase",
                 "Phase",
                 Float(0.0, (0.0, 100.0)),
-            ),
+            ).comment("Point at which the oscillator wave starts. Does nothing when Phase Rand = 100."),
             ControlPort::new(
                 "phase_rand",
                 "Phase Rand.",
                 Float(100.0, (0.0, 100.0)),
-            ),
+            ).comment("Partially or fully randomises the point where the oscillator wave starts. Keep this fairly high when using Unison."),
         ])
     }
     fn oscillator_no_mod(default_amp: f32, default_wave: usize) -> Self {
@@ -317,42 +327,42 @@ impl PortList {
                 "amp",
                 "Amplitude",
                 Float(default_amp, (0.0, 100.0)),
-            ),
+            ).comment("Oscillator output volume. Doesn't affect PM, FM or AM."),
             ControlPort::new(
                 "semitone",
                 "Detune",
                 Float(0.0, (-24.0, 24.0)),
-            ),
+            ).comment("Oscillator detune in semitones."),
             ControlPort::new(
                 "octave",
                 "Octave",
                 Int(0, (-8, 8)),
-            ),
+            ).comment("Oscillator detune in octaves."),
             ControlPort::new(
                 "multiplier",
                 "Freq. Mult",
                 Int(0, (-64, 64)),
-            ),
+            ).comment("Oscillator pitch multiplier / divider. Positive values multiply pitch, while negative values divide. A value of 0 means this control is bypassed."),
             ControlPort::new(
                 "voices",
-                "Voices",
+                "Unison",
                 Int(1, (1, 128)),
-            ),
+            ).comment("Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound."),
             ControlPort::new(
                 "super_detune",
-                "Super Detune",
+                "Unison Detune",
                 Float(21.0, (0.0, 100.0)),
-            ),
+            ).comment("Unison voice detune. Does nothing if unison = 1."),
             ControlPort::new(
                 "phase",
                 "Phase",
                 Float(0.0, (0.0, 100.0)),
-            ),
+            ).comment("Point at which the oscillator wave starts. Does nothing when Phase Rand = 100."),
             ControlPort::new(
                 "phase_rand",
                 "Phase Rand.",
                 Float(100.0, (0.0, 100.0)),
-            ),
+            ).comment("Partially or fully randomises the point where the oscillator wave starts. Keep this fairly high when using Unison."),
         ])
     }
     fn global() -> PortList {
@@ -366,27 +376,27 @@ impl PortList {
                     "Monophonic".to_string(),
                     "Legato".to_string(),
                 ]),
-            ),
+            ).comment("Polyphonic means an infinite number of notes can be played simultaneously. Monophonic means only one note can be played at a time. Legato is the same as monophonic, except notes are connected; envelopes / oscillator phases won't reset when gliding between notes."),
             ControlPort::new(
                 "octave_detune",
-                "Octave Detune",
-                Float(0.0, (-0.05, 0.05)),
-            ),
+                "Octave Drift",
+                Float(0.0, (-0.04, 0.04)),
+            ).comment("Stretches the octave width so that consecutive octaves are further or closer together. In 12TET (i.e. the chromatic scale), octaves are the only perfect interval, which means playing them with harsh waves (saw, square, etc) will result in a louder and harsher sound than playing any other two notes. This control is meant to fix that."),
             ControlPort::new(
                 "output_gain",
                 "Output Gain",
                 Float(-18.0, (-90.0, 0.0)),
-            ),
+            ).comment("Master output volume. Adjust if the synth is too loud / too quiet."),
             ControlPort::new(
                 "global_pitch",
                 "Master Pitch",
                 Int(0, (-24, 24)),
-            ),
+            ).comment("Pitch detune for the whole synth, in semitones."),
             ControlPort::new(
                 "bend_range",
                 "Bend Range",
                 Int(2, (-24, 24)),
-            ),
+            ).comment("Controls the range of the MIDI pitch wheel in semitones. Useful if you have a MIDI keyboard."),
         ])
     }
     fn envelope() -> PortList {
@@ -395,27 +405,30 @@ impl PortList {
                 "attack",
                 "Attack",
                 Float(0.001, (0.0, 15.0)),
-            ).logarithmic(),
+            ).logarithmic()
+            .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume."),
             ControlPort::new(
                 "decay",
                 "Decay",
                 Float(0.25, (0.0, 15.0)),
-            ).logarithmic(),
+            ).logarithmic()
+            .comment("Time for envelope to reach sustain level, in seconds. This gives a \\\"pluck\\\" effect when controlling volume. Does nothing when sustain = 1."),
             ControlPort::new(
                 "sustain",
                 "Sustain",
                 Float(1.0, (0.0, 1.0)),
-            ),
+            ).comment("The level the envelope will remain at while the note is held. Used for sustained sounds, like flutes or strings. Has no effect when set to 0; the note will end when decay finishes."),
             ControlPort::new(
                 "release",
                 "Release",
                 Float(0.005, (0.001, 15.0)),
-            ).logarithmic(),
+            ).logarithmic()
+            .comment("Time for the envelope to finish after the note is released. Useful for sounds which persist a while after they're played, like bells or chimes. Has mostly no effect when sustain = 0."),
             ControlPort::new(
                 "slope",
                 "Slope",
                 Float(1.0, (-8.0, 8.0)),
-            ),
+            ).comment("Controls the steepness of the attack, decay and release slopes either exponentially or logarithmically. Positive slope means attack and decay will change logarithmically, resulting in punchier sounds, while negative slope will do the opposite. A slope of 0 results in exactly linear slopes."),
         ])
     }
     fn filter_envelope() -> PortList {
@@ -424,37 +437,40 @@ impl PortList {
                 "keytrack",
                 "Keytrack",
                 Float(0.0, (0.0, 1.0)),
-            ),
+            ).comment("Amount the filter cutoff is affected by note frequency; Keytrack of 1.0 means the filter cutoff will follow the note frequency exactly, making higher notes brighter and lower notes darker."),
             ControlPort::new(
                 "env_amount",
                 "Env. Amount",
-                Float(0.0, (0.0, 1.0)),
-            ),
+                Float(0.25, (0.0, 1.0)),
+            ).comment("Amount the envelope affects the filter cutoff."),
             ControlPort::new(
                 "attack",
                 "Attack",
-                Float(0.0, (0.0, 15.0)),
-            ).logarithmic(),
+                Float(0.0, (0.0, 5.0)),
+            ).logarithmic()
+            .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume."),
             ControlPort::new(
                 "decay",
                 "Decay",
-                Float(0.25, (0.0, 15.0)),
-            ).logarithmic(),
+                Float(0.25, (0.0, 5.0)),
+            ).logarithmic()
+            .comment("Time for envelope to reach sustain level, in seconds. This gives a \\\"pluck\\\" effect when controlling volume. Does nothing when sustain = 1."),
             ControlPort::new(
                 "sustain",
                 "Sustain",
                 Float(0.0, (0.0, 1.0)),
-            ),
+            ).comment("The level the envelope will remain at while the note is held. Used for sustained sounds, like flutes or strings. Has no effect when set to 0; the note will end when decay finishes."),
             ControlPort::new(
                 "release",
                 "Release",
                 Float(0.005, (0.001, 15.0)),
-            ).logarithmic(),
+            ).logarithmic()
+            .comment("Time for the envelope to finish after the note is released. Useful for sounds which persist a while after they're played, like bells or chimes. Has mostly no effect when sustain = 0."),
             ControlPort::new(
                 "slope",
                 "Slope",
                 Float(1.0, (-8.0, 8.0)),
-            ),
+            ).comment("Controls the steepness of the attack, decay and release slopes either exponentially or logarithmically. Positive slope means attack and decay will change logarithmically, resulting in punchier sounds, while negative slope will do the opposite. A slope of 0 results in exactly linear slopes."),
         ])
     }
     fn filter() -> PortList {
@@ -469,7 +485,7 @@ impl PortList {
                     "Ladder".to_string(),
                     "Digital".to_string(),
                 ]),
-            ),
+            ).comment("There are 3 filter models: Digital is a bog-standard IIR Biquad, RC is a darker filter capable of aggressive self-resonance, and Ladder is based on a famous analog filter and sounds the best, with its code coming from janne808's Kocmoc Rack Modules project."),
             ControlPort::new(
                 "type",
                 "Type",
@@ -478,22 +494,23 @@ impl PortList {
                     "Bandpass".to_string(),
                     "Highpass".to_string(),
                 ]),
-            ),
+            ).comment("Lowpass cuts out high frequencies, Highpass cuts out low frequencies, and Bandpass allows a small band of frequencies at the cutoff point."),
             ControlPort::new(
                 "cutoff",
-                "Cutoff",
-                Float(22000.0, (1.0, 22000.0)),
-            ).logarithmic(),
+                "Cutoff Freq.",
+                Float(22000.0, (10.0, 22000.0)),
+            ).logarithmic()
+            .comment("Changes frequency at which the filter starts taking effect. Try it out."),
             ControlPort::new(
                 "resonance",
                 "Resonance",
-                Float(0.6, (0.01, 10.0)),
-            ),
+                Float(0.7, (0.01, 10.0)),
+            ).comment("Adds feedback to the filter loop, creating a volume spike at the filter's cutoff frequency. On the RC and Ladder filters, setting this high enough creates a self-sustaining sine wave."),
             ControlPort::new(
                 "drive",
                 "Drive",
                 Float(1.0, (0.01, 10.0)),
-            ),
+            ).comment("Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to protect ears."),
         ])
     }
 }
