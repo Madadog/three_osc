@@ -176,18 +176,14 @@ impl OscWave {
     }
 }
 
-pub fn modulate_delta(delta: f32, linear_fm: f32, constant_fm: f32, sample_rate: f32) -> f32 {
-    // `linear_fm` and `constant_fm` are expected to be between -1.0 and 1.0,
+pub fn modulate_delta(delta: f32, linear_fm: f32, sample_rate: f32) -> f32 {
+    // `linear_fm` is expected to be between -1.0 and 1.0,
     // must be stretched out.
     let linear_fm = linear_fm * 125.0;
-    let constant_fm = constant_fm * 10000.0 * 1.5;
 
-    // `delta_to_freq` is required because delta varies with sample rate. Constant FM
-    // requires this, but linear FM is multiplicative / relative, so it's unaffected.
-    let delta_to_freq = sample_rate / (2.0 * PI);
+    let delta = delta * (1.0 + linear_fm);
 
-    let delta = ((delta) * (1.0 + linear_fm) * delta_to_freq + constant_fm) / delta_to_freq;
-    // `rem_euclid()` doesn't allow negatives, while regular modulo does
+    // `rem_euclid()` prevents negative phases, unlike the default modulo
     delta.rem_euclid(2.0 * PI)
 }
 
@@ -281,6 +277,14 @@ impl Wavetable {
             .iter()
             .take(max)
             .map(|phase| self.generate(*phase))
+            .sum()
+    }
+    #[inline]
+    pub fn generate_multi_pm(&self, phases: &[f32], max: usize, phase_offset: f32) -> f32 {
+        phases
+            .iter()
+            .take(max)
+            .map(|phase| self.generate((*phase + phase_offset * 150.0).rem_euclid(2.0 * PI)))
             .sum()
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing

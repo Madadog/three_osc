@@ -282,8 +282,7 @@ impl Plugin for SynthLv2 {
         }
 
         // run synthesiser
-        self.synth
-            .run(ports.out_l.iter_mut().zip(ports.out_r.iter_mut()));
+        self.synth.run(&mut ports.out_l, &mut ports.out_r);
     }
 }
 // The `lv2_descriptors` macro creates the entry point to the plugin library. It takes structs that implement `Plugin` and exposes them. The host will load the library and call a generated function to find all the plugins defined in the library.

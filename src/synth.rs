@@ -1,5 +1,7 @@
 use std::f32::consts::PI;
 
+use itertools::izip;
+
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
 use self::notes::Notes;
@@ -135,129 +137,134 @@ impl ThreeOsc {
     }
     pub fn run(
         &mut self,
-        output: std::iter::Zip<std::slice::IterMut<f32>, std::slice::IterMut<f32>>,
+        output_left: &mut [f32],
+        output_right: &mut [f32],
     ) {
-        output.for_each(|(out_l, out_r)| {
-            self.run_voices(out_l, out_r);
-        })
-    }
-    pub fn run_voices(&mut self, out_l: &mut f32, out_r: &mut f32) {
         self.release_voices();
         self.filter_controller.cutoff = self.filter_controller.target_cutoff;
+
+        // Write samples from all voices
         for voice in self.voices.iter_mut() {
-            voice.advance();
-            let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
-            let mut out = 0.0;
-            let velocity = voice.velocity as f32 / 128.0;
-            let index = voice.id as usize;
-            voice.detune = self.octave_detune;
-
-            let osc3_out = if let Some(osc) = self.oscillators.get(2) {
-                let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let phases = voice.osc_voice[2].unison_phases(
-                    delta,
-                    osc.voice_count.into(),
-                    osc.voices_detune,
-                );
-                let osc_out = self.waves.select(&osc.wave).tables[index]
-                    .generate_multi(phases, osc.voice_count.into())
-                    / osc.voice_count as f32;
-                out += osc_out * osc.amp * velocity;
-                osc_out
-            } else {
-                unreachable!("Osc3 wasn't found...");
-            };
-
-            let osc2_out = if let Some(osc) = self.oscillators.get(1) {
-                let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta = modulate_delta(delta, osc3_out * osc.fm, 0.0, self.sample_rate as f32);
-                let phases = voice.osc_voice[1].unison_phases_pm(
-                    delta,
-                    osc.voice_count.into(),
-                    osc.voices_detune,
-                    osc3_out * osc.pm,
-                );
-
-                let mut osc_out = self.waves.select(&osc.wave).tables[index]
-                    .generate_multi(&phases, osc.voice_count.into())
-                    / osc.voice_count as f32;
-                osc_out *= lerp(1.0, osc3_out, osc.am);
-                out += osc_out * osc.amp * velocity;
-                osc_out
-            } else {
-                unreachable!("Osc2 wasn't found...");
-            };
-
-            if let Some(osc) = self.oscillators.get(0) {
-                let delta = osc.pitch_mult_delta(voice.voice_delta(self.sample_rate as f32));
-                let delta =
-                    modulate_delta(delta, osc2_out * osc.fm, 0.0, self.sample_rate as f32).abs();
-                let phases = voice.osc_voice[0].unison_phases_pm(
-                    delta,
-                    osc.voice_count.into(),
-                    osc.voices_detune,
-                    osc2_out * osc.pm,
-                );
-
-                let osc_out = self.waves.select(&osc.wave).tables[index]
-                    .generate_multi(&phases, osc.voice_count.into())
-                    / osc.voice_count as f32;
-                out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
-            }
-
-            // Update filter controls, calculate keytrack
-            let voice_freq =
-                2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
-
-            let cutoff = self.filter_controller.get_cutoff(
-                voice_freq,
-                envelope_index,
-                voice.release_time,
-                self.sample_rate as f32,
-            );
-            voice.filter.set(
-                self.filter_controller.filter_model,
-                cutoff,
-                self.filter_controller.resonance,
-                self.sample_rate as f32,
-                self.filter_controller.filter_type,
-            );
-            voice
-                .filter
-                .set_filter_type(self.filter_controller.filter_type);
-
-            match voice.filter {
-                // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
-                // keep the levels the same when switching filter.
-                filter::FilterContainer::BiquadFilter(_) | filter::FilterContainer::None => {
-                    self.filter_controller.drive = self.filter_controller.drive.min(1.0)
+            for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
+                voice.advance();
+                let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
+                let mut out = 0.0;
+                let velocity = voice.velocity as f32 / 128.0;
+                let index = voice.id as usize;
+                let voice_delta = voice.voice_delta(self.sample_rate as f32);
+                voice.detune = self.octave_detune;
+    
+                let osc3_out = if let Some(osc) = self.oscillators.get(2) {
+                    let delta = osc.pitch_mult_delta(voice_delta);
+                    let phases = voice.osc_voice[2].unison_phases(
+                        delta,
+                        osc.voice_count.into(),
+                        osc.voices_detune,
+                    );
+                    let osc_out = self.waves.select(&osc.wave).tables[index]
+                        .generate_multi(phases, osc.voice_count.into())
+                        / osc.voice_count as f32;
+                    out += osc_out * osc.amp * velocity;
+                    osc_out
+                } else {
+                    unreachable!("Osc3 wasn't found...");
+                };
+    
+                let osc2_out = if let Some(osc) = self.oscillators.get(1) {
+                    let delta = osc.pitch_mult_delta(voice_delta);
+                    let delta = modulate_delta(delta, osc3_out * osc.fm, self.sample_rate as f32);
+                    let phases = voice.osc_voice[1].unison_phases(
+                        delta,
+                        osc.voice_count.into(),
+                        osc.voices_detune,
+                    );
+    
+                    let mut osc_out = self.waves.select(&osc.wave).tables[index]
+                        .generate_multi_pm(
+                            &phases,
+                            osc.voice_count.into(),
+                        osc3_out * osc.pm,
+                        ) / osc.voice_count as f32;
+                    osc_out *= lerp(1.0, osc3_out, osc.am);
+                    out += osc_out * osc.amp * velocity;
+                    osc_out
+                } else {
+                    unreachable!("Osc2 wasn't found...");
+                };
+    
+                if let Some(osc) = self.oscillators.get(0) {
+                    let delta = osc.pitch_mult_delta(voice_delta);
+                    let delta =
+                        modulate_delta(delta, osc2_out * osc.fm, self.sample_rate as f32).abs();
+                    let phases = voice.osc_voice[0].unison_phases(
+                        delta,
+                        osc.voice_count.into(),
+                        osc.voices_detune,
+                    );
+    
+                    let osc_out = self.waves.select(&osc.wave).tables[index]
+                        .generate_multi_pm(&phases, osc.voice_count.into(), osc2_out * osc.pm)
+                        / osc.voice_count as f32;
+                    out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
                 }
-                _ => {}
-            };
-
-            // Process filter
-            voice.filter.set_params(
-                self.sample_rate as f32,
-                cutoff,
-                self.filter_controller.resonance,
-            );
-            out = voice.filter.process(out * self.filter_controller.drive);
-
-            // amplitude envelope
-            out = if let Some(release_time) = voice.release_time {
-                let release_index = release_time as f32 / self.sample_rate as f32;
-                out * self
-                    .gain_envelope
-                    .sample_released(release_index, envelope_index)
-            } else {
-                out * self.gain_envelope.sample_held(envelope_index)
-            };
-
-            *out_l += out;
-            *out_r += out;
+    
+                // Update filter controls, calculate keytrack
+                let voice_freq =
+                    2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
+    
+                let cutoff = self.filter_controller.get_cutoff(
+                    voice_freq,
+                    envelope_index,
+                    voice.release_time,
+                    self.sample_rate as f32,
+                );
+                voice.filter.set(
+                    self.filter_controller.filter_model,
+                    cutoff,
+                    self.filter_controller.resonance,
+                    self.sample_rate as f32,
+                    self.filter_controller.filter_type,
+                );
+                voice
+                    .filter
+                    .set_filter_type(self.filter_controller.filter_type);
+    
+                match voice.filter {
+                    // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
+                    // keep the levels the same when switching filter.
+                    filter::FilterContainer::BiquadFilter(_) | filter::FilterContainer::None => {
+                        self.filter_controller.drive = self.filter_controller.drive.min(1.0)
+                    }
+                    _ => {}
+                };
+    
+                // Process filter
+                voice.filter.set_params(
+                    self.sample_rate as f32,
+                    cutoff,
+                    self.filter_controller.resonance,
+                );
+                out = voice.filter.process(out * self.filter_controller.drive);
+    
+                // amplitude envelope
+                out = if let Some(release_time) = voice.release_time {
+                    let release_index = release_time as f32 / self.sample_rate as f32;
+                    out * self
+                        .gain_envelope
+                        .sample_released(release_index, envelope_index)
+                } else {
+                    out * self.gain_envelope.sample_held(envelope_index)
+                };
+    
+                *out_l += out;
+                *out_r += out;
+            }
         }
-        *out_l *= self.output_volume;
-        *out_r *= self.output_volume;
+        // Apply output volume
+        for (out_l, out_r) in izip!(output_left, output_right) {
+            *out_l *= self.output_volume;
+            *out_r *= self.output_volume;
+        }
     }
     pub fn pitch_bend(&mut self, bend: u16) {
         let bend = (bend as i32 - 8192) as f32 / 8192.0 * self.bend_range;
