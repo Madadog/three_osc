@@ -149,8 +149,8 @@ impl ThreeOsc {
         for voice in self.voices.iter_mut() {
             let velocity = voice.velocity as f32 / 128.0;
             let index = voice.id as usize;
-            let voice_delta = voice.voice_delta(self.sample_rate as f32);
             voice.detune = self.octave_detune;
+            let voice_delta = voice.voice_delta(self.sample_rate as f32);
             let osc3_delta = self.oscillators[2].pitch_mult_delta(voice_delta);
             let osc2_delta = self.oscillators[1].pitch_mult_delta(voice_delta);
             let osc1_delta = self.oscillators[0].pitch_mult_delta(voice_delta);
@@ -314,7 +314,7 @@ impl Voice {
             osc_voice,
             velocity,
             filter: filter::FilterContainer::None,
-            detune: 0.0,
+            detune: 1.0,
         }
     }
     pub fn release(&mut self) {
