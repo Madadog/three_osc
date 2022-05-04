@@ -4,6 +4,8 @@ use itertools::izip;
 
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
+use self::filter::FilterContainer;
+use self::filter::FilterModel;
 use self::notes::Notes;
 use self::oscillator::modulate_delta;
 use self::oscillator::AdditiveOsc;
@@ -145,79 +147,95 @@ impl ThreeOsc {
 
         // Write samples from all voices
         for voice in self.voices.iter_mut() {
+            let velocity = voice.velocity as f32 / 128.0;
+            let index = voice.id as usize;
+            let voice_delta = voice.voice_delta(self.sample_rate as f32);
+            voice.detune = self.octave_detune;
+            let osc3_delta = self.oscillators[2].pitch_mult_delta(voice_delta);
+            let osc2_delta = self.oscillators[1].pitch_mult_delta(voice_delta);
+            let osc1_delta = self.oscillators[0].pitch_mult_delta(voice_delta);
+            
+            let keytrack_freq =
+            2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
+
+
+            voice
+                .filter
+                .set_filter_type(self.filter_controller.filter_type);
+
+            match voice.filter {
+                // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
+                // keep the levels the same when switching filter.
+                FilterContainer::BiquadFilter(_) | FilterContainer::None => {
+                    self.filter_controller.drive = self.filter_controller.drive.min(1.0)
+                }
+                _ => {}
+            };
+
             for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
+                let mut out = 0.0;
+
                 voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
-                let mut out = 0.0;
-                let velocity = voice.velocity as f32 / 128.0;
-                let index = voice.id as usize;
-                let voice_delta = voice.voice_delta(self.sample_rate as f32);
-                voice.detune = self.octave_detune;
     
-                let osc3_out = if let Some(osc) = self.oscillators.get(2) {
-                    let delta = osc.pitch_mult_delta(voice_delta);
+                let osc3_out = {
+                    let osc = &self.oscillators[2];
                     let phases = voice.osc_voice[2].unison_phases(
-                        delta,
+                        osc3_delta,
                         osc.voice_count.into(),
                         osc.voices_detune,
                     );
                     let osc_out = self.waves.select(&osc.wave).tables[index]
-                        .generate_multi(phases, osc.voice_count.into())
-                        / osc.voice_count as f32;
+                    .generate_multi(phases, osc.voice_count.into())
+                    / osc.voice_count as f32;
                     out += osc_out * osc.amp * velocity;
                     osc_out
-                } else {
-                    unreachable!("Osc3 wasn't found...");
                 };
-    
-                let osc2_out = if let Some(osc) = self.oscillators.get(1) {
-                    let delta = osc.pitch_mult_delta(voice_delta);
-                    let delta = modulate_delta(delta, osc3_out * osc.fm, self.sample_rate as f32);
+                
+                let osc2_out = {
+                    let osc = &self.oscillators[1];
+                    let delta = modulate_delta(osc2_delta, osc3_out * osc.fm);
                     let phases = voice.osc_voice[1].unison_phases(
                         delta,
                         osc.voice_count.into(),
                         osc.voices_detune,
                     );
-    
+                    
                     let mut osc_out = self.waves.select(&osc.wave).tables[index]
-                        .generate_multi_pm(
-                            &phases,
-                            osc.voice_count.into(),
+                    .generate_multi_pm(
+                        &phases,
+                        osc.voice_count.into(),
                         osc3_out * osc.pm,
-                        ) / osc.voice_count as f32;
+                    ) / osc.voice_count as f32;
                     osc_out *= lerp(1.0, osc3_out, osc.am);
                     out += osc_out * osc.amp * velocity;
                     osc_out
-                } else {
-                    unreachable!("Osc2 wasn't found...");
                 };
-    
-                if let Some(osc) = self.oscillators.get(0) {
-                    let delta = osc.pitch_mult_delta(voice_delta);
+                
+                {
+                    let osc = &self.oscillators[0];
                     let delta =
-                        modulate_delta(delta, osc2_out * osc.fm, self.sample_rate as f32).abs();
+                        modulate_delta(osc1_delta, osc2_out * osc.fm).abs();
                     let phases = voice.osc_voice[0].unison_phases(
                         delta,
                         osc.voice_count.into(),
                         osc.voices_detune,
                     );
-    
+                    
                     let osc_out = self.waves.select(&osc.wave).tables[index]
                         .generate_multi_pm(&phases, osc.voice_count.into(), osc2_out * osc.pm)
                         / osc.voice_count as f32;
                     out += osc_out * osc.amp * velocity * lerp(1.0, osc2_out, osc.am);
                 }
     
-                // Update filter controls, calculate keytrack
-                let voice_freq =
-                    2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
-    
+                // Update filter controls
                 let cutoff = self.filter_controller.get_cutoff(
-                    voice_freq,
+                    keytrack_freq,
                     envelope_index,
                     voice.release_time,
                     self.sample_rate as f32,
                 );
+
                 voice.filter.set(
                     self.filter_controller.filter_model,
                     cutoff,
@@ -225,18 +243,6 @@ impl ThreeOsc {
                     self.sample_rate as f32,
                     self.filter_controller.filter_type,
                 );
-                voice
-                    .filter
-                    .set_filter_type(self.filter_controller.filter_type);
-    
-                match voice.filter {
-                    // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
-                    // keep the levels the same when switching filter.
-                    filter::FilterContainer::BiquadFilter(_) | filter::FilterContainer::None => {
-                        self.filter_controller.drive = self.filter_controller.drive.min(1.0)
-                    }
-                    _ => {}
-                };
     
                 // Process filter
                 voice.filter.set_params(

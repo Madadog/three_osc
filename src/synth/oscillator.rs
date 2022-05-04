@@ -176,7 +176,7 @@ impl OscWave {
     }
 }
 
-pub fn modulate_delta(delta: f32, linear_fm: f32, sample_rate: f32) -> f32 {
+pub fn modulate_delta(delta: f32, linear_fm: f32) -> f32 {
     // `linear_fm` is expected to be between -1.0 and 1.0,
     // must be stretched out.
     let linear_fm = linear_fm * 125.0;
