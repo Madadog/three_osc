@@ -28,7 +28,7 @@ pub struct ThreeOsc {
     pub polyphony: Polyphony,
     pub octave_detune: f32,
     pub portamento_rate: f32,
-    pub portamento_note: Option<f32>,
+    pub portamento_offset: f32,
 }
 
 impl ThreeOsc {
@@ -57,8 +57,8 @@ impl ThreeOsc {
             bend_range: 2.0,
             polyphony: Polyphony::Polyphonic,
             octave_detune: 1.0,
-            portamento_rate: 1.0,
-            portamento_note: None,
+            portamento_rate: 0.1,
+            portamento_offset: 0.0,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -66,22 +66,28 @@ impl ThreeOsc {
 
         match &self.polyphony {
             Polyphony::Polyphonic => {
+                let mut new_voice = Voice::from_midi_note(note, velocity, &self.oscillators);
+                new_voice.semitone_detune += self.portamento_offset;
                 self.voices
-                    .push(Voice::from_midi_note(note, velocity, &self.oscillators))
+                    .push(new_voice)
             }
             Polyphony::Legato | Polyphony::Monophonic => {
                 if let Some(voice) = self.voices.last_mut() {
+                    voice.semitone_detune = voice.id as f32 - note as f32 + voice.semitone_detune;
                     voice.id = note as u32;
                     voice.velocity = velocity;
 
                     // If the note is released, or if we are in monophonic mode, retrigger it.
                     if matches!(self.polyphony, Polyphony::Monophonic) || voice.release_time.is_some() {
+                        voice.semitone_detune += self.portamento_offset;
                         voice.release_time = None;
                         voice.runtime = 0;
                     }
                 } else {
+                    let mut new_voice = Voice::from_midi_note(note, velocity, &self.oscillators);
+                    new_voice.semitone_detune += self.portamento_offset;
                     self.voices
-                        .push(Voice::from_midi_note(note, velocity, &self.oscillators))
+                        .push(new_voice)
                 }
             }
         }
@@ -104,7 +110,7 @@ impl ThreeOsc {
                 .iter_mut()
                 .filter(|voice| voice.id == note as u32)
                 .for_each(|voice| {
-                    let nearest_note = self.notes.notes.iter().reduce(|accum, note| {
+                    let latest_note = self.notes.notes.iter().reduce(|accum, note| {
                         if note.age() < accum.age() {
                             note
                         } else {
@@ -113,10 +119,12 @@ impl ThreeOsc {
                     });
 
                     
-                    if let Some(note) = nearest_note {
+                    if let Some(note) = latest_note {
+                        voice.semitone_detune = voice.id as f32 + voice.semitone_detune - note.id as f32;
                         voice.id = note.id as u32;
                         // Retrigger notes when releasing keys in Monophonic mode
                         if matches!(self.polyphony, Polyphony::Monophonic) {
+                            voice.semitone_detune += self.portamento_offset;
                             voice.release_time = None;
                             voice.runtime = 0;
                         }
@@ -145,24 +153,19 @@ impl ThreeOsc {
         self.release_voices();
         self.filter_controller.cutoff = self.filter_controller.target_cutoff;
 
+
         // Write samples from all voices
         for voice in self.voices.iter_mut() {
             let velocity = voice.velocity as f32 / 128.0;
             let index = voice.id as usize;
-            voice.detune = self.octave_detune;
-            let voice_delta = voice.voice_delta(self.sample_rate as f32);
-            let osc3_delta = self.oscillators[2].pitch_mult_delta(voice_delta);
-            let osc2_delta = self.oscillators[1].pitch_mult_delta(voice_delta);
-            let osc1_delta = self.oscillators[0].pitch_mult_delta(voice_delta);
+
+            voice.pitch_multiply = self.octave_detune;
             
-            let keytrack_freq =
-            2.0_f32.powf((voice.id as f32 - 69.0) / 12.0 * self.filter_controller.keytrack);
-
-
+            
             voice
-                .filter
-                .set_filter_type(self.filter_controller.filter_type);
-
+            .filter
+            .set_filter_type(self.filter_controller.filter_type);
+            
             match voice.filter {
                 // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
                 // keep the levels the same when switching filter.
@@ -171,8 +174,18 @@ impl ThreeOsc {
                 }
                 _ => {}
             };
-
+            
             for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
+                voice.semitone_detune = lerp(voice.semitone_detune, 0.0, self.portamento_rate);
+
+                let voice_delta = voice.voice_delta(self.sample_rate as f32);
+                let osc3_delta = self.oscillators[2].pitch_mult_delta(voice_delta);
+                let osc2_delta = self.oscillators[1].pitch_mult_delta(voice_delta);
+                let osc1_delta = self.oscillators[0].pitch_mult_delta(voice_delta);
+                
+                let keytrack_freq =
+                2.0_f32.powf((voice.id as f32 - 69.0 + voice.semitone_detune) / 12.0 * self.filter_controller.keytrack);
+
                 let mut out = 0.0;
 
                 voice.advance();
@@ -297,7 +310,8 @@ pub struct Voice {
     osc_voice: [SuperVoice; 3],
     filter: filter::FilterContainer,
     velocity: u8,
-    detune: f32,
+    pitch_multiply: f32,
+    semitone_detune: f32,
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, osc: &[BasicOscillator]) -> Self {
@@ -314,7 +328,8 @@ impl Voice {
             osc_voice,
             velocity,
             filter: filter::FilterContainer::None,
-            detune: 1.0,
+            pitch_multiply: 1.0,
+            semitone_detune: 0.0,
         }
     }
     pub fn release(&mut self) {
@@ -326,8 +341,8 @@ impl Voice {
         self.runtime += 1;
     }
     pub fn voice_delta(&self, sample_rate: f32) -> f32 {
-        2.0 * PI * 440.0 * 2.0_f32.powf(((self.id as i16 - 69) as f32 * self.detune) / 12.0)
-            / sample_rate //* (1.0 + self.detune)
+        2.0 * PI * 440.0 * 2.0_f32.powf((((self.id as i16 - 69) as f32 + self.semitone_detune) * self.pitch_multiply) / 12.0)
+            / sample_rate
     }
 }
 

@@ -58,8 +58,7 @@ Coming soon...
 
 ## TODO
 * Choose oscillator wavetable using delta instead of midi input pitch.
-* Portamento
-* Process samples in buffer if possible
+* Use audio buffering for more optimisations
 * Rescale resonance control max from 10.0 to 1.0?
 * Add vibrato control / LFO
 * PWM

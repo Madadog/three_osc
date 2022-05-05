@@ -87,7 +87,7 @@ fn main() {
     }
 
     // prepare global controls
-    let volume_envelope = PortList::envelope().prefix("vol_", "Vol ");
+    let volume_envelope = PortList::envelope().prefix("vol_", "Volume ");
     let global_controls = PortList::global();
 
     // add global ports
@@ -407,6 +407,16 @@ impl PortList {
                     "Legato".to_string(),
                 ]),
             ).comment("Polyphonic means an infinite number of notes can be played simultaneously. Monophonic means only one note can be played at a time. Legato is the same as monophonic, except notes are connected; envelopes / oscillator phases won't reset when gliding between notes."),
+            ControlPort::new(
+                "portamento_rate",
+                "Portamento",
+                Float(0.25, (0.0, 0.999)),
+            ).comment("How slowly note pitch will glide to a new note. In Polyphonic mode, this only affects Portamento Offset."),
+            ControlPort::new(
+                "pitch_offset",
+                "Portamento Offset",
+                Float(0.0, (-96., 96.)),
+            ).comment("Initial pitch shift at the start of a note."),
             ControlPort::new(
                 "octave_detune",
                 "Octave Drift",

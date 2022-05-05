@@ -71,6 +71,8 @@ struct Ports {
     vol_release: InputPort<Control>,
     vol_slope: InputPort<Control>,
     polyphony: InputPort<Control>,
+    portamento_rate: InputPort<Control>,
+    pitch_offset: InputPort<Control>,
     octave_detune: InputPort<Control>,
     output_gain: InputPort<Control>,
     global_pitch: InputPort<Control>,
@@ -125,6 +127,12 @@ impl Plugin for SynthLv2 {
             x if x < 2.0 => Polyphony::Monophonic,
             _ => Polyphony::Legato,
         };
+        // Scaling: This is a lerp, and must be proportional to the sample rate
+        // ... the '0.002' is just user-friendly control scaling.
+        // TODO: test and make sure this actually keeps time constant across sample rates
+        self.synth.portamento_rate = 1.0 - ports.portamento_rate.powf(0.002 * self.synth.sample_rate as f32 / 44100.0);
+        self.synth.portamento_offset = *ports.pitch_offset;
+
         // multiplies delta: smaller = higher pitch
         self.synth.octave_detune = 1.0 - *ports.octave_detune;
 

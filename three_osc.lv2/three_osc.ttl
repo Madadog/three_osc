@@ -616,7 +616,7 @@
                     lv2:ControlPort ;
                 lv2:index 48 ;
                 lv2:symbol "vol_attack" ;
-                lv2:name "Vol Attack" ;
+                lv2:name "Volume Attack" ;
                 lv2:default 0.001 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -627,7 +627,7 @@
                     lv2:ControlPort ;
                 lv2:index 49 ;
                 lv2:symbol "vol_decay" ;
-                lv2:name "Vol Decay" ;
+                lv2:name "Volume Decay" ;
                 lv2:default 0.250 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -638,7 +638,7 @@
                     lv2:ControlPort ;
                 lv2:index 50 ;
                 lv2:symbol "vol_sustain" ;
-                lv2:name "Vol Sustain" ;
+                lv2:name "Volume Sustain" ;
                 lv2:default 1.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -648,7 +648,7 @@
                     lv2:ControlPort ;
                 lv2:index 51 ;
                 lv2:symbol "vol_release" ;
-                lv2:name "Vol Release" ;
+                lv2:name "Volume Release" ;
                 lv2:default 0.005 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -659,7 +659,7 @@
                     lv2:ControlPort ;
                 lv2:index 52 ;
                 lv2:symbol "vol_slope" ;
-                lv2:name "Vol Slope" ;
+                lv2:name "Volume Slope" ;
                 lv2:default 1.000 ;
                 lv2:minimum -8.000 ;
                 lv2:maximum 8.000 ;
@@ -692,6 +692,26 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 54 ;
+                lv2:symbol "portamento_rate" ;
+                lv2:name "Portamento" ;
+                lv2:default 0.250 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 0.999 ;
+                rdfs:comment "How slowly note pitch will glide to a new note. In Polyphonic mode, this only affects Portamento Offset." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 55 ;
+                lv2:symbol "pitch_offset" ;
+                lv2:name "Portamento Offset" ;
+                lv2:default 0.000 ;
+                lv2:minimum -96.000 ;
+                lv2:maximum 96.000 ;
+                rdfs:comment "Initial pitch shift at the start of a note." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 56 ;
                 lv2:symbol "octave_detune" ;
                 lv2:name "Octave Drift" ;
                 lv2:default 0.000 ;
@@ -701,7 +721,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 55 ;
+                lv2:index 57 ;
                 lv2:symbol "output_gain" ;
                 lv2:name "Output Gain" ;
                 lv2:default -18.000 ;
@@ -711,7 +731,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 56 ;
+                lv2:index 58 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Master Pitch" ;
                 lv2:default 0 ;
@@ -723,7 +743,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 57 ;
+                lv2:index 59 ;
                 lv2:symbol "bend_range" ;
                 lv2:name "Bend Range" ;
                 lv2:default 2 ;
