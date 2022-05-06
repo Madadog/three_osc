@@ -201,7 +201,7 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[0].octave = *ports.osc1_octave as i32;
             // Frequency multiplication if Freq. Mult is positive, frequency division if negative.
             // (This is because negative multiplication would just reverse the wave, which is not very useful)
-            self.synth.oscillators[0].multiplier = if ports.osc1_multiplier.is_sign_positive() {
+            self.synth.oscillators[0].pitch_multiplier = if ports.osc1_multiplier.is_sign_positive() {
                 1.0 + *ports.osc1_multiplier
             } else {
                 1.0 / (1.0 - *ports.osc1_multiplier)
@@ -214,12 +214,12 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[0].pm = (*ports.osc1_pm).powi(2);
             self.synth.oscillators[0].fm = (*ports.osc1_fm).powi(2);
             self.synth.oscillators[0].am = (*ports.osc1_am).powi(2);
-
+            
             // osc2
             self.synth.oscillators[1].amp = *ports.osc2_amp / 100.0;
             self.synth.oscillators[1].semitone = *ports.osc2_semitone + *ports.global_pitch;
             self.synth.oscillators[1].octave = *ports.osc2_octave as i32;
-            self.synth.oscillators[1].multiplier = if ports.osc2_multiplier.is_sign_positive() {
+            self.synth.oscillators[1].pitch_multiplier = if ports.osc2_multiplier.is_sign_positive() {
                 1.0 + *ports.osc2_multiplier
             } else {
                 1.0 / (1.0 - *ports.osc2_multiplier)
@@ -232,12 +232,12 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[1].pm = (*ports.osc2_pm).powi(2);
             self.synth.oscillators[1].fm = (*ports.osc2_fm).powi(2);
             self.synth.oscillators[1].am = (*ports.osc2_am).powi(2);
-
+            
             // osc3
             self.synth.oscillators[2].amp = *ports.osc3_amp / 100.0;
             self.synth.oscillators[2].semitone = *ports.osc3_semitone + *ports.global_pitch;
             self.synth.oscillators[2].octave = *ports.osc3_octave as i32;
-            self.synth.oscillators[2].multiplier = if ports.osc3_multiplier.is_sign_positive() {
+            self.synth.oscillators[2].pitch_multiplier = if ports.osc3_multiplier.is_sign_positive() {
                 1.0 + *ports.osc3_multiplier
             } else {
                 1.0 / (1.0 - *ports.osc3_multiplier)
@@ -248,12 +248,12 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[2].phase_rand = *ports.osc3_phase_rand * 2.0 * PI / 100.0;
             self.synth.oscillators[2].wave = OscWave::from_index(*ports.osc3_wave);
         }
-
+        
         let control_sequence = ports
-            .midi
-            .read(self.urids.atom.sequence, self.urids.unit.beat)
-            .unwrap();
-
+        .midi
+        .read(self.urids.atom.sequence, self.urids.unit.beat)
+        .unwrap();
+        
         for (timestamp, message) in control_sequence {
             let _timestamp: usize = if let Some(timestamp) = timestamp.as_frames() {
                 timestamp as usize

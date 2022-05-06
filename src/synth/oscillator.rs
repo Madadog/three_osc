@@ -33,7 +33,7 @@ impl SuperVoice {
             .take(voice_count)
             .enumerate()
             .for_each(|(i, phase): (usize, &mut f32)| {
-                let i = i as f32 - (i % 2) as f32 * 2.0;
+                let i = i as i32 - ((i % 2) * i * 2) as i32;
                 let delta = delta + delta * i as f32 * detune / (voice_count as f32);
                 *phase = (*phase + delta) % (2.0 * PI);
             });
@@ -61,15 +61,17 @@ impl SuperVoice {
 }
 
 #[derive(Debug, Clone)]
-/// Each voice generating a wave reads BasicOscillator once per sample,
+/// Each voice generating a wave reads OscillatorParams once per sample,
 /// and applies its current parameters to the generated wave.
-pub struct BasicOscillator {
+pub struct OscillatorParams {
     pub amp: f32,
     // TODO: Condense frequency manipulation parameters. Can probably just be two parameters
     // (Freq. Multiplier and Pitch Bend) which expose multiple controls in the gui.
     pub semitone: f32,
     pub octave: i32,
-    pub multiplier: f32,
+    pub pitch_multiplier: f32,
+
+    total_multiplier: f32,
 
     pub voice_count: u8,
     pub voices_detune: f32,
@@ -78,27 +80,31 @@ pub struct BasicOscillator {
     pub phase_rand: f32,
     pub pitch_bend: f32,
 
-    // Modulation multipliers. Not actually used by `BasicOscillator` itself, but it's
-    // closely associated and I have no idea where else to put it since there's no
-    // "modulation matrix" yet.
     pub fm: f32,
     pub pm: f32,
     pub am: f32,
 }
-impl BasicOscillator {
-    pub fn pitch_mult_delta(&self, delta: f32) -> f32 {
-        delta
-            * 2.0_f32.powf((self.semitone + self.pitch_bend) / 12.0 + self.octave as f32)
-            * self.multiplier
+impl OscillatorParams {
+    fn calc_pitch_mult(&self) -> f32 {
+        2.0_f32.powf((self.semitone + self.pitch_bend) / 12.0 + self.octave as f32)
+            * self.pitch_multiplier
     }
+    pub fn semitone_detune(&self) -> f32 {
+        self.semitone + self.pitch_bend + self.octave as f32 * 12.0
+    }
+    pub fn update_total_pitch(&mut self) {
+        self.total_multiplier = self.calc_pitch_mult()
+    }
+    pub fn total_pitch_multiplier(&self) -> f32 { self.total_multiplier }
 }
-impl Default for BasicOscillator {
+impl Default for OscillatorParams {
     fn default() -> Self {
         Self {
             amp: 1.0,
             semitone: Default::default(),
             octave: Default::default(),
-            multiplier: 1.0,
+            pitch_multiplier: 1.0,
+            total_multiplier: 1.0,
             voice_count: 1,
             voices_detune: 0.1,
             wave: OscWave::Sine,
@@ -257,11 +263,11 @@ impl Wavetable {
     #[inline]
     // TODO: This is very slow, compared to the index above
     pub fn index_lerp(&self, index: f32) -> f32 {
-        let index_1 = index as usize % self.table.len();
-        let index_2 = (index_1 + 1) % self.table.len();
-        let from = self.table[index_1];
-        let to = self.table[index_2];
-        lerp(from, to, index.fract())
+        let index_floor = index as usize;
+        let index_next = (index_floor + 1) % self.table.len();
+        let from = self.table[index_floor];
+        let to = self.table[index_next];
+        lerp(from, to, index - index_floor as f32)
     }
     #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
@@ -301,7 +307,8 @@ impl Wavetable {
     }
 }
 
-/// Wave generator with a unique wavetable for each midi note index.
+/// Wave generator with a unique wavetable for each midi note index (extended to the 44.1 kHz
+/// Nyquist frequency, so 138 notes).
 ///
 /// Wavetables can be trivially bandlimited by generating each table with additive synthesis
 /// with harmonics up to the Nyquist frequency. The table can then be sampled for cheap,
@@ -323,14 +330,27 @@ impl Wavetable {
 /// The artifacts could be reduced further by using better interpolation (with a derivative closer
 /// to that of the original signal).
 pub struct WavetableNotes {
-    pub tables: [Wavetable; 128],
+    pub tables: [Wavetable; 138],
 }
 #[allow(dead_code)]
 impl WavetableNotes {
     /// Returns `index` from the equation
     /// `440.0 * 2.0_f32.powf(index / 12.0) = frequency`
     pub fn frequency_to_note(frequency: f32) -> usize {
-        (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 127)
+        (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 137)
+    }
+    /// Returns `index` from the equation
+    /// `(2.0 * PI * 440.0 * 2.0_f32.powf(index / 12.0)) = delta * sample_rate`
+    pub fn delta_to_note(delta: f32, sample_rate: f32) -> usize {
+        (((sample_rate * delta / (440.0 * 2.0 * PI)).log2() * 12.0 + 69.0).ceil() as usize).clamp(0, 137)
+    }
+    /// Returns the appropriate wavetable corresponding to `delta` at `sample_rate`
+    pub fn delta_index(&self, delta: f32, sample_rate: f32) -> &Wavetable {
+        &self.tables[WavetableNotes::delta_to_note(delta, sample_rate)]
+    }
+    /// Returns the appropriate wavetable corresponding to `frequency`
+    pub fn frequency_index(&self, frequency: f32) -> &Wavetable {
+        &self.tables[WavetableNotes::frequency_to_note(frequency)]
     }
     /// Create a bandlimited wavetable for each midi note from a base additive function.
     ///
@@ -341,9 +361,9 @@ impl WavetableNotes {
     /// Limiting `max_table_len` mostly prevents low notes from growing too big (given you have `(sample_rate * max_oversample) / note_freq` samples per table)
     /// at the expense of sample quality.
     ///
-    /// Increasing `min_table_len` emulates increased oversampling for higher notes which, for reasons I don't fully understand, require much more oversampling
-    /// than the middle notes to achieve comparative noise reduction. E.g. a note at 2000 Hz requires 22.05 samples, so a `min_table_len` of 2560 is equivalent
-    /// to 116 times oversampling which is usually enough.
+    /// Increasing `min_table_len` emulates increased oversampling for higher notes which, for reasons I now understand, require much more oversampling
+    /// than the middle notes to achieve comparative noise reduction. E.g. a note at 2000 Hz theoretically requires a minimum of 22.05 samples, so a
+    /// `min_table_len` of 2560 is equivalent to 116 times oversampling which is usually enough.
     ///
     /// Note that all other wavetable synths just use wavetable lengths that are powers of two, because they use FFTs. Of course, a need for FFTs implies
     /// that you're reading user samples or doing spectral manipulation, both of which are beyond the scope of this synth. Inverse FFTs, on the other hand, will
@@ -359,23 +379,28 @@ impl WavetableNotes {
             max_oversample >= 1.0,
             "Oversampling factor should be 1.0 or greater"
         );
-        let tables: Vec<Wavetable> = (0..128)
+        let tables: Vec<Wavetable> = (0..138)
             .into_iter()
             .map(|x| {
-                // Sample length required for note
-                (max_oversample * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
+                if x == 137 {
+                    // highest note has no harmonics, so notes above nyquist are silent
+                    1
+                } else {
+                    // Sample length required for note
+                    (max_oversample * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
                     .ceil() as usize
+                }
             })
             .map(|len| {
                 let clamped_len = len.clamp(min_table_len, max_table_len);
                 // Ensure waveform is bandlimited
                 let harmonics =
-                    ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len / 2);
+                ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len / 2);
                 Wavetable::from_additive_osc(osc, clamped_len, harmonics)
             })
             .collect();
-        Self {
-            tables: tables.try_into().unwrap(),
+            Self {
+                tables: tables.try_into().unwrap(),
         }
     }
     /// `WavetableNotes::from_additive_osc()` with constant table length
@@ -391,12 +416,17 @@ impl WavetableNotes {
             oversampling_factor >= 1.0,
             "Oversampling factor should be 1.0 or greater"
         );
-        let tables: Vec<Wavetable> = (0..128)
-            .into_iter()
-            .map(|x| {
+        let tables: Vec<Wavetable> = (0..138)
+        .into_iter()
+        .map(|x| {
+            if x == 128 {
+                // highest note has no harmonics, so notes above nyquist are silent
+                1
+            } else {
                 // Number of harmonics required for note
                 (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).floor()
                     as usize
+                }
             })
             .map(|harmonics| {
                 // clamp to nyquist
