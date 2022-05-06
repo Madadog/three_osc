@@ -57,10 +57,8 @@ Coming soon...
     * Originally had no bandlimited wave generation.
 
 ## TODO
-* Choose oscillator wavetable using delta instead of midi input pitch.
-* Use audio buffering for more optimisations
-* Rescale resonance control max from 10.0 to 1.0?
 * Add vibrato control / LFO
+* Use naive wave generation for modulation (stop ringing artifacts)
 * PWM
 * Stereo
 * Figure out how many controls can fit on the UI before Ardour adds a scroll bar
@@ -73,6 +71,7 @@ Coming soon...
 * Switch between Naive, Wavetable, and Additive synthesis with a control
 * Make the build system nicer
 * Tools for working with the harmonic series
+* Use audio buffering for more optimisations
 * Optimise
 * Delete LV2, switch to VST and add gui with egui
 
