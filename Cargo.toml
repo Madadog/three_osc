@@ -11,6 +11,5 @@ crate-type = ["cdylib"]
 [dependencies]
 lv2 = "0.6.0"
 wmidi = "3.1.0"#wmidi = "4.0.6"
-lyon_geom = "0.17.6"
 fastrand = "1.7.0"
 itertools = "0.10.3"
