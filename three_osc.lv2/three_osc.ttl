@@ -538,7 +538,8 @@
                 lv2:default 1.000 ;
                 lv2:minimum 0.010 ;
                 lv2:maximum 10.000 ;
-                rdfs:comment "Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to protect ears." ;
+                lv2:portProperty props:logarithmic ;
+                rdfs:comment "Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to keep volume equal between filters." ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;

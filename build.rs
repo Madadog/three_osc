@@ -551,7 +551,8 @@ impl PortList {
                 "drive",
                 "Drive",
                 Float(1.0, (0.01, 10.0)),
-            ).comment("Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to protect ears."),
+            ).logarithmic()
+            .comment("Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to keep volume equal between filters."),
         ])
     }
 }
