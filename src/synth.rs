@@ -155,10 +155,13 @@ impl ThreeOsc {
         self.oscillators[1].update_total_pitch();
         self.oscillators[2].update_total_pitch();
 
+        let osc1_unison_amp = 1.0 / (self.oscillators[0].voice_count as f32).sqrt();
+        let osc2_unison_amp = 1.0 / (self.oscillators[1].voice_count as f32).sqrt();
+        let osc3_unison_amp = 1.0 / (self.oscillators[2].voice_count as f32).sqrt();
+
         // Write samples from all voices
         for voice in self.voices.iter_mut() {
             let velocity = voice.velocity as f32 / 128.0;
-            let index = voice.id as usize;
 
             voice.pitch_multiply = self.octave_detune;
 
@@ -205,7 +208,7 @@ impl ThreeOsc {
                     );
                     let osc_out = self.waves.select(&osc.wave).delta_index(osc3_delta, self.sample_rate as f32)
                         .generate_multi(phases, osc.voice_count.into())
-                        / osc.voice_count as f32;
+                        * osc3_unison_amp;
                     out += osc_out * osc.amp * velocity;
                     osc_out
                 } else { 0.0 };
@@ -224,7 +227,7 @@ impl ThreeOsc {
 
                     let mut osc_out = self.waves.select(&osc.wave).delta_index(osc2_delta, self.sample_rate as f32)
                         .generate_multi_pm(&phases, osc.voice_count.into(), osc3_out * osc.pm)
-                        / osc.voice_count as f32;
+                        * osc2_unison_amp;
                     osc_out *= lerp(1.0, (osc3_out + 1.0) / 2.0, osc.am);
                     out += osc_out * osc.amp * velocity;
                     osc_out
@@ -244,7 +247,7 @@ impl ThreeOsc {
                         &phases,
                         osc.voice_count.into(),
                         osc2_out * osc.pm,
-                    ) / osc.voice_count as f32;
+                    ) * osc1_unison_amp;
                     out += osc_out * osc.amp * velocity * lerp(1.0, (osc2_out + 1.0) / 2.0, osc.am);
                 }
 
