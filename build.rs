@@ -411,10 +411,10 @@ impl PortList {
                 "portamento_rate",
                 "Portamento",
                 Float(0.25, (0.0, 0.999)),
-            ).comment("How slowly note pitch will glide to a new note. In Polyphonic mode, this only affects Portamento Offset."),
+            ).comment("How slowly note pitch will glide to a new note. In Polyphonic mode, this only affects Pitch Slide."),
             ControlPort::new(
                 "pitch_offset",
-                "Portamento Offset",
+                "Pitch Slide",
                 Float(0.0, (-96., 96.)),
             ).comment("Initial pitch shift at the start of a note."),
             ControlPort::new(

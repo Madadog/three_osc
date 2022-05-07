@@ -697,13 +697,13 @@
                 lv2:default 0.250 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 0.999 ;
-                rdfs:comment "How slowly note pitch will glide to a new note. In Polyphonic mode, this only affects Portamento Offset." ;
+                rdfs:comment "How slowly note pitch will glide to a new note. In Polyphonic mode, this only affects Pitch Slide." ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 55 ;
                 lv2:symbol "pitch_offset" ;
-                lv2:name "Portamento Offset" ;
+                lv2:name "Pitch Slide" ;
                 lv2:default 0.000 ;
                 lv2:minimum -96.000 ;
                 lv2:maximum 96.000 ;
