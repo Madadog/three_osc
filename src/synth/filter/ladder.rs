@@ -313,7 +313,7 @@ impl Filter for LadderFilter {
         // Retune makes pitch accurate when resonance == 0.5
         self.cutoff_frequency = (cutoff as f64 / 7000.0) + 0.0001;
         // Self-resonance starts at resonance >= 0.5
-        self.resonance = (resonance / 10.0).powi(2) as f64;
+        self.resonance = (resonance / 16.6) as f64;
         self.set_sample_rate(sample_rate as f64);
     }
 

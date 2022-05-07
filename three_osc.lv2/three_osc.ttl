@@ -525,8 +525,9 @@
                 lv2:symbol "fil1_resonance" ;
                 lv2:name "Filter 1 Resonance" ;
                 lv2:default 0.700 ;
-                lv2:minimum 0.010 ;
+                lv2:minimum 0.100 ;
                 lv2:maximum 10.000 ;
+                lv2:portProperty props:logarithmic ;
                 rdfs:comment "Adds feedback to the filter loop, creating a volume spike at the filter's cutoff frequency. On the RC and Ladder filters, setting this high enough creates a self-sustaining sine wave." ;
         ] , [
                 a lv2:InputPort ,

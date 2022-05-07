@@ -469,7 +469,7 @@ impl Filter for RcFilter {
         self.rcb = 1.0 - self.rca;
         self.rcc = freq / (freq + delta);
 
-        self.rcq = resonance * 0.25;
+        self.rcq = resonance * 0.245;
     }
     fn set_filter_type(&mut self, filter_type: FilterType) {
         self.filter_type = filter_type;

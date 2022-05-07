@@ -544,8 +544,9 @@ impl PortList {
             ControlPort::new(
                 "resonance",
                 "Resonance",
-                Float(0.7, (0.01, 10.0)),
-            ).comment("Adds feedback to the filter loop, creating a volume spike at the filter's cutoff frequency. On the RC and Ladder filters, setting this high enough creates a self-sustaining sine wave."),
+                Float(0.7, (0.1, 10.0)),
+            ).logarithmic()
+            .comment("Adds feedback to the filter loop, creating a volume spike at the filter's cutoff frequency. On the RC and Ladder filters, setting this high enough creates a self-sustaining sine wave."),
             ControlPort::new(
                 "drive",
                 "Drive",
