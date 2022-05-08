@@ -5,8 +5,9 @@ use itertools::izip;
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
 use self::filter::FilterContainer;
-use self::filter::FilterModel;
 use self::notes::Notes;
+use self::oscillator::OscVoice;
+use self::oscillator::OscWave;
 use self::oscillator::modulate_delta;
 use self::oscillator::AdditiveOsc;
 use self::oscillator::OscillatorParams;
@@ -29,6 +30,7 @@ pub struct ThreeOsc {
     pub octave_detune: f32,
     pub portamento_rate: f32,
     pub portamento_offset: f32,
+    pub lfo_params: LfoParams,
 }
 
 impl ThreeOsc {
@@ -59,6 +61,7 @@ impl ThreeOsc {
             octave_detune: 1.0,
             portamento_rate: 0.1,
             portamento_offset: 0.0,
+            lfo_params: Default::default(),
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -155,6 +158,8 @@ impl ThreeOsc {
         self.oscillators[1].update_total_pitch();
         self.oscillators[2].update_total_pitch();
 
+        let lfo_delta = self.lfo_params.delta(self.sample_rate as f32);
+
         let osc1_unison_amp = 1.0 / (self.oscillators[0].voice_count as f32).sqrt();
         let osc2_unison_amp = 1.0 / (self.oscillators[1].voice_count as f32).sqrt();
         let osc3_unison_amp = 1.0 / (self.oscillators[2].voice_count as f32).sqrt();
@@ -186,6 +191,24 @@ impl ThreeOsc {
                 let osc2_delta = delta * self.oscillators[1].total_pitch_multiplier();
                 let osc1_delta = delta * self.oscillators[0].total_pitch_multiplier();
 
+                let lfo_phase = voice.lfo.add_phase(lfo_delta);
+                let lfo = self.lfo_params.wave.generate(lfo_phase);
+                let (osc1_delta, osc2_delta, osc3_delta) = (
+                    osc1_delta + osc1_delta * lfo * self.lfo_params.freq_mod,
+                    osc2_delta + osc2_delta * lfo * self.lfo_params.freq_mod,
+                    osc3_delta + osc3_delta * lfo * self.lfo_params.freq_mod,
+                );
+                let (osc1_lfo_amp, osc2_lfo_amp, osc3_lfo_amp) = (
+                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
+                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
+                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
+                );
+                let (osc1_lfo_mod, osc2_lfo_mod, osc3_lfo_mod) = (
+                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
+                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
+                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
+                );
+
                 let keytrack_freq = 2.0_f32.powf(
                     (voice.id as f32 - 69.0 + voice.semitone_detune) / 12.0
                         * self.filter_controller.keytrack,
@@ -209,8 +232,8 @@ impl ThreeOsc {
                     let osc_out = self.waves.select(&osc.wave).delta_index(osc3_delta, self.sample_rate as f32)
                         .generate_multi(phases, osc.voice_count.into())
                         * osc3_unison_amp;
-                    out += osc_out * osc.amp * velocity;
-                    osc_out
+                    out += osc_out * osc.amp * velocity * osc3_lfo_amp;
+                    osc_out * osc3_lfo_mod
                 } else { 0.0 };
 
                 let osc2_out = if self.oscillators[1].amp > 0.0
@@ -229,8 +252,8 @@ impl ThreeOsc {
                         .generate_multi_pm(&phases, osc.voice_count.into(), osc3_out * osc.pm)
                         * osc2_unison_amp;
                     osc_out *= lerp(1.0, (osc3_out + 1.0) / 2.0, osc.am);
-                    out += osc_out * osc.amp * velocity;
-                    osc_out
+                    out += osc_out * osc.amp * velocity * osc2_lfo_amp;
+                    osc_out * osc2_lfo_mod
                 } else {0.0};
 
                 if self.oscillators[0].amp > 0.0 {
@@ -248,12 +271,12 @@ impl ThreeOsc {
                         osc.voice_count.into(),
                         osc2_out * osc.pm,
                     ) * osc1_unison_amp;
-                    out += osc_out * osc.amp * velocity * lerp(1.0, (osc2_out + 1.0) / 2.0, osc.am);
+                    out += osc_out * osc.amp * velocity * lerp(1.0, (osc2_out + 1.0) / 2.0, osc.am) * osc1_lfo_amp;
                 }
 
                 // Update filter controls
                 let cutoff = self.filter_controller.get_cutoff(
-                    keytrack_freq,
+                    keytrack_freq + keytrack_freq * lfo * self.lfo_params.filter_mod,
                     envelope_index,
                     voice.release_time,
                     self.sample_rate as f32,
@@ -318,6 +341,7 @@ pub struct Voice {
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 3],
+    lfo: OscVoice,
     filter: filter::FilterContainer,
     velocity: u8,
     pitch_multiply: f32,
@@ -336,6 +360,7 @@ impl Voice {
             runtime: 0,
             release_time: None,
             osc_voice,
+            lfo: Default::default(),
             velocity,
             filter: filter::FilterContainer::None,
             pitch_multiply: 1.0,
@@ -438,6 +463,34 @@ mod envelopes {
                 let level = self.sample_held(release_index);
                 (1.0 - (index - release_index) / self.release_time).powf(self.slope) * level
             }
+        }
+    }
+}
+
+pub struct LfoParams {
+    pub freq: f32,
+    pub wave: OscWave,
+    pub freq_mod: f32,
+    pub amp_mod: f32,
+    pub mod_mod: f32,
+    pub filter_mod: f32,
+    pub target_osc: Option<usize>,
+}
+impl LfoParams {
+    fn delta(&self, sample_rate: f32) -> f32 {
+        2.0 * PI * self.freq / sample_rate
+    }
+}
+impl Default for LfoParams {
+    fn default() -> Self {
+        Self {
+            freq: 5.0,
+            wave: OscWave::Sine,
+            freq_mod: 0.0,
+            amp_mod: 0.0,
+            mod_mod: 0.0,
+            filter_mod: 0.0,
+            target_osc: None,
         }
     }
 }

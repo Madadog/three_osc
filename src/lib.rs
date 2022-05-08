@@ -70,6 +70,12 @@ struct Ports {
     vol_sustain: InputPort<Control>,
     vol_release: InputPort<Control>,
     vol_slope: InputPort<Control>,
+    lfo_wave: InputPort<Control>,
+    lfo_freq: InputPort<Control>,
+    lfo_freq_mod: InputPort<Control>,
+    lfo_amp_mod: InputPort<Control>,
+    lfo_mod_mod: InputPort<Control>,
+    lfo_filter_mod: InputPort<Control>,
     polyphony: InputPort<Control>,
     portamento_rate: InputPort<Control>,
     pitch_offset: InputPort<Control>,
@@ -191,6 +197,14 @@ impl Plugin for SynthLv2 {
             x if x <= 4.0 => FilterModel::BiquadFilter,
             _ => FilterModel::None,
         };
+
+        // lfo
+        self.synth.lfo_params.wave = OscWave::from_index(*ports.lfo_wave);
+        self.synth.lfo_params.freq = *ports.lfo_freq;
+        self.synth.lfo_params.freq_mod = ports.lfo_freq_mod.powi(1);
+        self.synth.lfo_params.amp_mod = *ports.lfo_amp_mod;
+        self.synth.lfo_params.mod_mod = *ports.lfo_mod_mod;
+        self.synth.lfo_params.filter_mod = *ports.lfo_filter_mod;
 
         // apply oscillator ports
         // ... TODO: write a macro for all this

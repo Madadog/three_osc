@@ -14,7 +14,7 @@
         lv2:project <https://github.com/Madadog/three_osc> ;
 
         lv2:microVersion 0 ;
-        lv2:minorVersion 2 ;
+        lv2:minorVersion 3 ;
 
         doap:name "Three Osc" ;
         doap:license <https://www.gnu.org/licenses/gpl-3.0.html> ;
@@ -670,6 +670,92 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 53 ;
+                lv2:symbol "lfo_wave" ;
+                lv2:name "Lfo Wave" ;
+                lv2:default 0 ;
+                lv2:minimum 0 ;
+                lv2:maximum 5 ;
+                lv2:portProperty lv2:integer ;
+                lv2:portProperty lv2:enumeration ;
+                lv2:scalePoint [
+                    rdfs:label  "Sine" ;
+                    rdf:value 0 ;
+                ] ,
+                [
+                    rdfs:label  "Triangle" ;
+                    rdf:value 1 ;
+                ] ,
+                [
+                    rdfs:label  "Saw" ;
+                    rdf:value 2 ;
+                ] ,
+                [
+                    rdfs:label  "Exponential" ;
+                    rdf:value 3 ;
+                ] ,
+                [
+                    rdfs:label  "Square" ;
+                    rdf:value 4 ;
+                ] ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 54 ;
+                lv2:symbol "lfo_freq" ;
+                lv2:name "Lfo Freq." ;
+                lv2:default 5.000 ;
+                lv2:minimum 0.010 ;
+                lv2:maximum 22000.000 ;
+                lv2:portProperty props:logarithmic ;
+                rdfs:comment "The frequency the LFO oscillates at when active." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 55 ;
+                lv2:symbol "lfo_freq_mod" ;
+                lv2:name "Lfo -> Target Freq." ;
+                lv2:default 0.000 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 1.000 ;
+                lv2:portProperty props:logarithmic ;
+                rdfs:comment "LFO modulation of the target's pitch." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 56 ;
+                lv2:symbol "lfo_amp_mod" ;
+                lv2:name "Lfo -> Target Amp." ;
+                lv2:default 0.000 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 1.000 ;
+                lv2:portProperty props:logarithmic ;
+                rdfs:comment "LFO modulation of the target's amplitude." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 57 ;
+                lv2:symbol "lfo_mod_mod" ;
+                lv2:name "Lfo -> Target Mod." ;
+                lv2:default 0.000 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 1.000 ;
+                lv2:portProperty props:logarithmic ;
+                rdfs:comment "LFO modulation of the target's PM, AM and FM modulation." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 58 ;
+                lv2:symbol "lfo_filter_mod" ;
+                lv2:name "Lfo -> Fil. Cutoff" ;
+                lv2:default 0.000 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 1.000 ;
+                lv2:portProperty props:logarithmic ;
+                rdfs:comment "LFO modulation of the filter's cutoff." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 59 ;
                 lv2:symbol "polyphony" ;
                 lv2:name "Polyphony" ;
                 lv2:default 0 ;
@@ -693,7 +779,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 54 ;
+                lv2:index 60 ;
                 lv2:symbol "portamento_rate" ;
                 lv2:name "Portamento" ;
                 lv2:default 0.250 ;
@@ -703,7 +789,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 55 ;
+                lv2:index 61 ;
                 lv2:symbol "pitch_offset" ;
                 lv2:name "Pitch Slide" ;
                 lv2:default 0.000 ;
@@ -713,7 +799,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 56 ;
+                lv2:index 62 ;
                 lv2:symbol "octave_detune" ;
                 lv2:name "Octave Drift" ;
                 lv2:default 0.000 ;
@@ -723,7 +809,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 57 ;
+                lv2:index 63 ;
                 lv2:symbol "output_gain" ;
                 lv2:name "Output Gain" ;
                 lv2:default -18.000 ;
@@ -733,7 +819,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 58 ;
+                lv2:index 64 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Master Pitch" ;
                 lv2:default 0 ;
@@ -745,7 +831,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 59 ;
+                lv2:index 65 ;
                 lv2:symbol "bend_range" ;
                 lv2:name "Bend Range" ;
                 lv2:default 2 ;

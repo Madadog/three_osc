@@ -5,6 +5,22 @@ use std::{
 
 use super::lerp;
 
+/// A single instance of a playing oscillator. Maintains phase in
+/// internal state
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OscVoice {
+    pub phase: f32,
+}
+impl OscVoice {
+    pub fn new(phase: f32) -> Self {
+        Self { phase }
+    }
+    pub fn add_phase(&mut self, delta: f32) -> f32 {
+        self.phase = (self.phase + delta) % (2.0 * PI);
+        self.phase
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Brute force approach to oscillator super (playing multiple detuned copies
 /// of a wave simultaneously) which tracks the phase of every wave copy.

@@ -14,7 +14,7 @@
         lv2:project <https://github.com/Madadog/three_osc> ;
 
         lv2:microVersion 0 ;
-        lv2:minorVersion 2 ;
+        lv2:minorVersion 3 ;
 
         doap:name "Three Osc" ;
         doap:license <https://www.gnu.org/licenses/gpl-3.0.html> ;

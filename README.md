@@ -57,8 +57,7 @@ Coming soon...
     * Originally had no bandlimited wave generation.
 
 ## TODO
-* Add vibrato control / LFO
-* Use naive wave generation for modulation (stop ringing artifacts)
+* Use naive wave generation for modulation between oscillators (stop ringing artifacts)
 * PWM
 * Stereo
 * Figure out how many controls can fit on the UI before Ardour adds a scroll bar

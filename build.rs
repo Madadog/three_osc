@@ -86,12 +86,14 @@ fn main() {
         portstruct.push_str(&format!("\n{}", control.struct_port()));
     }
 
+
     // prepare global controls
     let volume_envelope = PortList::envelope().prefix("vol_", "Volume ");
+    let lfo = PortList::lfo().prefix("lfo_", "Lfo ");
     let global_controls = PortList::global();
 
     // add global ports
-    for control in volume_envelope.0.iter().chain(global_controls.0.iter()) {
+    for control in volume_envelope.0.iter().chain(lfo.0.iter()).chain(global_controls.0.iter()) {
         ttl.push_str(&ttl_control_divider);
         ttl.push_str(&control.to_ttl(port_index));
         port_index += 1;
@@ -395,7 +397,7 @@ impl PortList {
             ).comment("Partially or fully randomises the point where the oscillator wave starts. Keep this fairly high when using Unison."),
         ])
     }
-    fn global() -> PortList {
+    fn global() -> Self {
         Self(vec![
             ControlPort::new(
                 "polyphony",
@@ -439,7 +441,7 @@ impl PortList {
             ).comment("Controls the range of the MIDI pitch wheel in semitones. Useful if you have a MIDI keyboard."),
         ])
     }
-    fn envelope() -> PortList {
+    fn envelope() -> Self {
         Self(vec![
             ControlPort::new(
                 "attack",
@@ -471,7 +473,7 @@ impl PortList {
             ).comment("Controls the steepness of the attack, decay and release slopes either exponentially or logarithmically. Positive slope means attack and decay will change logarithmically, resulting in punchier sounds, while negative slope will do the opposite. A slope of 0 results in exactly linear slopes."),
         ])
     }
-    fn filter_envelope() -> PortList {
+    fn filter_envelope() -> Self {
         Self(vec![
             ControlPort::new(
                 "keytrack",
@@ -513,7 +515,7 @@ impl PortList {
             ).comment("Controls the steepness of the attack, decay and release slopes either exponentially or logarithmically. Positive slope means attack and decay will change logarithmically, resulting in punchier sounds, while negative slope will do the opposite. A slope of 0 results in exactly linear slopes."),
         ])
     }
-    fn filter() -> PortList {
+    fn filter() -> Self {
         Self(vec![
             ControlPort::new(
                 "model",
@@ -553,6 +555,52 @@ impl PortList {
                 Float(1.0, (0.01, 10.0)),
             ).logarithmic()
             .comment("Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to keep volume equal between filters."),
+        ])
+    }
+    fn lfo() -> Self {
+        Self(vec![
+            ControlPort::new(
+                "wave",
+                "Wave",
+                // Int(0, (0, 6)),
+                ControlRange::Enum(0, vec![
+                    "Sine".to_string(),
+                    "Triangle".to_string(),
+                    "Saw".to_string(),
+                    "Exponential".to_string(),
+                    "Square".to_string(),
+                ]),
+            ),
+            ControlPort::new(
+                "freq",
+                "Freq.",
+                Float(5.0, (0.01, 22000.0)),
+            ).logarithmic()
+            .comment("The frequency the LFO oscillates at when active."),
+            ControlPort::new(
+                "freq_mod",
+                "-> Target Freq.",
+                Float(0.0, (0.0, 1.0)),
+            ).logarithmic()
+            .comment("LFO modulation of the target's pitch."),
+            ControlPort::new(
+                "amp_mod",
+                "-> Target Amp.",
+                Float(0.0, (0.0, 1.0)),
+            ).logarithmic()
+            .comment("LFO modulation of the target's amplitude."),
+            ControlPort::new(
+                "mod_mod",
+                "-> Target Mod.",
+                Float(0.0, (0.0, 1.0)),
+            ).logarithmic()
+            .comment("LFO modulation of the target's PM, AM and FM modulation."),
+            ControlPort::new(
+                "filter_mod",
+                "-> Fil. Cutoff",
+                Float(0.0, (0.0, 1.0)),
+            ).logarithmic()
+            .comment("LFO modulation of the filter's cutoff."),
         ])
     }
 }
