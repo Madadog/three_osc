@@ -16,7 +16,7 @@ Currently a work in progress, but usable nevertheless.
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with smoothly adjustable slopes
 * Sine, triangle, exponential, saw, and square waves
-* Bandlimited wave synthesis using a combination of wavetables and additive synthesis
+* Bandlimited wave synthesis using wavetables computed via FFT (i.e. harmonics extending up to the Nyquist frequency, with no unexpected drop-off)
 * Detunable unison with (up to) 128 voices for each oscillator
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * No GUI
@@ -57,16 +57,15 @@ Coming soon...
     * Originally had no bandlimited wave generation.
 
 ## TODO
-* Use naive wave generation for modulation between oscillators (stop ringing artifacts)
+* Use naive wave generation for modulation between oscillators? (stop ringing artifacts)
 * PWM
 * Stereo
+* Add oversampling with a control (for FM / PM)
+* Switch between Naive, Wavetable, and Additive synthesis with a control
 * Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
-* User-friendly envelope declicking
-* Generate wavetables at constant length with FFT at compile time, not at load time.
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
 * Adjust more knobs to sensible values / defaults
 * Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonably nice)
-* Switch between Naive, Wavetable, and Additive synthesis with a control
 * Make the build system nicer
 * Tools for working with the harmonic series
 * Use audio buffering for more optimisations
