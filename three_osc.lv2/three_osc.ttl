@@ -620,8 +620,8 @@
                     lv2:ControlPort ;
                 lv2:index 48 ;
                 lv2:symbol "vol_attack" ;
-                lv2:name "Vol. Env. Attack" ;
-                lv2:default 0.001 ;
+                lv2:name "Volume Env. Attack" ;
+                lv2:default 0.002 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
                 lv2:portProperty props:logarithmic ;
@@ -631,7 +631,7 @@
                     lv2:ControlPort ;
                 lv2:index 49 ;
                 lv2:symbol "vol_decay" ;
-                lv2:name "Vol. Env. Decay" ;
+                lv2:name "Volume Env. Decay" ;
                 lv2:default 0.250 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -642,7 +642,7 @@
                     lv2:ControlPort ;
                 lv2:index 50 ;
                 lv2:symbol "vol_sustain" ;
-                lv2:name "Vol. Env. Sustain" ;
+                lv2:name "Volume Env. Sustain" ;
                 lv2:default 1.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -652,7 +652,7 @@
                     lv2:ControlPort ;
                 lv2:index 51 ;
                 lv2:symbol "vol_release" ;
-                lv2:name "Vol. Env. Release" ;
+                lv2:name "Volume Env. Release" ;
                 lv2:default 0.005 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -663,7 +663,7 @@
                     lv2:ControlPort ;
                 lv2:index 52 ;
                 lv2:symbol "vol_slope" ;
-                lv2:name "Vol. Env. Slope" ;
+                lv2:name "Volume Env. Slope" ;
                 lv2:default 1.000 ;
                 lv2:minimum -8.000 ;
                 lv2:maximum 8.000 ;
@@ -742,7 +742,7 @@
                     lv2:ControlPort ;
                 lv2:index 56 ;
                 lv2:symbol "lfo_freq_mod" ;
-                lv2:name "Lfo 1 -> Target Freq." ;
+                lv2:name "Lfo 1 -> Vibrato" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -753,7 +753,7 @@
                     lv2:ControlPort ;
                 lv2:index 57 ;
                 lv2:symbol "lfo_amp_mod" ;
-                lv2:name "Lfo 1 -> Target Amp." ;
+                lv2:name "Lfo 1 -> Tremelo" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -764,7 +764,7 @@
                     lv2:ControlPort ;
                 lv2:index 58 ;
                 lv2:symbol "lfo_mod_mod" ;
-                lv2:name "Lfo 1 -> Target Mod." ;
+                lv2:name "Lfo 1 -> Modulation" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;

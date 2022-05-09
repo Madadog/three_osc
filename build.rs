@@ -88,7 +88,7 @@ fn main() {
 
 
     // prepare global controls
-    let volume_envelope = PortList::envelope().prefix("vol_", "Vol. Env. ");
+    let volume_envelope = PortList::envelope().prefix("vol_", "Volume Env. ");
     let lfo = PortList::lfo().prefix("lfo_", "Lfo 1 ");
     let global_controls = PortList::global().prefix("", "Global 1 ");
 
@@ -459,7 +459,7 @@ impl PortList {
             ControlPort::new(
                 "attack",
                 "Attack",
-                Float(0.001, (0.001, 15.0)),
+                Float(0.002, (0.001, 15.0)),
             ).logarithmic()
             .comment("Envelope start time, in seconds. This gives a \\\"fade in\\\" effect when controlling volume. (Note: This control's minimum value (0.001) actually corresponds to 0 internally. This is a GUI hack to make logarithmic values display nicely in Ardour.)"),
             ControlPort::new(
@@ -603,19 +603,19 @@ impl PortList {
             .comment("The frequency the LFO oscillates at when active."),
             ControlPort::new(
                 "freq_mod",
-                "-> Target Freq.",
+                "-> Vibrato",
                 Float(0.0, (0.0, 1.0)),
             ).logarithmic()
             .comment("LFO modulation of the target's pitch."),
             ControlPort::new(
                 "amp_mod",
-                "-> Target Amp.",
+                "-> Tremelo",
                 Float(0.0, (0.0, 1.0)),
             ).logarithmic()
             .comment("LFO modulation of the target's amplitude."),
             ControlPort::new(
                 "mod_mod",
-                "-> Target Mod.",
+                "-> Modulation",
                 Float(0.0, (0.0, 1.0)),
             ).logarithmic()
             .comment("LFO modulation of PM, AM and FM modulation the target is receiving."),
