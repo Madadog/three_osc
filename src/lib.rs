@@ -209,7 +209,7 @@ impl Plugin for SynthLv2 {
         };
         self.synth.lfo_params.wave = OscWave::from_index(*ports.lfo_wave);
         self.synth.lfo_params.freq = *ports.lfo_freq;
-        self.synth.lfo_params.freq_mod = ports.lfo_freq_mod.powi(1);
+        self.synth.lfo_params.freq_mod = ports.lfo_freq_mod.powi(2);
         self.synth.lfo_params.amp_mod = *ports.lfo_amp_mod;
         self.synth.lfo_params.mod_mod = *ports.lfo_mod_mod;
         self.synth.lfo_params.filter_mod = *ports.lfo_filter_mod;
