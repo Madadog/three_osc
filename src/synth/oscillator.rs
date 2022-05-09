@@ -1,7 +1,10 @@
 use std::{
     convert::TryInto,
-    f32::consts::{FRAC_1_SQRT_2, PI},
+    f32::consts::{FRAC_1_SQRT_2, PI}, iter,
 };
+
+use itertools::izip;
+use rustfft::{FftPlanner, num_complex::{Complex, Complex32}};
 
 use super::lerp;
 
@@ -362,6 +365,11 @@ impl Wavetable {
             .collect();
         Self { table }
     }
+    pub fn from_additive_osc_ifft(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
+        let mut table: Vec<f32> = vec![0.0; len];
+        osc.generate_ifft(&mut table, harmonics);
+        Self { table }
+    }
 }
 
 /// Wave generator with a unique wavetable for each midi note index (extended to the 44.1 kHz
@@ -421,10 +429,6 @@ impl WavetableNotes {
     /// Increasing `min_table_len` emulates increased oversampling for higher notes which, for reasons I now understand, require much more oversampling
     /// than the middle notes to achieve comparative noise reduction. E.g. a note at 2000 Hz theoretically requires a minimum of 22.05 samples, so a
     /// `min_table_len` of 2560 is equivalent to 116 times oversampling which is usually enough.
-    ///
-    /// Note that all other wavetable synths just use wavetable lengths that are powers of two, because they use FFTs. Of course, a need for FFTs implies
-    /// that you're reading user samples or doing spectral manipulation, both of which are beyond the scope of this synth. Inverse FFTs, on the other hand, will
-    /// allow me to stop summing sine waves manually, speeding up table generation to realtime speeds...  
     pub fn from_additive_osc(
         osc: &AdditiveOsc,
         sample_rate: f32,
@@ -436,7 +440,7 @@ impl WavetableNotes {
             max_oversample >= 1.0,
             "Oversampling factor should be 1.0 or greater"
         );
-        let tables: Vec<Wavetable> = (0..138)
+        let tables: Vec<Wavetable> = (0..=137)
             .into_iter()
             .map(|x| {
                 if x == 137 {
@@ -460,25 +464,18 @@ impl WavetableNotes {
                 tables: tables.try_into().unwrap(),
         }
     }
-    /// `WavetableNotes::from_additive_osc()` with constant table length
-    ///
-    /// I will migrate to this once I start using fast fourier transforms.
-    pub fn from_additive_osc_2(
+    /// Generates a bandlimited wavetable for each midi note using fast fourier transforms, with constant wavetable length
+    pub fn from_additive_osc_ifft(
         osc: &AdditiveOsc,
         sample_rate: f32,
-        oversampling_factor: f32,
         table_length: usize,
     ) -> Self {
-        debug_assert!(
-            oversampling_factor >= 1.0,
-            "Oversampling factor should be 1.0 or greater"
-        );
-        let tables: Vec<Wavetable> = (0..138)
+        let tables: Vec<Wavetable> = (0..=137)
         .into_iter()
         .map(|x| {
-            if x == 128 {
+            if x == 137 {
                 // highest note has no harmonics, so notes above nyquist are silent
-                1
+                0
             } else {
                 // Number of harmonics required for note
                 (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).floor()
@@ -488,9 +485,9 @@ impl WavetableNotes {
             .map(|harmonics| {
                 // clamp to nyquist
                 let harmonics = harmonics.min(table_length / 2);
-                Wavetable::from_additive_osc(
+                Wavetable::from_additive_osc_ifft(
                     osc,
-                    (table_length as f32 * oversampling_factor) as usize,
+                    table_length,
                     harmonics,
                 )
             })
@@ -507,46 +504,34 @@ pub struct WavetableSet {
 impl WavetableSet {
     pub fn new(
         sample_rate: f32,
-        max_oversample: f32,
-        max_table_len: usize,
-        min_table_len: usize,
+        table_len: usize,
     ) -> Self {
         Self {
             wavetables: vec![
-                WavetableNotes::from_additive_osc(
+                WavetableNotes::from_additive_osc_ifft(
                     &AdditiveOsc::sine(),
                     sample_rate,
-                    max_oversample,
-                    max_table_len,
-                    min_table_len,
+                    table_len,
                 ),
-                WavetableNotes::from_additive_osc(
+                WavetableNotes::from_additive_osc_ifft(
                     &AdditiveOsc::triangle(),
                     sample_rate,
-                    max_oversample,
-                    max_table_len,
-                    min_table_len,
+                    table_len,
                 ),
-                WavetableNotes::from_additive_osc(
+                WavetableNotes::from_additive_osc_ifft(
                     &AdditiveOsc::saw(),
                     sample_rate,
-                    max_oversample,
-                    max_table_len,
-                    min_table_len,
+                    table_len,
                 ),
-                WavetableNotes::from_additive_osc(
+                WavetableNotes::from_additive_osc_ifft(
                     &AdditiveOsc::fake_exp(),
                     sample_rate,
-                    max_oversample,
-                    max_table_len,
-                    min_table_len,
+                    table_len,
                 ),
-                WavetableNotes::from_additive_osc(
+                WavetableNotes::from_additive_osc_ifft(
                     &AdditiveOsc::square(),
                     sample_rate,
-                    max_oversample,
-                    max_table_len,
-                    min_table_len,
+                    table_len,
                 ),
             ],
         }
@@ -568,7 +553,7 @@ impl WavetableSet {
 ///
 /// The lowest-frequency signal that can be generated with all of its expected harmonics
 /// is given by sample_rate / (2.0 * N). (i.e. with 2560 sinusoids: 44100/(2.0 * 2560) = 8.613 Hz)
-pub struct AdditiveOsc<const N: usize = 1280> {
+pub struct AdditiveOsc<const N: usize = 2048> {
     amplitudes: [f32; N],
     phases: [f32; N],
 }
@@ -587,6 +572,33 @@ impl<const N: usize> AdditiveOsc<N> {
     pub fn generate_segment(&self, output: &mut [f32], delta: f32, harmonics: usize) {
         for (i, sample) in output.iter_mut().enumerate() {
             *sample = self.generate(delta * i as f32, harmonics);
+        }
+    }
+    pub fn generate_ifft(&self, output: &mut [f32], harmonics: usize) {
+        assert_eq!(output.len(), N);
+
+        let dc_offset = iter::once((&0.0_f32, &0.0_f32));
+
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_inverse(N);
+        let mut buffer: Vec<Complex32> = dc_offset.chain(
+            self.amplitudes.iter()
+            .take(harmonics)
+            .zip(self.phases.iter()))
+            // TODO: use phase
+            .map(|(amplitude, _phase)| Complex {
+                re: 0.0,
+                im: *amplitude,
+            })
+            .collect();
+        // FFTs must be constant length
+        if buffer.len() < N {
+            buffer.extend(vec![Complex32 { re: 0.0, im: 0.0 }; N - buffer.len()])
+        }
+        fft.process(&mut buffer);
+
+        for (sample, output) in izip!(buffer.iter(), output.iter_mut()) {
+            *output = sample.re;
         }
     }
     pub fn sine() -> Self {
