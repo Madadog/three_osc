@@ -12,13 +12,15 @@ Currently a work in progress, but usable nevertheless.
 ## Features
 
 * 3 oscillators which can modulate eachother via phase, frequency, and amplitude modulation (PM, FM & AM) simultaneously
-* 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope
+* Choose between 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope
 * Unlimited polyphony, with optional monophonic and legato modes
-* ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.  
+* ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
 * Sine, triangle, absolute sine, saw, and square waves
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off)
 * Detunable unison with (up to) 128 voices for each oscillator (i.e. yes it can supersaw)
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
+* Vibrato, tremolo and modulation control with an LFO
+* Portamento and adjustable initial pitch slide for kickdrum synthesis.
 * No GUI
 
 ## Sound Demo
