@@ -14,10 +14,10 @@ Currently a work in progress, but usable nevertheless.
 * 3 oscillators which can modulate eachother via phase, frequency, and amplitude modulation (PM, FM & AM) simultaneously
 * 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope
 * Unlimited polyphony, with optional monophonic and legato modes
-* ADSR envelopes with smoothly adjustable slopes
-* Sine, triangle, exponential, saw, and square waves
-* Bandlimited wave synthesis using wavetables computed via FFT (i.e. harmonics extending up to the Nyquist frequency, with no unexpected drop-off)
-* Detunable unison with (up to) 128 voices for each oscillator
+* ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.  
+* Sine, triangle, absolute sine, saw, and square waves
+* Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off)
+* Detunable unison with (up to) 128 voices for each oscillator (i.e. yes it can supersaw)
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * No GUI
 
@@ -38,7 +38,8 @@ Coming soon...
 3. Load it into your preferred LV2 host (Ardour, Carla, LMMS) and have fun.
 
 ## Tips and Tricks
-* Increasing envelope slope makes it steeper, decreasing it does the opposite. Slope = 1 gives perceptually-linear (logarithmic) volume decay.
+* The absolute sine / exponential wave is like a saw wave where the harmonics decrease volume at -12dB per octave instead of -6 dB per octave (i.e. it's a saw wave tracked by a soft filter). Similarly, the triangle wave is like a square wave where the harmonics diminish at -12dB per octave instead of -6dB.
+* Increasing envelope slope makes it steeper, decreasing it does the opposite. Slope = 0 gives perfectly linear slopes, which are not perceptually linear. Slope = 1 gives perceptually-linear (logarithmic) volume decay.
 * The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Underdriving the filters (i.e. drive below 1) and sweeping them very slowly gives a 'harmonic snap' effect.
 * Setting octave detune to -0.0028 gives near perfect fifths, while 0.0342 gives near perfect major thirds.
 * FM changes frequency with the modulator's waveform, PM changes frequency with the derivative of the modulator's waveform. (I.E. PM by triangle == FM by square wave)
