@@ -70,6 +70,7 @@ struct Ports {
     vol_sustain: InputPort<Control>,
     vol_release: InputPort<Control>,
     vol_slope: InputPort<Control>,
+    lfo_target: InputPort<Control>,
     lfo_wave: InputPort<Control>,
     lfo_freq: InputPort<Control>,
     lfo_freq_mod: InputPort<Control>,
@@ -199,6 +200,13 @@ impl Plugin for SynthLv2 {
         };
 
         // lfo
+        self.synth.lfo_params.target_osc = match *ports.lfo_target {
+            x if x < 1.0 => None,
+            x if x < 2.0 => Some(0),
+            x if x < 3.0 => Some(1),
+            x if x < 4.0 => Some(2),
+            _ => Some(3),
+        };
         self.synth.lfo_params.wave = OscWave::from_index(*ports.lfo_wave);
         self.synth.lfo_params.freq = *ports.lfo_freq;
         self.synth.lfo_params.freq_mod = ports.lfo_freq_mod.powi(1);

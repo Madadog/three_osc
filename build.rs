@@ -78,7 +78,7 @@ fn main() {
 
     // filter controls
     let filter_controls = PortList::filter().prefix("fil1_", "Filter 1 ");
-    let filter_envelope = PortList::filter_envelope().prefix("fil1_", "Filter 1 ");
+    let filter_envelope = PortList::filter_envelope().prefix("fil1_", "Filter 1 Env. ");
     for control in filter_controls.0.iter().chain(filter_envelope.0.iter()) {
         ttl.push_str(&ttl_control_divider);
         ttl.push_str(&control.to_ttl(port_index));
@@ -88,9 +88,9 @@ fn main() {
 
 
     // prepare global controls
-    let volume_envelope = PortList::envelope().prefix("vol_", "Volume ");
-    let lfo = PortList::lfo().prefix("lfo_", "Lfo ");
-    let global_controls = PortList::global();
+    let volume_envelope = PortList::envelope().prefix("vol_", "Vol. Env. ");
+    let lfo = PortList::lfo().prefix("lfo_", "Lfo 1 ");
+    let global_controls = PortList::global().prefix("", "Global 1 ");
 
     // add global ports
     for control in volume_envelope.0.iter().chain(lfo.0.iter()).chain(global_controls.0.iter()) {
@@ -151,6 +151,9 @@ impl ControlPort {
     fn comment(self, comment: &str) -> Self {
         self.with_property(PortProperty::Comment(comment.to_string()))
     }
+    fn group(self, group: &str) -> Self {
+        self.with_property(PortProperty::Group(group.to_string()))
+    }
     fn to_ttl(&self, index: usize) -> String {
         let mut buf = String::with_capacity(2000);
         buf.push_str(&format!("                lv2:index {index} ;\n"));
@@ -196,7 +199,10 @@ impl ControlPort {
                     buf.push_str("\n                lv2:portProperty props:logarithmic ;")
                 }
                 PortProperty::Comment(comment) => {
-                    buf.push_str(&format!("\n                rdfs:comment \"{}\" ;", comment))
+                    buf.push_str(&format!("\n                rdfs:comment \"{comment}\" ;"))
+                }
+                PortProperty::Group(group) => {
+                    buf.push_str(&format!("\n                pg:group {group}"))
                 }
                 x => {
                     panic!("You need to add {:?} to the .to_ttl() function", x)
@@ -257,6 +263,7 @@ impl ControlRange {
 enum PortProperty {
     Logarithmic,
     Comment(String),
+    Group(String),
 }
 
 use ControlRange::{Float, Int};
@@ -267,6 +274,12 @@ impl PortList {
     fn prefix(mut self, symbol_prefix: &str, name_prefix: &str) -> Self {
         for port in self.0.iter_mut() {
             port.prefix(symbol_prefix, name_prefix);
+        }
+        self
+    }
+    fn with_property(mut self, property: PortProperty) -> Self {
+        for port in self.0.iter_mut() {
+            port.properties.push(property.clone());
         }
         self
     }
@@ -431,7 +444,7 @@ impl PortList {
             ).comment("Master output volume. Adjust if the synth is too loud / too quiet."),
             ControlPort::new(
                 "global_pitch",
-                "Master Pitch",
+                "Output Pitch",
                 Int(0, (-24, 24)),
             ).comment("Pitch detune for the whole synth, in semitones."),
             ControlPort::new(
@@ -476,13 +489,8 @@ impl PortList {
     fn filter_envelope() -> Self {
         Self(vec![
             ControlPort::new(
-                "keytrack",
-                "Keytrack",
-                Float(0.0, (0.0, 1.0)),
-            ).comment("Amount the filter cutoff is affected by note frequency; Keytrack of 1.0 means the filter cutoff will follow the note frequency exactly, making higher notes brighter and lower notes darker."),
-            ControlPort::new(
                 "env_amount",
-                "Env. Amount",
+                "Amount",
                 Float(0.25, (0.0, 1.0)),
             ).comment("Amount the envelope affects the filter cutoff."),
             ControlPort::new(
@@ -555,10 +563,26 @@ impl PortList {
                 Float(1.0, (0.01, 10.0)),
             ).logarithmic()
             .comment("Multiplies the amplitude of the filter input, creating distortion inside the RC and Ladder filters. Does not amplify when Model = None or Digital, to keep volume equal between filters."),
+            ControlPort::new(
+                "keytrack",
+                "Keytrack",
+                Float(0.0, (0.0, 1.0)),
+            ).comment("Amount the filter cutoff is affected by note frequency; Keytrack of 1.0 means the filter cutoff will follow the note frequency exactly, making higher notes brighter and lower notes darker."),
         ])
     }
     fn lfo() -> Self {
         Self(vec![
+            ControlPort::new(
+                "target",
+                "Target Osc.",
+                // Int(0, (0, 6)),
+                ControlRange::Enum(0, vec![
+                    "All Oscs".to_string(),
+                    "Osc. 1".to_string(),
+                    "Osc. 2".to_string(),
+                    "Osc. 3".to_string(),
+                ]),
+            ),
             ControlPort::new(
                 "wave",
                 "Wave",
@@ -594,7 +618,7 @@ impl PortList {
                 "-> Target Mod.",
                 Float(0.0, (0.0, 1.0)),
             ).logarithmic()
-            .comment("LFO modulation of the target's PM, AM and FM modulation."),
+            .comment("LFO modulation of PM, AM and FM modulation the target is receiving."),
             ControlPort::new(
                 "filter_mod",
                 "-> Fil. Cutoff",

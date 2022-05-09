@@ -193,21 +193,37 @@ impl ThreeOsc {
 
                 let lfo_phase = voice.lfo.add_phase(lfo_delta);
                 let lfo = self.lfo_params.wave.generate(lfo_phase);
-                let (osc1_delta, osc2_delta, osc3_delta) = (
-                    osc1_delta + osc1_delta * lfo * self.lfo_params.freq_mod,
-                    osc2_delta + osc2_delta * lfo * self.lfo_params.freq_mod,
-                    osc3_delta + osc3_delta * lfo * self.lfo_params.freq_mod,
-                );
-                let (osc1_lfo_amp, osc2_lfo_amp, osc3_lfo_amp) = (
-                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
-                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
-                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
-                );
-                let (osc1_lfo_mod, osc2_lfo_mod, osc3_lfo_mod) = (
-                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
-                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
-                    lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
-                );
+                
+                // set / bypass modulation depending on LFO target 
+                let (
+                    (osc1_delta, osc2_delta, osc3_delta),
+                    (osc1_lfo_amp, osc2_lfo_amp, osc3_lfo_amp),
+                    (osc1_lfo_mod, osc2_lfo_mod)
+                ) = match self.lfo_params.target_osc {
+                    Some(0) => {((osc1_delta + osc1_delta * lfo * self.lfo_params.freq_mod, osc2_delta, osc3_delta),
+                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod), 1.0, 1.0),
+                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod), 1.0),
+                    )},
+                    Some(1) => {((osc1_delta, osc2_delta + osc2_delta * lfo * self.lfo_params.freq_mod, osc3_delta),
+                        (1.0, lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod), 1.0),
+                        (1.0, lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod)),
+                    )},
+                    Some(2) => {((osc1_delta, osc2_delta, osc3_delta + osc3_delta * lfo * self.lfo_params.freq_mod),
+                        (1.0, lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod), 1.0),
+                        (1.0, 1.0),
+                    )},
+                    // no target / invalid target: default to modulating all
+                    _ => {(
+                        (osc1_delta + osc1_delta * lfo * self.lfo_params.freq_mod,
+                            osc2_delta + osc2_delta * lfo * self.lfo_params.freq_mod,
+                            osc3_delta + osc3_delta * lfo * self.lfo_params.freq_mod),
+                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
+                            lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
+                            lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod)),
+                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
+                            lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),)
+                    )}
+                };
 
                 let keytrack_freq = 2.0_f32.powf(
                     (voice.id as f32 - 69.0 + voice.semitone_detune) / 12.0
@@ -233,7 +249,7 @@ impl ThreeOsc {
                         .generate_multi(phases, osc.voice_count.into())
                         * osc3_unison_amp;
                     out += osc_out * osc.amp * velocity * osc3_lfo_amp;
-                    osc_out * osc3_lfo_mod
+                    osc_out * osc2_lfo_mod
                 } else { 0.0 };
 
                 let osc2_out = if self.oscillators[1].amp > 0.0
@@ -253,7 +269,7 @@ impl ThreeOsc {
                         * osc2_unison_amp;
                     osc_out *= lerp(1.0, (osc3_out + 1.0) / 2.0, osc.am);
                     out += osc_out * osc.amp * velocity * osc2_lfo_amp;
-                    osc_out * osc2_lfo_mod
+                    osc_out * osc1_lfo_mod
                 } else {0.0};
 
                 if self.oscillators[0].amp > 0.0 {

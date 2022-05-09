@@ -60,7 +60,6 @@ Coming soon...
 * Use naive wave generation for modulation between oscillators (stop ringing artifacts)
 * PWM
 * Stereo
-* Figure out how many controls can fit on the UI before Ardour adds a scroll bar
 * Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
 * User-friendly envelope declicking
 * Generate wavetables at constant length with FFT at compile time, not at load time.

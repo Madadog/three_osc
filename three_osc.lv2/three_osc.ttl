@@ -2,6 +2,8 @@
 @prefix doap:  <http://usefulinc.com/ns/doap#> .
 @prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
 @prefix midi: <http://lv2plug.in/ns/ext/midi#> .
+@prefix param: <http://lv2plug.in/ns/ext/parameters#> .
+@prefix pg: <http://lv2plug.in/ns/ext/port-groups#> .
 @prefix props: <http://lv2plug.in/ns/ext/port-props#> .
 @prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
@@ -565,7 +567,7 @@
                     lv2:ControlPort ;
                 lv2:index 43 ;
                 lv2:symbol "fil1_attack" ;
-                lv2:name "Filter 1 Attack" ;
+                lv2:name "Filter 1 Env. Attack" ;
                 lv2:default 0.001 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -576,7 +578,7 @@
                     lv2:ControlPort ;
                 lv2:index 44 ;
                 lv2:symbol "fil1_decay" ;
-                lv2:name "Filter 1 Decay" ;
+                lv2:name "Filter 1 Env. Decay" ;
                 lv2:default 0.250 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -587,7 +589,7 @@
                     lv2:ControlPort ;
                 lv2:index 45 ;
                 lv2:symbol "fil1_sustain" ;
-                lv2:name "Filter 1 Sustain" ;
+                lv2:name "Filter 1 Env. Sustain" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -597,7 +599,7 @@
                     lv2:ControlPort ;
                 lv2:index 46 ;
                 lv2:symbol "fil1_release" ;
-                lv2:name "Filter 1 Release" ;
+                lv2:name "Filter 1 Env. Release" ;
                 lv2:default 0.005 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -608,7 +610,7 @@
                     lv2:ControlPort ;
                 lv2:index 47 ;
                 lv2:symbol "fil1_slope" ;
-                lv2:name "Filter 1 Slope" ;
+                lv2:name "Filter 1 Env. Slope" ;
                 lv2:default 1.000 ;
                 lv2:minimum -8.000 ;
                 lv2:maximum 8.000 ;
@@ -618,7 +620,7 @@
                     lv2:ControlPort ;
                 lv2:index 48 ;
                 lv2:symbol "vol_attack" ;
-                lv2:name "Volume Attack" ;
+                lv2:name "Vol. Env. Attack" ;
                 lv2:default 0.001 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -629,7 +631,7 @@
                     lv2:ControlPort ;
                 lv2:index 49 ;
                 lv2:symbol "vol_decay" ;
-                lv2:name "Volume Decay" ;
+                lv2:name "Vol. Env. Decay" ;
                 lv2:default 0.250 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -640,7 +642,7 @@
                     lv2:ControlPort ;
                 lv2:index 50 ;
                 lv2:symbol "vol_sustain" ;
-                lv2:name "Volume Sustain" ;
+                lv2:name "Vol. Env. Sustain" ;
                 lv2:default 1.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -650,7 +652,7 @@
                     lv2:ControlPort ;
                 lv2:index 51 ;
                 lv2:symbol "vol_release" ;
-                lv2:name "Volume Release" ;
+                lv2:name "Vol. Env. Release" ;
                 lv2:default 0.005 ;
                 lv2:minimum 0.001 ;
                 lv2:maximum 15.000 ;
@@ -661,7 +663,7 @@
                     lv2:ControlPort ;
                 lv2:index 52 ;
                 lv2:symbol "vol_slope" ;
-                lv2:name "Volume Slope" ;
+                lv2:name "Vol. Env. Slope" ;
                 lv2:default 1.000 ;
                 lv2:minimum -8.000 ;
                 lv2:maximum 8.000 ;
@@ -670,8 +672,35 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 53 ;
+                lv2:symbol "lfo_target" ;
+                lv2:name "Lfo 1 Target Osc." ;
+                lv2:default 0 ;
+                lv2:minimum 0 ;
+                lv2:maximum 4 ;
+                lv2:portProperty lv2:integer ;
+                lv2:portProperty lv2:enumeration ;
+                lv2:scalePoint [
+                    rdfs:label  "All Oscs" ;
+                    rdf:value 0 ;
+                ] ,
+                [
+                    rdfs:label  "Osc. 1" ;
+                    rdf:value 1 ;
+                ] ,
+                [
+                    rdfs:label  "Osc. 2" ;
+                    rdf:value 2 ;
+                ] ,
+                [
+                    rdfs:label  "Osc. 3" ;
+                    rdf:value 3 ;
+                ] ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 54 ;
                 lv2:symbol "lfo_wave" ;
-                lv2:name "Lfo Wave" ;
+                lv2:name "Lfo 1 Wave" ;
                 lv2:default 0 ;
                 lv2:minimum 0 ;
                 lv2:maximum 5 ;
@@ -700,9 +729,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 54 ;
+                lv2:index 55 ;
                 lv2:symbol "lfo_freq" ;
-                lv2:name "Lfo Freq." ;
+                lv2:name "Lfo 1 Freq." ;
                 lv2:default 5.000 ;
                 lv2:minimum 0.010 ;
                 lv2:maximum 22000.000 ;
@@ -711,9 +740,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 55 ;
+                lv2:index 56 ;
                 lv2:symbol "lfo_freq_mod" ;
-                lv2:name "Lfo -> Target Freq." ;
+                lv2:name "Lfo 1 -> Target Freq." ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -722,9 +751,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 56 ;
+                lv2:index 57 ;
                 lv2:symbol "lfo_amp_mod" ;
-                lv2:name "Lfo -> Target Amp." ;
+                lv2:name "Lfo 1 -> Target Amp." ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -733,20 +762,20 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 57 ;
+                lv2:index 58 ;
                 lv2:symbol "lfo_mod_mod" ;
-                lv2:name "Lfo -> Target Mod." ;
+                lv2:name "Lfo 1 -> Target Mod." ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
                 lv2:portProperty props:logarithmic ;
-                rdfs:comment "LFO modulation of the target's PM, AM and FM modulation." ;
+                rdfs:comment "LFO modulation of PM, AM and FM modulation the target is receiving." ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 58 ;
+                lv2:index 59 ;
                 lv2:symbol "lfo_filter_mod" ;
-                lv2:name "Lfo -> Fil. Cutoff" ;
+                lv2:name "Lfo 1 -> Fil. Cutoff" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
@@ -755,9 +784,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 59 ;
+                lv2:index 60 ;
                 lv2:symbol "polyphony" ;
-                lv2:name "Polyphony" ;
+                lv2:name "Global 1 Polyphony" ;
                 lv2:default 0 ;
                 lv2:minimum 0 ;
                 lv2:maximum 3 ;
@@ -779,9 +808,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 60 ;
+                lv2:index 61 ;
                 lv2:symbol "portamento_rate" ;
-                lv2:name "Portamento" ;
+                lv2:name "Global 1 Portamento" ;
                 lv2:default 0.250 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 0.999 ;
@@ -789,9 +818,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 61 ;
+                lv2:index 62 ;
                 lv2:symbol "pitch_offset" ;
-                lv2:name "Pitch Slide" ;
+                lv2:name "Global 1 Pitch Slide" ;
                 lv2:default 0.000 ;
                 lv2:minimum -96.000 ;
                 lv2:maximum 96.000 ;
@@ -799,9 +828,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 62 ;
+                lv2:index 63 ;
                 lv2:symbol "octave_detune" ;
-                lv2:name "Octave Drift" ;
+                lv2:name "Global 1 Octave Drift" ;
                 lv2:default 0.000 ;
                 lv2:minimum -0.040 ;
                 lv2:maximum 0.040 ;
@@ -809,9 +838,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 63 ;
+                lv2:index 64 ;
                 lv2:symbol "output_gain" ;
-                lv2:name "Output Gain" ;
+                lv2:name "Global 1 Output Gain" ;
                 lv2:default -18.000 ;
                 lv2:minimum -90.000 ;
                 lv2:maximum 0.000 ;
@@ -819,9 +848,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 64 ;
+                lv2:index 65 ;
                 lv2:symbol "global_pitch" ;
-                lv2:name "Master Pitch" ;
+                lv2:name "Global 1 Output Pitch" ;
                 lv2:default 0 ;
                 lv2:minimum -24 ;
                 lv2:maximum 24 ;
@@ -831,9 +860,9 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 65 ;
+                lv2:index 66 ;
                 lv2:symbol "bend_range" ;
-                lv2:name "Bend Range" ;
+                lv2:name "Global 1 Bend Range" ;
                 lv2:default 2 ;
                 lv2:minimum -24 ;
                 lv2:maximum 24 ;

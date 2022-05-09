@@ -147,7 +147,9 @@ pub enum OscWave {
 }
 #[allow(dead_code)]
 impl OscWave {
-    pub fn generate(&self, phase: f32) -> f32 {
+    /// Generates the waveform at the specified phase, attempting to keep waveform volumes
+    /// normalised.
+    pub fn generate_normalised(&self, phase: f32) -> f32 {
         use OscWave::*;
 
         match self {
@@ -180,6 +182,45 @@ impl OscWave {
                     FRAC_1_SQRT_2
                 } else {
                     -FRAC_1_SQRT_2
+                }
+            }
+        }
+    }
+    /// Generates the waveform at the specified phase with all values
+    /// ranging from -1 and +1 peak to peak.
+    pub fn generate(&self, phase: f32) -> f32 {
+        use OscWave::*;
+
+        match self {
+            Sine => phase.sin(),
+            Tri => {
+                if phase <= PI {
+                    (phase / PI) * 2.0 - 1.0
+                } else {
+                    ((-phase + 2.0 * PI) / PI) * 2.0 - 1.0
+                }
+            }
+            Saw => (phase - PI) / (2.0 * PI),
+            Exp => phase.sin().abs() * 2.0 - 1.0,
+            Square => {
+                if phase <= PI {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            PulseQuarter => {
+                if phase <= std::f32::consts::FRAC_PI_2 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            PulseEighth => {
+                if phase <= std::f32::consts::FRAC_PI_4 {
+                    1.0
+                } else {
+                    -1.0
                 }
             }
         }
