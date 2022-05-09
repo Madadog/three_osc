@@ -609,7 +609,7 @@ impl PortList {
             .comment("LFO modulation of the target's pitch."),
             ControlPort::new(
                 "amp_mod",
-                "-> Tremelo",
+                "-> Tremolo",
                 Float(0.0, (0.0, 1.0)),
             ).logarithmic()
             .comment("LFO modulation of the target's amplitude."),

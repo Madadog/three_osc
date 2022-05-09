@@ -753,7 +753,7 @@
                     lv2:ControlPort ;
                 lv2:index 57 ;
                 lv2:symbol "lfo_amp_mod" ;
-                lv2:name "Lfo 1 -> Tremelo" ;
+                lv2:name "Lfo 1 -> Tremolo" ;
                 lv2:default 0.000 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 1.000 ;
