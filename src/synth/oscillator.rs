@@ -99,6 +99,8 @@ pub struct OscillatorParams {
     pub phase_rand: f32,
     pub pitch_bend: f32,
 
+    pub pulse_width: f32,
+
     pub fm: f32,
     pub pm: f32,
     pub am: f32,
@@ -130,6 +132,7 @@ impl Default for OscillatorParams {
             phase: 0.0,
             phase_rand: PI * 2.0,
             pitch_bend: 0.0,
+            pulse_width: PI,
             fm: 0.0,
             pm: 0.0,
             am: 0.0,
@@ -145,8 +148,7 @@ pub enum OscWave {
     Saw,
     Exp,
     Square,
-    PulseQuarter,
-    PulseEighth,
+    Pulse {width: f32},
 }
 #[allow(dead_code)]
 impl OscWave {
@@ -173,15 +175,8 @@ impl OscWave {
                     -FRAC_1_SQRT_2
                 }
             }
-            PulseQuarter => {
-                if phase <= std::f32::consts::FRAC_PI_2 {
-                    FRAC_1_SQRT_2
-                } else {
-                    -FRAC_1_SQRT_2
-                }
-            }
-            PulseEighth => {
-                if phase <= std::f32::consts::FRAC_PI_4 {
+            Pulse { width } => {
+                if phase <= *width {
                     FRAC_1_SQRT_2
                 } else {
                     -FRAC_1_SQRT_2
@@ -212,15 +207,8 @@ impl OscWave {
                     -1.0
                 }
             }
-            PulseQuarter => {
-                if phase <= std::f32::consts::FRAC_PI_2 {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-            PulseEighth => {
-                if phase <= std::f32::consts::FRAC_PI_4 {
+            Pulse { width } => {
+                if phase <= *width {
                     1.0
                 } else {
                     -1.0
@@ -235,8 +223,16 @@ impl OscWave {
             x if x < 3.0 => OscWave::Saw,
             x if x < 4.0 => OscWave::Exp,
             x if x < 5.0 => OscWave::Square,
-            x if x < 6.0 => OscWave::PulseQuarter,
-            x if x < 7.0 => OscWave::PulseEighth,
+            _ => OscWave::Sine,
+        }
+    }
+    pub fn from_index_pulse(index: f32) -> Self {
+        match index {
+            x if x < 1.0 => OscWave::Sine,
+            x if x < 2.0 => OscWave::Tri,
+            x if x < 3.0 => OscWave::Saw,
+            x if x < 4.0 => OscWave::Exp,
+            x if x < 5.0 => OscWave::Pulse { width: PI },
             _ => OscWave::Sine,
         }
     }
@@ -350,7 +346,7 @@ impl Wavetable {
         phases
             .iter()
             .take(max)
-            .map(|phase| self.generate((*phase + phase_offset * 150.0).rem_euclid(2.0 * PI)))
+            .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
             .sum()
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
@@ -543,6 +539,7 @@ impl WavetableSet {
             OscWave::Saw => 2,
             OscWave::Exp => 3,
             OscWave::Square => 4,
+            OscWave::Pulse { width: _ } => 2,
             _ => 0,
         };
         &self.wavetables[wave_index]

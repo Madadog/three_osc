@@ -389,6 +389,11 @@ impl PortList {
                 Int(0, (-64, 64)),
             ).comment("Oscillator pitch multiplier / divider. Positive values multiply pitch, while negative values divide. A value of 0 means this control is bypassed."),
             ControlPort::new(
+                "pwm",
+                "Pulse Width",
+                Float(50.0, (0.0, 50.0)),
+            ).comment("Pulse width modulation. Adjusts the width of the square waveform."),
+            ControlPort::new(
                 "voices",
                 "Unison",
                 Int(1, (1, 128)),

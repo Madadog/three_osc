@@ -49,6 +49,7 @@ struct Ports {
     osc3_semitone: InputPort<Control>,
     osc3_octave: InputPort<Control>,
     osc3_multiplier: InputPort<Control>,
+    osc3_pwm: InputPort<Control>,
     osc3_voices: InputPort<Control>,
     osc3_super_detune: InputPort<Control>,
     osc3_phase: InputPort<Control>,
@@ -268,7 +269,8 @@ impl Plugin for SynthLv2 {
             self.synth.oscillators[2].voices_detune = (*ports.osc3_super_detune / 100.0).powi(3);
             self.synth.oscillators[2].phase = *ports.osc3_phase * 2.0 * PI / 100.0;
             self.synth.oscillators[2].phase_rand = *ports.osc3_phase_rand * 2.0 * PI / 100.0;
-            self.synth.oscillators[2].wave = OscWave::from_index(*ports.osc3_wave);
+            self.synth.oscillators[2].wave = OscWave::from_index_pulse(*ports.osc3_wave);
+            self.synth.oscillators[2].pulse_width = *ports.osc3_pwm * 2.0 * PI / 100.0;
         }
         
         let control_sequence = ports
