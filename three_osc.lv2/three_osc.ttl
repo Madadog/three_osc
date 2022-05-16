@@ -159,7 +159,7 @@
                 lv2:name "Osc 1 Unison" ;
                 lv2:default 1 ;
                 lv2:minimum 1 ;
-                lv2:maximum 128 ;
+                lv2:maximum 32 ;
                 lv2:portProperty lv2:integer ;
                 lv2:portProperty lv2:integer ;
                 rdfs:comment "Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound." ;
@@ -306,7 +306,7 @@
                 lv2:name "Osc 2 Unison" ;
                 lv2:default 1 ;
                 lv2:minimum 1 ;
-                lv2:maximum 128 ;
+                lv2:maximum 32 ;
                 lv2:portProperty lv2:integer ;
                 lv2:portProperty lv2:integer ;
                 rdfs:comment "Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound." ;
@@ -433,7 +433,7 @@
                 lv2:name "Osc 3 Unison" ;
                 lv2:default 1 ;
                 lv2:minimum 1 ;
-                lv2:maximum 128 ;
+                lv2:maximum 32 ;
                 lv2:portProperty lv2:integer ;
                 lv2:portProperty lv2:integer ;
                 rdfs:comment "Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound." ;
@@ -529,7 +529,7 @@
                 lv2:minimum 10.000 ;
                 lv2:maximum 22000.000 ;
                 lv2:portProperty props:logarithmic ;
-                rdfs:comment "Changes frequency at which the filter starts taking effect. Try it out." ;
+                rdfs:comment "Changes the frequency at which the filter starts taking effect. Try it out." ;
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;

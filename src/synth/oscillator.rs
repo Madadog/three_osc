@@ -32,11 +32,11 @@ impl OscVoice {
 /// (delta) which differs for each phase according to the `detune` parameter in
 /// `add_phase()`.
 pub struct SuperVoice {
-    pub voice_phases: [f32; 128],
+    pub voice_phases: [f32; 32],
 }
 impl SuperVoice {
     pub fn new(phase: f32, phase_random: f32) -> Self {
-        let mut voice_phases = [phase; 128];
+        let mut voice_phases = [phase; 32];
         let rng = fastrand::Rng::new();
 
         for phase in voice_phases.iter_mut() {
@@ -68,7 +68,7 @@ impl SuperVoice {
         voice_count: usize,
         voices_detune: f32,
         pm: f32,
-    ) -> [f32; 128] {
+    ) -> [f32; 32] {
         self.add_phase(delta, voice_count, voices_detune);
         let pm = pm * 150.0;
         let mut out = self.voice_phases;

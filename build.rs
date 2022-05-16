@@ -335,7 +335,7 @@ impl PortList {
             ControlPort::new(
                 "voices",
                 "Unison",
-                Int(1, (1, 128)),
+                Int(1, (1, 32)),
             ).comment("Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound."),
             ControlPort::new(
                 "super_detune",
@@ -396,7 +396,7 @@ impl PortList {
             ControlPort::new(
                 "voices",
                 "Unison",
-                Int(1, (1, 128)),
+                Int(1, (1, 32)),
             ).comment("Copies of this oscillator which are overlaid at different pitches. Useful for the supersaw sound."),
             ControlPort::new(
                 "super_detune",
@@ -555,7 +555,7 @@ impl PortList {
                 "Cutoff Freq.",
                 Float(22000.0, (10.0, 22000.0)),
             ).logarithmic()
-            .comment("Changes frequency at which the filter starts taking effect. Try it out."),
+            .comment("Changes the frequency at which the filter starts taking effect. Try it out."),
             ControlPort::new(
                 "resonance",
                 "Resonance",

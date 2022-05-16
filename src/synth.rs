@@ -202,7 +202,9 @@ impl ThreeOsc {
                 match self.lfo_params.target_osc {
                     Some(x) => {
                         osc_lfo_amp[x] = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod);
-                        osc_lfo_mod[x] = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod);
+                        if let Some(lfo_mod) = osc_lfo_mod.get_mut(x + 1) {
+                            *lfo_mod = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod);
+                        };
                         osc_delta[x] = osc_delta[x] + osc_delta[x] * lfo * self.lfo_params.freq_mod;
                     },
                     None => {
@@ -219,6 +221,7 @@ impl ThreeOsc {
                 .rev()
                 .fold(0.0, |mod_osc_out, (i, osc)| {
                     let delta = modulate_delta(osc_delta[i], mod_osc_out * osc.fm);
+
                     let phases = voice.osc_voice[i].unison_phases(
                         delta,
                         osc.voice_count.into(),
