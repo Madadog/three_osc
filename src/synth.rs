@@ -158,9 +158,9 @@ impl ThreeOsc {
             voice.pitch_multiply = self.octave_detune;
 
             match voice.filter {
-                // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
+                // Biquad/SVF/none filters are unaffected by drive, so we clamp it between 0 and 1 to
                 // keep the levels the same when switching filter.
-                FilterContainer::BiquadFilter(_) | FilterContainer::None => {
+                FilterContainer::BiquadFilter(_) | FilterContainer::SvfSimperFilter(_) | FilterContainer::None => {
                     self.filter_controller.drive = self.filter_controller.drive.min(1.0)
                 }
                 _ => {}
