@@ -165,7 +165,7 @@ impl Plugin for SynthLv2 {
         self.synth.gain_envelope.release_time = *ports.vol_release;
         self.synth.gain_envelope.set_slope(*ports.vol_slope);
 
-        self.synth.filter_controller.envelope_amount = (*ports.fil1_env_amount).powi(2) * 22000.0;
+        self.synth.filter_controller.envelope_amount = (*ports.fil1_env_amount).powi(2) * 1.0;
         self.synth.filter_controller.keytrack = *ports.fil1_keytrack;
         self.synth.filter_controller.cutoff_envelope.attack_time = if *ports.fil1_attack <= 0.001 {
             0.0

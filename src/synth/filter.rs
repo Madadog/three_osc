@@ -212,10 +212,10 @@ impl FilterController {
             let release_time = release_index as f32 / sample_rate as f32;
             self.cutoff_envelope
                 .sample_released(release_time, envelope_index)
-                * self.envelope_amount
         } else {
-            self.cutoff_envelope.sample_held(envelope_index) * self.envelope_amount
+            self.cutoff_envelope.sample_held(envelope_index)
         };
+        let envelope = envelope * self.envelope_amount * (440.0 + self.cutoff * cutoff_mult) * 50.0;
         (self.cutoff * cutoff_mult + envelope).clamp(10.0, 22000.0)
     }
 }
