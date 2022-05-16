@@ -94,6 +94,8 @@ pub struct OscillatorParams {
 
     pub voice_count: u8,
     pub voices_detune: f32,
+    /// Amp to keep volume roughly equal across different voice counts
+    pub unison_amp: f32,
     pub wave: OscWave,
     pub phase: f32,
     pub phase_rand: f32,
@@ -117,6 +119,8 @@ impl OscillatorParams {
         self.total_multiplier = self.calc_pitch_mult()
     }
     pub fn total_pitch_multiplier(&self) -> f32 { self.total_multiplier }
+    pub fn calc_unison_amp(&self) -> f32 {1.0 / (self.voice_count as f32).sqrt()}
+    pub fn update_unison_amp(&mut self) {self.unison_amp = self.calc_unison_amp()}
 }
 impl Default for OscillatorParams {
     fn default() -> Self {
@@ -128,6 +132,7 @@ impl Default for OscillatorParams {
             total_multiplier: 1.0,
             voice_count: 1,
             voices_detune: 0.1,
+            unison_amp: 1.0,
             wave: OscWave::Sine,
             phase: 0.0,
             phase_rand: PI * 2.0,

@@ -9,10 +9,8 @@ use self::notes::Notes;
 use self::oscillator::OscVoice;
 use self::oscillator::OscWave;
 use self::oscillator::modulate_delta;
-use self::oscillator::AdditiveOsc;
 use self::oscillator::OscillatorParams;
 use self::oscillator::SuperVoice;
-use self::oscillator::WavetableNotes;
 use self::oscillator::WavetableSet;
 
 pub struct ThreeOsc {
@@ -146,15 +144,12 @@ impl ThreeOsc {
 
         // Minor optimisation: Semitone / octave / pitch multiplier offset is calculated and cached
         // once per run, not once per sample
-        self.oscillators[0].update_total_pitch();
-        self.oscillators[1].update_total_pitch();
-        self.oscillators[2].update_total_pitch();
+        for osc in self.oscillators.iter_mut() {
+            osc.update_total_pitch();
+            osc.update_unison_amp();
+        }
 
         let lfo_delta = self.lfo_params.delta(self.sample_rate as f32);
-
-        let osc1_unison_amp = 1.0 / (self.oscillators[0].voice_count as f32).sqrt();
-        let osc2_unison_amp = 1.0 / (self.oscillators[1].voice_count as f32).sqrt();
-        let osc3_unison_amp = 1.0 / (self.oscillators[2].voice_count as f32).sqrt();
 
         // Write samples from all voices
         for voice in self.voices.iter_mut() {
@@ -172,125 +167,82 @@ impl ThreeOsc {
             };
 
             for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
-                voice.semitone_detune = lerp(voice.semitone_detune, 0.0, self.portamento_rate);
+                let mut out = 0.0;
 
+                voice.advance();
+                let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
+                
                 let delta = voice.delta(self.sample_rate as f32);
-                let osc3_delta = delta * self.oscillators[2].total_pitch_multiplier();
-                let osc2_delta = delta * self.oscillators[1].total_pitch_multiplier();
-                let osc1_delta = delta * self.oscillators[0].total_pitch_multiplier();
-
+                
+                let mut osc_delta = [0.0; 3];
+                for (x, osc) in izip!(osc_delta.iter_mut(), self.oscillators.iter()) {
+                    *x = osc.total_pitch_multiplier() * delta;
+                }
+                
                 for osc in self.oscillators.iter_mut() {
                     if let OscWave::Pulse { width } = &mut osc.wave {
                         *width = osc.pulse_width;
                     }
                 }
-
-                let lfo_phase = voice.lfo.add_phase(lfo_delta);
-                let lfo = self.lfo_params.wave.generate(lfo_phase);
                 
-                // set / bypass modulation depending on LFO target 
-                let (
-                    (osc1_delta, osc2_delta, osc3_delta),
-                    (osc1_lfo_amp, osc2_lfo_amp, osc3_lfo_amp),
-                    (osc1_lfo_mod, osc2_lfo_mod)
-                ) = match self.lfo_params.target_osc {
-                    Some(0) => {((osc1_delta + osc1_delta * lfo * self.lfo_params.freq_mod, osc2_delta, osc3_delta),
-                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod), 1.0, 1.0),
-                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod), 1.0),
-                    )},
-                    Some(1) => {((osc1_delta, osc2_delta + osc2_delta * lfo * self.lfo_params.freq_mod, osc3_delta),
-                        (1.0, lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod), 1.0),
-                        (1.0, lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod)),
-                    )},
-                    Some(2) => {((osc1_delta, osc2_delta, osc3_delta + osc3_delta * lfo * self.lfo_params.freq_mod),
-                        (1.0, lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod), 1.0),
-                        (1.0, 1.0),
-                    )},
-                    // no target / invalid target: default to modulating all
-                    _ => {(
-                        (osc1_delta + osc1_delta * lfo * self.lfo_params.freq_mod,
-                            osc2_delta + osc2_delta * lfo * self.lfo_params.freq_mod,
-                            osc3_delta + osc3_delta * lfo * self.lfo_params.freq_mod),
-                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
-                            lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod),
-                            lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod)),
-                        (lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),
-                            lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod),)
-                    )}
-                };
-
+                voice.semitone_detune = lerp(voice.semitone_detune, 0.0, self.portamento_rate);
+                
                 let keytrack_freq = 2.0_f32.powf(
                     (voice.id as f32 - 69.0 + voice.semitone_detune) / 12.0
                         * self.filter_controller.keytrack,
                 );
 
-                let mut out = 0.0;
+                let lfo_phase = voice.lfo.add_phase(lfo_delta);
+                let lfo = self.lfo_params.wave.generate(lfo_phase);
+                
+                let mut osc_lfo_amp = [1.0; 3];
+                let mut osc_lfo_mod = [1.0; 3];
 
-                voice.advance();
-                let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
-
-                let osc3_out = if self.oscillators[2].amp > 0.0
-                || self.oscillators[1].am > 0.0
-                || self.oscillators[1].pm > 0.0
-                || self.oscillators[1].fm > 0.0 {
-                    let osc = &self.oscillators[2];
-                    let phases = voice.osc_voice[2].unison_phases(
-                        osc3_delta,
-                        osc.voice_count.into(),
-                        osc.voices_detune,
-                    );
-                    let mut osc_out = self.waves.select(&osc.wave).delta_index(osc3_delta, self.sample_rate as f32)
-                        .generate_multi(phases, osc.voice_count.into())
-                        * osc3_unison_amp;
-                    // if pulse wave, subtract 2 saw waves
-                    if let OscWave::Pulse { width } = osc.wave {
-                        osc_out -= self.waves.select(&osc.wave).delta_index(osc3_delta, self.sample_rate as f32)
-                        .generate_multi_pm(phases, osc.voice_count.into(), width)
-                        * osc3_unison_amp;
+                // set / bypass modulation depending on LFO target 
+                match self.lfo_params.target_osc {
+                    Some(x) => {
+                        osc_lfo_amp[x] = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod);
+                        osc_lfo_mod[x] = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod);
+                        osc_delta[x] = osc_delta[x] + osc_delta[x] * lfo * self.lfo_params.freq_mod;
+                    },
+                    None => {
+                        for (lfo_amp, lfo_mod, delta) in izip!(osc_lfo_amp.iter_mut(), osc_lfo_mod.iter_mut(), osc_delta.iter_mut()) {
+                            *lfo_amp = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod);
+                            *lfo_mod = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod);
+                            *delta = *delta + *delta * lfo * self.lfo_params.freq_mod;
+                        }
                     }
-                    out += osc_out * osc.amp * velocity * osc3_lfo_amp;
-                    osc_out * osc2_lfo_mod
-                } else { 0.0 };
+                };
 
-                let osc2_out = if self.oscillators[1].amp > 0.0
-                || self.oscillators[0].am > 0.0
-                || self.oscillators[0].pm > 0.0
-                || self.oscillators[0].fm > 0.0 {
-                    let osc = &self.oscillators[1];
-                    let delta = modulate_delta(osc2_delta, osc3_out * osc.fm);
-                    let phases = voice.osc_voice[1].unison_phases(
+                self.oscillators.iter_mut()
+                .enumerate()
+                .rev()
+                .fold(0.0, |mod_osc_out, (i, osc)| {
+                    let delta = modulate_delta(osc_delta[i], mod_osc_out * osc.fm);
+                    let phases = voice.osc_voice[i].unison_phases(
                         delta,
                         osc.voice_count.into(),
                         osc.voices_detune,
                     );
 
-                    let mut osc_out = self.waves.select(&osc.wave).delta_index(osc2_delta, self.sample_rate as f32)
-                        .generate_multi_pm(&phases, osc.voice_count.into(), osc3_out * osc.pm * 150.0)
-                        * osc2_unison_amp;
-
-                    osc_out *= lerp(1.0, (osc3_out + 1.0) / 2.0, osc.am);
-                    out += osc_out * osc.amp * velocity * osc2_lfo_amp;
-                    osc_out * osc1_lfo_mod
-                } else {0.0};
-
-                if self.oscillators[0].amp > 0.0 {
-                    let osc = &self.oscillators[0];
-                    let delta = modulate_delta(osc1_delta, osc2_out * osc.fm).abs();
-                    let phases = voice.osc_voice[0].unison_phases(
-                        delta,
-                        osc.voice_count.into(),
-                        osc.voices_detune,
-                    );
-
-                    let mut osc_out = self.waves.select(&osc.wave).delta_index(osc1_delta, self.sample_rate as f32)
+                    let mut osc_out = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
                         .generate_multi_pm(
                         &phases,
                         osc.voice_count.into(),
-                        osc2_out * osc.pm * 150.0,
-                    ) * osc1_unison_amp;
+                        mod_osc_out * osc.pm * 150.0,
+                    ) * osc.unison_amp;
 
-                    out += osc_out * osc.amp * velocity * lerp(1.0, (osc2_out + 1.0) / 2.0, osc.am) * osc1_lfo_amp;
-                }
+                    // if pulse wave, subtract 2 saw waves
+                    if let OscWave::Pulse { width } = osc.wave {
+                        osc_out -= self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
+                        .generate_multi_pm(phases, osc.voice_count.into(), width)
+                        * osc.unison_amp;
+                    }
+
+                    out += osc_out * osc.amp * velocity * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
+
+                    osc_out * osc_lfo_mod[i]
+                });
 
                 // Update filter controls
                 let cutoff = self.filter_controller.get_cutoff(
@@ -299,7 +251,6 @@ impl ThreeOsc {
                     voice.release_time,
                     self.sample_rate as f32,
                 );
-
                 
                 voice.filter.set(
                     self.filter_controller.filter_model,
