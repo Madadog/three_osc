@@ -196,7 +196,7 @@ impl Plugin for SynthLv2 {
             x if x < 1.0 => FilterModel::None,
             x if x < 2.0 => FilterModel::RcFilter,
             x if x < 3.0 => FilterModel::LadderFilter,
-            x if x <= 4.0 => FilterModel::BiquadFilter,
+            x if x <= 4.0 => FilterModel::SvfSimperFilter,
             _ => FilterModel::None,
         };
 

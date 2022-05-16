@@ -1,4 +1,5 @@
 use self::ladder::{tanh_pade32_f32, LadderFilter};
+use self::svf_simper::SvfSimper;
 
 use super::lerp;
 
@@ -18,8 +19,10 @@ pub struct BiquadFilter {
     pub(crate) b0: f32, // [n] out
     pub(crate) b1: f32, // [n-1] out
     pub(crate) b2: f32,
+    // targets for coefficient interpolation:
     pub(crate) target_a: (f32, f32, f32),
     pub(crate) target_b: (f32, f32, f32),
+    /// Default coefficient interpolation rate 
     pub(crate) lerp_amount: f32,
     pub(crate) filter_type: FilterType,
 }
@@ -47,6 +50,9 @@ impl BiquadFilter {
         filter.b0 = coeffs.3;
         filter.b1 = coeffs.4;
         filter.b2 = coeffs.5;
+
+        filter.target_a = (filter.a0, filter.a1, filter.a2);
+        filter.target_b = (filter.b0, filter.b1, filter.b2);
 
         filter.lerp_amount = 705.6 / sample_rate;
 
@@ -222,6 +228,7 @@ pub enum FilterContainer {
     RcFilter(RcFilter),
     LadderFilter(LadderFilter),
     BiquadFilter(BiquadFilter),
+    SvfSimperFilter(SvfSimper),
 }
 impl FilterContainer {
     pub fn set(
@@ -236,7 +243,13 @@ impl FilterContainer {
             (FilterContainer::RcFilter(_), FilterModel::RcFilter) => {}
             (FilterContainer::LadderFilter(_), FilterModel::LadderFilter) => {}
             (FilterContainer::BiquadFilter(_), FilterModel::BiquadFilter) => {}
-            (x, FilterModel::RcFilter) => *x = FilterContainer::RcFilter(RcFilter::default()),
+            (FilterContainer::SvfSimperFilter(_), FilterModel::SvfSimperFilter) => {}
+            (x, FilterModel::RcFilter) => {
+                let mut filter = RcFilter::new(sample_rate, cutoff, resonance);
+                filter.set_filter_type(filter_type);
+                filter.order = FilterOrder::_24dB;
+                *x = FilterContainer::RcFilter(filter)
+            },
             (x, FilterModel::LadderFilter) => {
                 *x = FilterContainer::LadderFilter(LadderFilter::default())
             }
@@ -247,6 +260,11 @@ impl FilterContainer {
                     sample_rate,
                     filter_type,
                 ))
+            }
+            (x, FilterModel::SvfSimperFilter) => {
+                let mut filter = SvfSimper::new(cutoff, resonance, sample_rate);
+                filter.filter_type = filter_type;
+                *x = FilterContainer::SvfSimperFilter(filter)
             }
             (x, FilterModel::None) => *x = FilterContainer::None,
             #[allow(unreachable_patterns)]
@@ -262,6 +280,7 @@ impl Filter for FilterContainer {
             FilterContainer::RcFilter(x) => x.process(input),
             FilterContainer::LadderFilter(x) => x.process(input / 2.0) * 2.0,
             FilterContainer::BiquadFilter(x) => x.process(input),
+            FilterContainer::SvfSimperFilter(x) => x.process(input),
             _ => input,
         }
     }
@@ -270,6 +289,7 @@ impl Filter for FilterContainer {
             FilterContainer::RcFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             FilterContainer::LadderFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             FilterContainer::BiquadFilter(x) => x.set_params(sample_rate, cutoff, resonance),
+            FilterContainer::SvfSimperFilter(x) => x.set_params(sample_rate, cutoff, resonance / 10.0),
             _ => {}
         }
     }
@@ -278,6 +298,7 @@ impl Filter for FilterContainer {
             FilterContainer::RcFilter(x) => x.set_filter_type(filter_type),
             FilterContainer::LadderFilter(x) => x.set_filter_type(filter_type),
             FilterContainer::BiquadFilter(x) => x.set_filter_type(filter_type),
+            FilterContainer::SvfSimperFilter(x) => x.set_filter_type(filter_type),
             _ => {}
         }
     }
@@ -291,6 +312,7 @@ pub enum FilterModel {
     RcFilter,
     LadderFilter,
     BiquadFilter,
+    SvfSimperFilter,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -442,6 +464,30 @@ impl RcFilter {
             FilterType::Highpass => self.hp1,
         }
     }
+    pub fn new(sample_rate: f32, mut cutoff: f32, resonance: f32) -> Self {
+        cutoff = cutoff.clamp(5.0, 22000.0);
+        let delta = (1.0 / sample_rate) / 4.0; // division by 4.0 occurs because of oversampling when processing...
+        let freq = 1.0 / (cutoff * PI * 2.0);
+
+        let rca = 1.0 - delta / (freq + delta);
+
+        Self {
+            rca,
+            rcb: 1.0 - rca,
+            rcc: freq / (freq + delta),
+            rcq: resonance * 0.245,
+            last0: 0.0,
+            bp0: 0.0,
+            lp0: 0.0,
+            hp0: 0.0,
+            last1: 0.0,
+            bp1: 0.0,
+            lp1: 0.0,
+            hp1: 0.0,
+            order: FilterOrder::_12dB,
+            filter_type: FilterType::Lowpass,
+        }
+    }
 }
 impl Filter for RcFilter {
     // Original notice:
@@ -452,24 +498,22 @@ impl Filter for RcFilter {
     fn process(&mut self, input: f32) -> f32 {
         match &self.order {
             FilterOrder::_12dB => match &self.filter_type {
-                FilterType::Lowpass => self.filter_all_tanh(input).0,
-                FilterType::Bandpass => self.filter_all_tanh(input).1,
-                FilterType::Highpass => self.filter_all_tanh(input).2,
+                FilterType::Lowpass => self.filter_all(input).0,
+                FilterType::Bandpass => self.filter_all(input).1,
+                FilterType::Highpass => self.filter_all(input).2,
             },
-            FilterOrder::_24dB => self.filter_2nd_order_tanh(input),
+            FilterOrder::_24dB => self.filter_2nd_order(input),
         }
     }
 
-    fn set_params(&mut self, sample_rate: f32, mut cutoff: f32, resonance: f32) {
-        cutoff = cutoff.clamp(5.0, 22000.0);
-        let delta = (1.0 / sample_rate) / 4.0; // division by 4.0 occurs because of oversampling when processing...
-        let freq = 1.0 / (cutoff * PI * 2.0);
+    fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
+        let filter = Self::new(sample_rate, cutoff, resonance);
 
-        self.rca = 1.0 - delta / (freq + delta);
-        self.rcb = 1.0 - self.rca;
-        self.rcc = freq / (freq + delta);
+        self.rca = filter.rca;
+        self.rcb = filter.rcb;
+        self.rcc = filter.rcc;
 
-        self.rcq = resonance * 0.245;
+        self.rcq = filter.rcq;
     }
     fn set_filter_type(&mut self, filter_type: FilterType) {
         self.filter_type = filter_type;
@@ -497,3 +541,4 @@ impl Default for RcFilter {
 }
 
 mod ladder;
+mod svf_simper;

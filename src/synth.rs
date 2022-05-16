@@ -162,10 +162,6 @@ impl ThreeOsc {
 
             voice.pitch_multiply = self.octave_detune;
 
-            voice
-                .filter
-                .set_filter_type(self.filter_controller.filter_type);
-
             match voice.filter {
                 // Biquad filter / none are unaffected by drive, so we clamp it between 0 and 1 to
                 // keep the levels the same when switching filter.
@@ -304,6 +300,7 @@ impl ThreeOsc {
                     self.sample_rate as f32,
                 );
 
+                
                 voice.filter.set(
                     self.filter_controller.filter_model,
                     cutoff,
@@ -312,12 +309,17 @@ impl ThreeOsc {
                     self.filter_controller.filter_type,
                 );
 
+                voice
+                    .filter
+                    .set_filter_type(self.filter_controller.filter_type);
+                
                 // Process filter
                 voice.filter.set_params(
                     self.sample_rate as f32,
                     cutoff,
                     self.filter_controller.resonance,
                 );
+
                 out = voice.filter.process(out * self.filter_controller.drive);
 
                 // amplitude envelope

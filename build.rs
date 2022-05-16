@@ -540,7 +540,7 @@ impl PortList {
                     "Ladder".to_string(),
                     "Digital".to_string(),
                 ]),
-            ).comment("There are 3 filter models: Digital is a bog-standard IIR Biquad, RC is a darker filter capable of aggressive self-resonance, and Ladder is based on a famous analog filter and sounds the best, with its code coming from janne808's Kocmoc Rack Modules project."),
+            ).comment("There are 3 filter models: Digital is an SVF identical to an IIR biquad filter (except stable over large cutoff changes), RC is a darker filter capable of aggressive self-resonance, and Ladder is based on a famous analog filter and sounds the best, with its code coming from janne808's Kocmoc Rack Modules project."),
             ControlPort::new(
                 "type",
                 "Type",
