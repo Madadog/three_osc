@@ -90,7 +90,7 @@ fn main() {
     // prepare global controls
     let volume_envelope = PortList::envelope().prefix("vol_", "Volume Env. ");
     let lfo = PortList::lfo().prefix("lfo_", "Lfo 1 ");
-    let global_controls = PortList::global().prefix("", "Global 1 ");
+    let global_controls = PortList::global().prefix("", "Global ");
 
     // add global ports
     for control in volume_envelope.0.iter().chain(lfo.0.iter()).chain(global_controls.0.iter()) {

@@ -796,7 +796,7 @@
                     lv2:ControlPort ;
                 lv2:index 61 ;
                 lv2:symbol "polyphony" ;
-                lv2:name "Global 1 Polyphony" ;
+                lv2:name "Global Polyphony" ;
                 lv2:default 0 ;
                 lv2:minimum 0 ;
                 lv2:maximum 3 ;
@@ -820,7 +820,7 @@
                     lv2:ControlPort ;
                 lv2:index 62 ;
                 lv2:symbol "portamento_rate" ;
-                lv2:name "Global 1 Portamento" ;
+                lv2:name "Global Portamento" ;
                 lv2:default 0.250 ;
                 lv2:minimum 0.000 ;
                 lv2:maximum 0.999 ;
@@ -830,7 +830,7 @@
                     lv2:ControlPort ;
                 lv2:index 63 ;
                 lv2:symbol "pitch_offset" ;
-                lv2:name "Global 1 Pitch Slide" ;
+                lv2:name "Global Pitch Slide" ;
                 lv2:default 0.000 ;
                 lv2:minimum -96.000 ;
                 lv2:maximum 96.000 ;
@@ -840,7 +840,7 @@
                     lv2:ControlPort ;
                 lv2:index 64 ;
                 lv2:symbol "octave_detune" ;
-                lv2:name "Global 1 Octave Drift" ;
+                lv2:name "Global Octave Drift" ;
                 lv2:default 0.000 ;
                 lv2:minimum -0.040 ;
                 lv2:maximum 0.040 ;
@@ -850,7 +850,7 @@
                     lv2:ControlPort ;
                 lv2:index 65 ;
                 lv2:symbol "output_gain" ;
-                lv2:name "Global 1 Output Gain" ;
+                lv2:name "Global Output Gain" ;
                 lv2:default -18.000 ;
                 lv2:minimum -90.000 ;
                 lv2:maximum 0.000 ;
@@ -860,7 +860,7 @@
                     lv2:ControlPort ;
                 lv2:index 66 ;
                 lv2:symbol "global_pitch" ;
-                lv2:name "Global 1 Output Pitch" ;
+                lv2:name "Global Output Pitch" ;
                 lv2:default 0 ;
                 lv2:minimum -24 ;
                 lv2:maximum 24 ;
@@ -872,7 +872,7 @@
                     lv2:ControlPort ;
                 lv2:index 67 ;
                 lv2:symbol "bend_range" ;
-                lv2:name "Global 1 Bend Range" ;
+                lv2:name "Global Bend Range" ;
                 lv2:default 2 ;
                 lv2:minimum -24 ;
                 lv2:maximum 24 ;
