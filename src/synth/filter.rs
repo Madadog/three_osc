@@ -278,7 +278,7 @@ impl Filter for FilterContainer {
     fn process(&mut self, input: f32) -> f32 {
         match self {
             FilterContainer::RcFilter(x) => x.process(input),
-            FilterContainer::LadderFilter(x) => x.process(input / 2.0) * 2.0,
+            FilterContainer::LadderFilter(x) => x.process(input),
             FilterContainer::BiquadFilter(x) => x.process(input),
             FilterContainer::SvfSimperFilter(x) => x.process(input),
             _ => input,
@@ -289,7 +289,7 @@ impl Filter for FilterContainer {
             FilterContainer::RcFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             FilterContainer::LadderFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             FilterContainer::BiquadFilter(x) => x.set_params(sample_rate, cutoff, resonance),
-            FilterContainer::SvfSimperFilter(x) => x.set_params(sample_rate, cutoff, resonance / 10.0),
+            FilterContainer::SvfSimperFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             _ => {}
         }
     }

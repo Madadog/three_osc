@@ -64,7 +64,6 @@ Coming soon...
 * Use naive wave generation for modulation between oscillators? (stop ringing artifacts)
 * Add oversampling with a control (for FM / PM)
 * Switch between Naive, Wavetable, and Additive synthesis with a control
-* Reduce super voices / optimize (switch to zynaddsubfx unison/chorus effect?)
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
 * Adjust more knobs to sensible values / defaults
 * Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonably nice)

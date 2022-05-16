@@ -102,7 +102,7 @@ impl Filter for SvfSimper {
     }
 
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
-        self.set(cutoff, resonance, sample_rate)
+        self.set(cutoff, resonance / 10.0, sample_rate)
     }
 
     fn set_filter_type(&mut self, filter_type: FilterType) {

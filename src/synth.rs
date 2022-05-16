@@ -157,13 +157,16 @@ impl ThreeOsc {
 
             voice.pitch_multiply = self.octave_detune;
 
-            match voice.filter {
+            let drive = match voice.filter {
                 // Biquad/SVF/none filters are unaffected by drive, so we clamp it between 0 and 1 to
                 // keep the levels the same when switching filter.
                 FilterContainer::BiquadFilter(_) | FilterContainer::SvfSimperFilter(_) | FilterContainer::None => {
-                    self.filter_controller.drive = self.filter_controller.drive.min(1.0)
+                    self.filter_controller.drive.min(1.0)
                 }
-                _ => {}
+                FilterContainer::LadderFilter(_) => {
+                    self.filter_controller.drive / 2.0
+                }
+                _ => {self.filter_controller.drive}
             };
 
             for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
@@ -242,7 +245,7 @@ impl ThreeOsc {
                         * osc.unison_amp;
                     }
 
-                    out += osc_out * osc.amp * velocity * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
+                    out += osc_out * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
 
                     osc_out * osc_lfo_mod[i]
                 });
@@ -274,7 +277,7 @@ impl ThreeOsc {
                     self.filter_controller.resonance,
                 );
 
-                out = voice.filter.process(out * self.filter_controller.drive);
+                out = voice.filter.process(out * drive);
 
                 // amplitude envelope
                 out = if let Some(release_time) = voice.release_time {
@@ -285,6 +288,9 @@ impl ThreeOsc {
                 } else {
                     out * self.gain_envelope.sample_held(envelope_index)
                 };
+
+                // keyboard velocity scaling
+                out *= velocity;
 
                 *out_l += out;
                 *out_r += out;
