@@ -332,7 +332,11 @@ impl Wavetable {
     }
     #[inline]
     pub fn phase_to_index(&self, phase: f32) -> f32 {
-        (phase / (2.0 * PI)) * self.table.len() as f32
+        // Number is slightly greater than 2 to prevent OOB indexes
+        // when phase/2PI == 1, at the expense of a small downwards
+        // pitch detune.
+        // TODO: Find out how many decimal points f32 can handle here, or rethink indexing so that it doesn't require this unnecessary division
+        (phase / (2.000001 * PI)) * self.table.len() as f32
     }
     #[inline]
     pub fn generate(&self, phase: f32) -> f32 {
@@ -349,10 +353,10 @@ impl Wavetable {
     #[inline]
     pub fn generate_multi_pm(&self, phases: &[f32], max: usize, phase_offset: f32) -> f32 {
         phases
-            .iter()
-            .take(max)
-            .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
-            .sum()
+        .iter()
+        .take(max)
+        .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
+        .sum()
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
