@@ -859,6 +859,16 @@
                 a lv2:InputPort ,
                     lv2:ControlPort ;
                 lv2:index 66 ;
+                lv2:symbol "stereo_width" ;
+                lv2:name "Global Stereo Width" ;
+                lv2:default 0.000 ;
+                lv2:minimum 0.000 ;
+                lv2:maximum 1.000 ;
+                rdfs:comment "Stereo width for voice unison. At 0 the signal is mono: both stereo outputs are identical." ;
+        ] , [
+                a lv2:InputPort ,
+                    lv2:ControlPort ;
+                lv2:index 67 ;
                 lv2:symbol "global_pitch" ;
                 lv2:name "Global Output Pitch" ;
                 lv2:default 0 ;
@@ -870,7 +880,7 @@
         ] , [
                 a lv2:InputPort ,
                     lv2:ControlPort ;
-                lv2:index 67 ;
+                lv2:index 68 ;
                 lv2:symbol "bend_range" ;
                 lv2:name "Global Bend Range" ;
                 lv2:default 2 ;

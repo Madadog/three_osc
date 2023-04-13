@@ -448,6 +448,11 @@ impl PortList {
                 Float(-18.0, (-90.0, 0.0)),
             ).comment("Master output volume. Adjust if the synth is too loud / too quiet."),
             ControlPort::new(
+                "stereo_width",
+                "Stereo Width",
+                Float(0.0, (0.0, 1.0)),
+            ).comment("Stereo width for voice unison. At 0 the signal is mono: both stereo outputs are identical."),
+            ControlPort::new(
                 "global_pitch",
                 "Output Pitch",
                 Int(0, (-24, 24)),

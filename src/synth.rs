@@ -28,6 +28,7 @@ pub struct ThreeOsc {
     pub portamento_rate: f32,
     pub portamento_offset: f32,
     pub lfo_params: LfoParams,
+    pub stereo_width: Option<f32>,
 }
 
 impl ThreeOsc {
@@ -52,6 +53,7 @@ impl ThreeOsc {
             portamento_rate: 0.1,
             portamento_offset: 0.0,
             lfo_params: Default::default(),
+            stereo_width: None,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -171,6 +173,7 @@ impl ThreeOsc {
 
             for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
                 let mut out = 0.0;
+                let mut out_stereo = 0.0;
 
                 voice.advance();
                 let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
@@ -231,23 +234,44 @@ impl ThreeOsc {
                         osc.voices_detune,
                     );
 
-                    let mut osc_out = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
-                        .generate_multi_pm(
-                        &phases,
-                        osc.voice_count.into(),
-                        mod_osc_out * osc.pm * 150.0,
-                    ) * osc.unison_amp;
-
-                    // if pulse wave, subtract 2 saw waves
-                    if let OscWave::Pulse { width } = osc.wave {
-                        osc_out -= self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
-                        .generate_multi_pm(phases, osc.voice_count.into(), width)
-                        * osc.unison_amp;
+                    if let Some(width) = self.stereo_width {
+                        let (mut osc_out_l, mut osc_out_r) = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
+                            .generate_multi_stereo_pm(
+                            &phases,
+                            osc.voice_count.into(),
+                            mod_osc_out * osc.pm * 150.0,
+                        );
+    
+                        // if pulse wave, subtract 2 saw waves
+                        if let OscWave::Pulse { width } = osc.wave {
+                            let pulse = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
+                            .generate_multi_stereo_pm(phases, osc.voice_count.into(), width);
+                            osc_out_l -= pulse.0;
+                            osc_out_r -= pulse.1;
+                        }
+    
+                        out += osc_out_l * osc.unison_amp * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
+                        out_stereo += osc_out_r * osc.unison_amp * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
+    
+                        osc_out_l + osc_out_r
+                    } else {
+                        let mut osc_out = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
+                            .generate_multi_pm(
+                            &phases,
+                            osc.voice_count.into(),
+                            mod_osc_out * osc.pm * 150.0,
+                        );
+    
+                        // if pulse wave, subtract 2 saw waves
+                        if let OscWave::Pulse { width } = osc.wave {
+                            osc_out -= self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
+                            .generate_multi_pm(phases, osc.voice_count.into(), width);
+                        }
+    
+                        out += osc_out * osc.unison_amp * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
+    
+                        osc_out * osc_lfo_mod[i]
                     }
-
-                    out += osc_out * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
-
-                    osc_out * osc_lfo_mod[i]
                 });
 
                 // Update filter controls
@@ -279,21 +303,40 @@ impl ThreeOsc {
 
                 out = voice.filter.process(out * drive);
 
-                // amplitude envelope
-                out = if let Some(release_time) = voice.release_time {
-                    let release_index = release_time as f32 / self.sample_rate as f32;
-                    out * self
-                        .gain_envelope
-                        .sample_released(release_index, envelope_index)
+                if let Some(width) = self.stereo_width {
+                    // amplitude envelope
+                    let envelope = if let Some(release_time) = voice.release_time {
+                        let release_index = release_time as f32 / self.sample_rate as f32;
+                        self
+                            .gain_envelope
+                            .sample_released(release_index, envelope_index)
+                    } else {
+                        self.gain_envelope.sample_held(envelope_index)
+                    };
+    
+                    // keyboard velocity scaling
+                    out *= velocity;
+                    out_stereo *= velocity;
+    
+                    *out_l += out * envelope;
+                    *out_r += out_stereo * envelope;
                 } else {
-                    out * self.gain_envelope.sample_held(envelope_index)
-                };
-
-                // keyboard velocity scaling
-                out *= velocity;
-
-                *out_l += out;
-                *out_r += out;
+                    // amplitude envelope
+                    out = if let Some(release_time) = voice.release_time {
+                        let release_index = release_time as f32 / self.sample_rate as f32;
+                        out * self
+                            .gain_envelope
+                            .sample_released(release_index, envelope_index)
+                    } else {
+                        out * self.gain_envelope.sample_held(envelope_index)
+                    };
+    
+                    // keyboard velocity scaling
+                    out *= velocity;
+    
+                    *out_l += out;
+                    *out_r += out;
+                }
             }
         }
         // Apply output volume

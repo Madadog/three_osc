@@ -72,6 +72,8 @@ Coming soon...
 * Use audio buffering for more optimisations
 * Optimise
 * Delete LV2, switch to VST and add gui with egui
+* Extract DSP to internal crate
+* Port to https://github.com/robbert-vdh/nih-plug
 
 ## LICENSE
 The Three Osc project is licensed under the GNU General Public Licence version 3.

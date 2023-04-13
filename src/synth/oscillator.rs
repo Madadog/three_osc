@@ -1,10 +1,14 @@
 use std::{
     convert::TryInto,
-    f32::consts::{FRAC_1_SQRT_2, PI}, iter,
+    f32::consts::{FRAC_1_SQRT_2, PI},
+    iter,
 };
 
 use itertools::izip;
-use rustfft::{FftPlanner, num_complex::{Complex, Complex32}};
+use rustfft::{
+    num_complex::{Complex, Complex32},
+    FftPlanner,
+};
 
 use super::lerp;
 
@@ -61,7 +65,7 @@ impl SuperVoice {
         self.add_phase(delta, voice_count, voices_detune);
         &self.voice_phases
     }
-    /// TODO: this duplicates all 128 phases, every time. 
+    /// TODO: this duplicates all 128 phases, every time.
     pub fn unison_phases_pm(
         &mut self,
         delta: f32,
@@ -118,9 +122,15 @@ impl OscillatorParams {
     pub fn update_total_pitch(&mut self) {
         self.total_multiplier = self.calc_pitch_mult()
     }
-    pub fn total_pitch_multiplier(&self) -> f32 { self.total_multiplier }
-    pub fn calc_unison_amp(&self) -> f32 {1.0 / (self.voice_count as f32).sqrt()}
-    pub fn update_unison_amp(&mut self) {self.unison_amp = self.calc_unison_amp()}
+    pub fn total_pitch_multiplier(&self) -> f32 {
+        self.total_multiplier
+    }
+    pub fn calc_unison_amp(&self) -> f32 {
+        1.0 / (self.voice_count as f32).sqrt()
+    }
+    pub fn update_unison_amp(&mut self) {
+        self.unison_amp = self.calc_unison_amp()
+    }
 }
 impl Default for OscillatorParams {
     fn default() -> Self {
@@ -153,9 +163,9 @@ pub enum OscWave {
     Saw,
     Exp,
     Square,
-    Pulse {width: f32},
+    Pulse { width: f32 },
 }
-#[allow(dead_code)]
+
 impl OscWave {
     /// Generates the waveform at the specified phase, attempting to keep waveform volumes
     /// normalised.
@@ -254,22 +264,19 @@ pub fn modulate_delta(delta: f32, linear_fm: f32) -> f32 {
     delta.rem_euclid(2.0 * PI)
 }
 
-/// Efficient constant frequency sine approximation.
+/// Efficient constant frequency sine approximation based on 2D rotation.
 ///
 /// From https://www.iquilezles.org/www/articles/sincos/sincos.htm
 ///
-/// SimpleSin decays and approaches zero faster with higher delta,
-/// due to floating point precision issues. I briefly tried f64 but
-/// didn't notice much of an improvement.
-#[allow(dead_code)]
-pub struct SinApprox {
+/// Accurate at low frequencies, but grows or decays exponentially
+/// depending on your processor due to floating point precision.
+pub struct CoupledFormQuad {
     sin_dt: f32,
     cos_dt: f32,
     sin: f32,
     cos: f32,
 }
-#[allow(dead_code)]
-impl SinApprox {
+impl CoupledFormQuad {
     pub fn new(phase: f32, delta: f32) -> Self {
         let (sin_dt, cos_dt) = delta.sin_cos();
         let (sin, cos) = phase.sin_cos();
@@ -308,11 +315,50 @@ impl SinApprox {
     }
 }
 
+/// from https://ccrma.stanford.edu/~jos/pasp/Digital_Sinusoid_Generators.html
+/// Supposedly more numerically stable, but cos is offset by half a sample.
+pub struct MagicCircleQuad {
+    parameter: f32,
+    sin: f32,
+    cos: f32,
+}
+impl MagicCircleQuad {
+    pub fn new(delta: f32) -> Self {
+        let (parameter, cos) = (delta / 2.0).sin_cos();
+        let parameter = parameter * 2.0;
+        Self {
+            parameter,
+            sin: 0.0,
+            cos,
+        }
+    }
+    #[inline]
+    pub fn next(&mut self) -> (f32, f32) {
+        self.cos = self.cos - self.sin * self.parameter;
+        self.sin = self.sin + self.cos * self.parameter;
+        (self.sin, self.cos)
+    }
+    pub fn set_delta(&mut self, delta: f32) {
+        let parameter = (delta / 2.0).sin() * 2.0;
+        *self = Self { parameter, ..*self }
+    }
+    pub fn sin(&self) -> f32 {
+        self.sin
+    }
+    pub fn cos(&self) -> f32 {
+        self.cos
+    }
+}
+
+/// from https://vicanek.de/articles/QuadOsc.pdf
+///
+pub struct QuadOsc;
+
 #[derive(Debug, Clone)]
 pub struct Wavetable {
     pub table: Vec<f32>,
 }
-#[allow(dead_code)]
+
 impl Wavetable {
     pub fn new(table: Vec<f32>) -> Self {
         Self { table }
@@ -353,10 +399,30 @@ impl Wavetable {
     #[inline]
     pub fn generate_multi_pm(&self, phases: &[f32], max: usize, phase_offset: f32) -> f32 {
         phases
-        .iter()
-        .take(max)
-        .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
-        .sum()
+            .iter()
+            .take(max)
+            .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
+            .sum()
+    }
+    #[inline]
+    pub fn generate_multi_stereo_pm(
+        &self,
+        phases: &[f32],
+        max: usize,
+        phase_offset: f32,
+    ) -> (f32, f32) {
+        phases
+            .iter()
+            .take(max)
+            .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
+            .enumerate()
+            .fold((0.0, 0.0), |(l, r), (i, gen)| {
+                if i % 2 == 0 {
+                    (l + gen, r)
+                } else {
+                    (l, r + gen)
+                }
+            })
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
@@ -402,7 +468,7 @@ impl Wavetable {
 pub struct WavetableNotes {
     pub tables: [Wavetable; 138],
 }
-#[allow(dead_code)]
+
 impl WavetableNotes {
     /// Returns `index` from the equation
     /// `440.0 * 2.0_f32.powf(index / 12.0) = frequency`
@@ -412,7 +478,8 @@ impl WavetableNotes {
     /// Returns `index` from the equation
     /// `(2.0 * PI * 440.0 * 2.0_f32.powf(index / 12.0)) = delta * sample_rate`
     pub fn delta_to_note(delta: f32, sample_rate: f32) -> usize {
-        (((sample_rate * delta / (440.0 * 2.0 * PI)).log2() * 12.0 + 69.0).ceil() as usize).clamp(0, 137)
+        (((sample_rate * delta / (440.0 * 2.0 * PI)).log2() * 12.0 + 69.0).ceil() as usize)
+            .clamp(0, 137)
     }
     /// Returns the appropriate wavetable corresponding to `delta` at `sample_rate`
     pub fn delta_index(&self, delta: f32, sample_rate: f32) -> &Wavetable {
@@ -454,19 +521,19 @@ impl WavetableNotes {
                 } else {
                     // Sample length required for note
                     (max_oversample * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
-                    .ceil() as usize
+                        .ceil() as usize
                 }
             })
             .map(|len| {
                 let clamped_len = len.clamp(min_table_len, max_table_len);
                 // Ensure waveform is bandlimited
                 let harmonics =
-                ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len / 2);
+                    ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len / 2);
                 Wavetable::from_additive_osc(osc, clamped_len, harmonics)
             })
             .collect();
-            Self {
-                tables: tables.try_into().unwrap(),
+        Self {
+            tables: tables.try_into().unwrap(),
         }
     }
     /// Generates a bandlimited wavetable for each midi note using fast fourier transforms, with constant wavetable length
@@ -476,25 +543,21 @@ impl WavetableNotes {
         table_length: usize,
     ) -> Self {
         let tables: Vec<Wavetable> = (0..=137)
-        .into_iter()
-        .map(|x| {
-            if x == 137 {
-                // highest note has no harmonics, so notes above nyquist are silent
-                0
-            } else {
-                // Number of harmonics required for note
-                (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).floor()
-                    as usize
+            .into_iter()
+            .map(|x| {
+                if x == 137 {
+                    // highest note has no harmonics, so notes above nyquist are silent
+                    0
+                } else {
+                    // Number of harmonics required for note
+                    (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).floor()
+                        as usize
                 }
             })
             .map(|harmonics| {
                 // clamp to nyquist
                 let harmonics = harmonics.min(table_length / 2);
-                Wavetable::from_additive_osc_ifft(
-                    osc,
-                    table_length,
-                    harmonics,
-                )
+                Wavetable::from_additive_osc_ifft(osc, table_length, harmonics)
             })
             .collect();
         Self {
@@ -507,10 +570,7 @@ pub struct WavetableSet {
     pub wavetables: Vec<WavetableNotes>,
 }
 impl WavetableSet {
-    pub fn new(
-        sample_rate: f32,
-        table_len: usize,
-    ) -> Self {
+    pub fn new(sample_rate: f32, table_len: usize) -> Self {
         Self {
             wavetables: vec![
                 WavetableNotes::from_additive_osc_ifft(
@@ -523,11 +583,7 @@ impl WavetableSet {
                     sample_rate,
                     table_len,
                 ),
-                WavetableNotes::from_additive_osc_ifft(
-                    &AdditiveOsc::saw(),
-                    sample_rate,
-                    table_len,
-                ),
+                WavetableNotes::from_additive_osc_ifft(&AdditiveOsc::saw(), sample_rate, table_len),
                 WavetableNotes::from_additive_osc_ifft(
                     &AdditiveOsc::fake_exp(),
                     sample_rate,
@@ -563,7 +619,7 @@ pub struct AdditiveOsc<const N: usize = 2048> {
     amplitudes: [f32; N],
     phases: [f32; N],
 }
-#[allow(dead_code)]
+
 impl<const N: usize> AdditiveOsc<N> {
     #[inline]
     pub fn generate(&self, phase: f32, harmonics: usize) -> f32 {
@@ -587,10 +643,13 @@ impl<const N: usize> AdditiveOsc<N> {
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_inverse(N);
-        let mut buffer: Vec<Complex32> = dc_offset.chain(
-            self.amplitudes.iter()
-            .take(harmonics)
-            .zip(self.phases.iter()))
+        let mut buffer: Vec<Complex32> = dc_offset
+            .chain(
+                self.amplitudes
+                    .iter()
+                    .take(harmonics)
+                    .zip(self.phases.iter()),
+            )
             // TODO: use phase
             .map(|(amplitude, _phase)| Complex {
                 re: 0.0,
@@ -661,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_simple_sin() {
-        let mut simple_sin = SinApprox::new(0.0, 1.0 / 100_000.0);
+        let mut simple_sin = CoupledFormQuad::new(0.0, 1.0 / 100_000.0);
         for _ in 0..100_000 {
             simple_sin.next();
         }
