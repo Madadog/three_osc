@@ -12,7 +12,7 @@ Currently a work in progress, but usable nevertheless.
 ## Features
 
 * 3 oscillators which can modulate eachother via phase, frequency, and amplitude modulation (PM, FM & AM) simultaneously
-* Choose between 3 multimode filters (RC, Ladder, IIR Biquad) with keytracking and envelope
+* Choose between 3 multimode filter models (RC, Ladder, Simper SVF) with keytracking and envelope
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
 * Sine, triangle, absolute sine, saw, and square waves
@@ -71,9 +71,19 @@ Coming soon...
 * Tools for working with the harmonic series
 * Use audio buffering for more optimisations
 * Optimise
-* Delete LV2, switch to VST and add gui with egui
 * Extract DSP to internal crate
 * Port to https://github.com/robbert-vdh/nih-plug
+* Sinc interpolation for wavetables instead of Lerp
+* SIMD accelerate stereo paths
+* Approximate/cache expensive computations (i.e. any uses of `powf`)
+* Fix buffer size to reduce expensive modulation calculations at the expense of sample-accurate automation (make const so that you can play around with buffer lengths, see what is good)
+* Add midi pitch bend support
+* Come up with better name for "Initial Pitch Slide" control
+* Add UI using nih-plug, make it functional
+    * 1 page, all controls
+    * 2nd page for oversampling and other unimportant things
+* Load Scala .scl and .kbm files
+* Publish
 
 ## LICENSE
 The Three Osc project is licensed under the GNU General Public Licence version 3.
