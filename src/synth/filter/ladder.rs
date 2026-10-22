@@ -197,7 +197,26 @@ impl LadderFilter {
     /// The CPU must support AVX.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx")]
-    pub unsafe fn process_block_x8(mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
+    pub unsafe fn process_block_x8(lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
+        Self::process_lanes::<Separate>(lanes)
+    }
+    /// [`process_block_x8()`][Self::process_block_x8()] with fused multiply-adds, which are
+    /// fewer instructions and shorten the chains of dependent operations. Rounding once rather
+    /// than twice, its output differs from the one-filter path's by rounding errors.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 and FMA.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn process_block_x8_fma(lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
+        Self::process_lanes::<Fused>(lanes)
+    }
+    /// The lockstep kernel, with its multiply-adds done by `M`. Inlined into the functions
+    /// above, which enable the instructions it needs.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn process_lanes<M: MulAdd>(mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
         use std::arch::x86_64::*;
 
         use super::simd::transpose8;
@@ -220,27 +239,31 @@ impl LadderFilter {
             .min()
             .unwrap_or(0);
 
-        // Gather the state of each lane
-        let gather = |get: &dyn Fn(&LadderFilter) -> f32| {
-            let mut values = [0.0_f32; LADDER_LANES];
-            for (value, lane) in values.iter_mut().zip(lanes.iter()) {
-                if let Some((filter, _)) = lane {
-                    *value = get(filter);
-                }
+        // The state of each lane, transposed into one vector per value. Empty lanes are zero.
+        let rows = std::array::from_fn(|lane| match &lanes[lane] {
+            Some((filter, _)) => {
+                let (f, resonance) = (filter, 8.0 * filter.resonance);
+                _mm256_setr_ps(f.p0, f.p1, f.p2, f.p3, f.ut_1, f.dt, resonance, f.out)
             }
-            _mm256_loadu_ps(values.as_ptr())
-        };
-        let (mut p0, mut p1) = (gather(&|f| f.p0), gather(&|f| f.p1));
-        let (mut p2, mut p3) = (gather(&|f| f.p2), gather(&|f| f.p3));
-        let mut ut_1 = gather(&|f| f.ut_1);
-        let dt = gather(&|f| f.dt);
-        let feedback = gather(&|f| 8.0 * f.resonance);
-        // The last output, before the output gain
-        let mut out = gather(&|f| f.out);
-        let mut z: [__m256; IIR_MAX_ORDER] =
-            std::array::from_fn(|i| gather(&|f| f.iir_lowpass.z[i]));
-        let mut zu: [__m256; IIR_MAX_ORDER] =
-            std::array::from_fn(|i| gather(&|f| f.iir_upsampler.z[i]));
+            None => _mm256_setzero_ps(),
+        });
+        // (`out` is the last output, before the output gain)
+        let [mut p0, mut p1, mut p2, mut p3, mut ut_1, dt, feedback, mut out] = transpose8(rows);
+        // The resampling filters' delays the cascades use, transposed eight at a time
+        let delay_groups = (2 * biquads).div_ceil(LADDER_LANES);
+        let mut z = [_mm256_setzero_ps(); IIR_MAX_ORDER];
+        let mut zu = [_mm256_setzero_ps(); IIR_MAX_ORDER];
+        for group in 0..delay_groups {
+            let at = group * LADDER_LANES;
+            let rows = |delays: fn(&LadderFilter) -> &[f32; IIR_MAX_ORDER]| {
+                std::array::from_fn(|lane| match &lanes[lane] {
+                    Some((filter, _)) => _mm256_loadu_ps(delays(filter)[at..at + LADDER_LANES].as_ptr()),
+                    None => _mm256_setzero_ps(),
+                })
+            };
+            z[at..at + LADDER_LANES].copy_from_slice(&transpose8(rows(|filter| &filter.iir_lowpass.z)));
+            zu[at..at + LADDER_LANES].copy_from_slice(&transpose8(rows(|filter| &filter.iir_upsampler.z)));
+        }
         let half_dt = _mm256_mul_ps(_mm256_set1_ps(0.5), dt);
         let upsampling_gain = _mm256_set1_ps(oversampling_factor as f32);
 
@@ -248,9 +271,9 @@ impl LadderFilter {
         // of its own, unrolled, which saves the loop's bookkeeping in every biquad.
         let cascade = |z: &mut [__m256; IIR_MAX_ORDER], input: __m256| {
             if biquads == IIR_DOWNSAMPLE_ORDER / 2 {
-                cascade_x8::<{ IIR_DOWNSAMPLE_ORDER / 2 }>(z, &coefficients, input, biquads)
+                cascade_x8::<{ IIR_DOWNSAMPLE_ORDER / 2 }, M>(z, &coefficients, input, biquads)
             } else {
-                cascade_x8::<0>(z, &coefficients, input, biquads)
+                cascade_x8::<0, M>(z, &coefficients, input, biquads)
             }
         };
 
@@ -262,16 +285,16 @@ impl LadderFilter {
             let x2 = _mm256_min_ps(_mm256_mul_ps(x, x), _mm256_set1_ps(9.0));
             _mm256_div_ps(
                 _mm256_mul_ps(clamped, _mm256_add_ps(_mm256_set1_ps(15.0), x2)),
-                _mm256_add_ps(_mm256_set1_ps(15.0), _mm256_mul_ps(_mm256_set1_ps(6.0), x2)),
+                M::mul_add(_mm256_set1_ps(6.0), x2, _mm256_set1_ps(15.0)),
             )
         };
+        // The predictor's step `p + dt (a - b)` and the corrector's
+        let predict = |p: __m256, a: __m256, b: __m256| M::mul_add(dt, _mm256_sub_ps(a, b), p);
         let correct = |p: __m256, a: __m256, b: __m256, a_prime: __m256, b_prime: __m256| {
-            _mm256_add_ps(
+            M::mul_add(
+                half_dt,
+                _mm256_add_ps(_mm256_sub_ps(a, b), _mm256_sub_ps(a_prime, b_prime)),
                 p,
-                _mm256_mul_ps(
-                    half_dt,
-                    _mm256_add_ps(_mm256_sub_ps(a, b), _mm256_sub_ps(a_prime, b_prime)),
-                ),
             )
         };
 
@@ -318,16 +341,16 @@ impl LadderFilter {
                         input_sample
                     };
 
-                    let tanh_in = tanh(_mm256_sub_ps(ut_1, _mm256_mul_ps(feedback, p3)));
+                    let tanh_in = tanh(M::neg_mul_add(feedback, p3, ut_1));
                     let tanh_p0 = tanh(p0);
                     let tanh_p1 = tanh(p1);
                     let tanh_p2 = tanh(p2);
                     let tanh_p3 = tanh(p3);
 
-                    let p0_prime = _mm256_add_ps(p0, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_in, tanh_p0)));
-                    let p1_prime = _mm256_add_ps(p1, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p0, tanh_p1)));
-                    let p2_prime = _mm256_add_ps(p2, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p1, tanh_p2)));
-                    let p3_prime = _mm256_add_ps(p3, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p2, tanh_p3)));
+                    let p0_prime = predict(p0, tanh_in, tanh_p0);
+                    let p1_prime = predict(p1, tanh_p0, tanh_p1);
+                    let p2_prime = predict(p2, tanh_p1, tanh_p2);
+                    let p3_prime = predict(p3, tanh_p2, tanh_p3);
                     let tanh_p0_prime = tanh(p0_prime);
                     let tanh_p1_prime = tanh(p1_prime);
                     let tanh_p2_prime = tanh(p2_prime);
@@ -336,7 +359,7 @@ impl LadderFilter {
                     p3 = correct(p3, tanh_p2, tanh_p3, tanh_p2_prime, tanh_p3_prime);
                     p2 = correct(p2, tanh_p1, tanh_p2, tanh_p1_prime, tanh_p2_prime);
                     p1 = correct(p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
-                    let tanh_new_in = tanh(_mm256_sub_ps(input, _mm256_mul_ps(feedback, p3)));
+                    let tanh_new_in = tanh(M::neg_mul_add(feedback, p3, input));
                     p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
 
                     // The input at the previous oversampled step
@@ -345,10 +368,7 @@ impl LadderFilter {
                     out = match mode {
                         FilterType::Lowpass => p3,
                         FilterType::Bandpass => _mm256_sub_ps(p1, p3),
-                        FilterType::Highpass => tanh(_mm256_sub_ps(
-                            _mm256_sub_ps(input, p0),
-                            _mm256_mul_ps(feedback, p3),
-                        )),
+                        FilterType::Highpass => tanh(M::neg_mul_add(feedback, p3, _mm256_sub_ps(input, p0))),
                     };
 
                     if decimate {
@@ -376,29 +396,27 @@ impl LadderFilter {
             start += len;
         }
 
-        // Scatter the state back
-        let store = |vector: __m256| {
-            let mut values = [0.0_f32; LADDER_LANES];
-            _mm256_storeu_ps(values.as_mut_ptr(), vector);
-            values
-        };
-        let (p0, p1, p2, p3, ut_1) = (store(p0), store(p1), store(p2), store(p3), store(ut_1));
-        let out = store(out);
-        let z: [[f32; LADDER_LANES]; IIR_MAX_ORDER] = std::array::from_fn(|i| store(z[i]));
-        let zu: [[f32; LADDER_LANES]; IIR_MAX_ORDER] = std::array::from_fn(|i| store(zu[i]));
-        for (lane, entry) in lanes.iter_mut().enumerate() {
+        // Transpose the state back into the filters
+        let rows = transpose8([p0, p1, p2, p3, ut_1, dt, feedback, out]);
+        for (row, entry) in rows.iter().zip(lanes.iter_mut()) {
             if let Some((filter, _)) = entry {
-                filter.p0 = p0[lane];
-                filter.p1 = p1[lane];
-                filter.p2 = p2[lane];
-                filter.p3 = p3[lane];
-                filter.ut_1 = ut_1[lane];
-                filter.out = out[lane];
-                for (filter_z, z) in filter.iir_lowpass.z.iter_mut().zip(z.iter()) {
-                    *filter_z = z[lane];
-                }
-                for (filter_z, z) in filter.iir_upsampler.z.iter_mut().zip(zu.iter()) {
-                    *filter_z = z[lane];
+                let mut values = [0.0_f32; LADDER_LANES];
+                _mm256_storeu_ps(values.as_mut_ptr(), *row);
+                [filter.p0, filter.p1, filter.p2, filter.p3, filter.ut_1] =
+                    [values[0], values[1], values[2], values[3], values[4]];
+                filter.out = values[7];
+            }
+        }
+        for group in 0..delay_groups {
+            let at = group * LADDER_LANES;
+            let lowpass = transpose8(z[at..at + LADDER_LANES].try_into().unwrap());
+            let upsampler = transpose8(zu[at..at + LADDER_LANES].try_into().unwrap());
+            for (lane, entry) in lanes.iter_mut().enumerate() {
+                if let Some((filter, _)) = entry {
+                    let delays = &mut filter.iir_lowpass.z[at..at + LADDER_LANES];
+                    _mm256_storeu_ps(delays.as_mut_ptr(), lowpass[lane]);
+                    let delays = &mut filter.iir_upsampler.z[at..at + LADDER_LANES];
+                    _mm256_storeu_ps(delays.as_mut_ptr(), upsampler[lane]);
                 }
             }
         }
@@ -641,14 +659,59 @@ impl Filter for LadderFilter {
 
 use self::iir::IIR_MAX_ORDER;
 
+/// The multiplications followed by additions in the lockstep kernel: either rounded after
+/// each operation, exactly like the one-filter path, or fused (FMA), which is fewer
+/// instructions and rounds once.
+#[cfg(target_arch = "x86_64")]
+trait MulAdd {
+    /// `a * b + c`
+    unsafe fn mul_add(a: std::arch::x86_64::__m256, b: std::arch::x86_64::__m256, c: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256;
+    /// `c - a * b`
+    unsafe fn neg_mul_add(a: std::arch::x86_64::__m256, b: std::arch::x86_64::__m256, c: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256;
+}
+
+/// [`MulAdd`] as a multiplication and an addition (AVX).
+#[cfg(target_arch = "x86_64")]
+struct Separate;
+
+#[cfg(target_arch = "x86_64")]
+impl MulAdd for Separate {
+    #[inline(always)]
+    unsafe fn mul_add(a: std::arch::x86_64::__m256, b: std::arch::x86_64::__m256, c: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+        use std::arch::x86_64::*;
+        _mm256_add_ps(_mm256_mul_ps(a, b), c)
+    }
+    #[inline(always)]
+    unsafe fn neg_mul_add(a: std::arch::x86_64::__m256, b: std::arch::x86_64::__m256, c: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+        use std::arch::x86_64::*;
+        _mm256_sub_ps(c, _mm256_mul_ps(a, b))
+    }
+}
+
+/// [`MulAdd`] as fused multiply-adds (FMA).
+#[cfg(target_arch = "x86_64")]
+struct Fused;
+
+#[cfg(target_arch = "x86_64")]
+impl MulAdd for Fused {
+    #[inline(always)]
+    unsafe fn mul_add(a: std::arch::x86_64::__m256, b: std::arch::x86_64::__m256, c: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+        std::arch::x86_64::_mm256_fmadd_ps(a, b, c)
+    }
+    #[inline(always)]
+    unsafe fn neg_mul_add(a: std::arch::x86_64::__m256, b: std::arch::x86_64::__m256, c: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+        std::arch::x86_64::_mm256_fnmadd_ps(a, b, c)
+    }
+}
+
 /// A resampling filter's coefficients for [`cascade_x8()`], each broadcast to a vector.
 #[cfg(target_arch = "x86_64")]
 struct CascadeCoefficients {
-    k: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
     a1: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
     a2: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
     b1: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
     b2: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
+    gain: std::arch::x86_64::__m256,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -658,22 +721,22 @@ impl CascadeCoefficients {
         use std::arch::x86_64::*;
         let broadcast = |index: usize| std::array::from_fn(|i| _mm256_set1_ps(iir.run[i][index]));
         Self {
-            k: broadcast(0),
-            a1: broadcast(1),
-            a2: broadcast(2),
-            b1: broadcast(3),
-            b2: broadcast(4),
+            a1: broadcast(0),
+            a2: broadcast(1),
+            b1: broadcast(2),
+            b2: broadcast(3),
+            gain: _mm256_set1_ps(iir.gain),
         }
     }
 }
 
 /// One sample of eight filters through the first `biquads` biquads of a resampling filter's
-/// cascade, with the same operations as [`IirFilter::filter()`]. A `FIXED` above zero is the
-/// number of biquads instead, known at compile time, so that the loop unrolls.
+/// cascade, with the operations of [`IirFilter::filter()`] (exactly, with [`Separate`]). A
+/// `FIXED` above zero is the number of biquads instead, known at compile time, so that the loop
+/// unrolls.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-#[inline]
-unsafe fn cascade_x8<const FIXED: usize>(
+#[inline(always)]
+unsafe fn cascade_x8<const FIXED: usize, M: MulAdd>(
     z: &mut [std::arch::x86_64::__m256; IIR_MAX_ORDER],
     coefficients: &CascadeCoefficients,
     mut out: std::arch::x86_64::__m256,
@@ -683,21 +746,14 @@ unsafe fn cascade_x8<const FIXED: usize>(
     let biquads = if FIXED > 0 { FIXED } else { biquads };
     for biquad in 0..biquads {
         let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
-        let recursive = _mm256_add_ps(
-            _mm256_mul_ps(coefficients.a1[biquad], z0),
-            _mm256_mul_ps(coefficients.a2[biquad], z1),
-        );
-        let feedforward = _mm256_add_ps(
-            _mm256_mul_ps(coefficients.b1[biquad], z0),
-            _mm256_mul_ps(coefficients.b2[biquad], z1),
-        );
-        let scaled = _mm256_mul_ps(coefficients.k[biquad], out);
-        let biquad_in = _mm256_sub_ps(scaled, recursive);
-        out = _mm256_add_ps(scaled, feedforward);
+        let recursive = M::mul_add(coefficients.a1[biquad], z0, _mm256_mul_ps(coefficients.a2[biquad], z1));
+        let feedforward = M::mul_add(coefficients.b1[biquad], z0, _mm256_mul_ps(coefficients.b2[biquad], z1));
+        let biquad_in = _mm256_sub_ps(out, recursive);
+        out = _mm256_add_ps(out, feedforward);
         z[2 * biquad + 1] = z0;
         z[2 * biquad] = biquad_in;
     }
-    out
+    _mm256_mul_ps(out, coefficients.gain)
 }
 
 mod iir {
@@ -723,9 +779,11 @@ mod iir {
         p_real: [f64; IIR_MAX_ORDER / 2],
         p_imag: [f64; IIR_MAX_ORDER / 2],
 
-        /// The coefficients the cascade runs with, in single precision, per biquad: `k`, `a1`,
-        /// `a2`, `2 - a1` and `1 - a2` (see [`filter()`][Self::filter()]).
-        pub run: [[f32; 5]; IIR_MAX_ORDER / 2],
+        /// The coefficients the cascade runs with, in single precision, per biquad: `a1`, `a2`,
+        /// `2 - a1` and `1 - a2` (see [`filter()`][Self::filter()]).
+        pub run: [[f32; 4]; IIR_MAX_ORDER / 2],
+        /// The product of the biquads' gains `k`, applied once at the end of the cascade.
+        pub gain: f32,
 
         // cascaded biquad buffers
         pub z: [f32; IIR_MAX_ORDER],
@@ -750,7 +808,8 @@ mod iir {
                 p_real: [0.0; IIR_MAX_ORDER / 2],
                 p_imag: [0.0; IIR_MAX_ORDER / 2],
 
-                run: [[0.0; 5]; IIR_MAX_ORDER / 2],
+                run: [[0.0; 4]; IIR_MAX_ORDER / 2],
+                gain: 1.0,
                 z: [0.0; IIR_MAX_ORDER],
             };
             iir.compute_coefficients();
@@ -758,16 +817,17 @@ mod iir {
         }
         /// Runs one sample through the cascade.
         ///
-        /// Each biquad is `w = k x - a1 z0 - a2 z1` and `y = w + 2 z0 + z1`, rearranged as
-        /// `y = k x + ((2 - a1) z0 + (1 - a2) z1)` so that only a multiplication and an
-        /// addition stand between a stage's input and its output: the sum of the delay terms
-        /// doesn't depend on the input, so it is computed while the previous stage is still
-        /// busy. The lockstep ladder (see `LadderFilter::process_block_x8()`) uses the same
-        /// operations in the same order.
+        /// Each biquad is `w = k x - a1 z0 - a2 z1` and `y = w + 2 z0 + z1`. The gains `k` are
+        /// taken out of the biquads and applied together at the end, which scales each biquad's
+        /// state by the gains before it but gives the same output, and `y` is rearranged as
+        /// `y = x + ((2 - a1) z0 + (1 - a2) z1)`, so that only an addition stands between a
+        /// stage's input and its output: the sum of the delay terms doesn't depend on the input,
+        /// so it is computed while the previous stage is still busy. The lockstep ladder (see
+        /// `LadderFilter::process_block_x8()`) uses the same operations in the same order.
         pub fn filter(&mut self, input: f32) -> f32 {
             let mut out = input;
 
-            for (&[k, a1, a2, b1, b2], z) in self
+            for (&[a1, a2, b1, b2], z) in self
                 .run
                 .iter()
                 .zip(self.z.chunks_exact_mut(2))
@@ -776,16 +836,15 @@ mod iir {
                 let (z0, z1) = (z[0], z[1]);
                 let recursive = a1 * z0 + a2 * z1;
                 let feedforward = b1 * z0 + b2 * z1;
-                let scaled = k * out;
-                let biquad_in = scaled - recursive;
-                out = scaled + feedforward;
+                let biquad_in = out - recursive;
+                out += feedforward;
 
                 // update delays
                 z[1] = z0;
                 z[0] = biquad_in;
             }
 
-            out
+            out * self.gain
         }
 
         pub fn set_order(&mut self, order: usize) {
@@ -876,20 +935,15 @@ mod iir {
                 *k = (1.0 + *a1 + *a2) / 4.0;
             }
 
-            for (run, (k, a1, a2)) in self
+            for (run, (a1, a2)) in self
                 .run
                 .iter_mut()
-                .zip(izip!(&self.k, &self.a1, &self.a2))
+                .zip(izip!(&self.a1, &self.a2))
                 .take(self.decimator_order / 2)
             {
-                *run = [
-                    *k as f32,
-                    *a1 as f32,
-                    *a2 as f32,
-                    (2.0 - a1) as f32,
-                    (1.0 - a2) as f32,
-                ];
+                *run = [*a1 as f32, *a2 as f32, (2.0 - a1) as f32, (1.0 - a2) as f32];
             }
+            self.gain = self.k.iter().take(self.decimator_order / 2).product::<f64>() as f32;
         }
     }
 }
@@ -1042,6 +1096,52 @@ mod tests {
         (0..len)
             .map(|i| ((i % 97) as f32 / 48.5 - 1.0) * 0.5 + ((i % 61) as f32 / 30.5 - 1.0) * 0.3)
             .collect()
+    }
+
+    /// The FMA version of the lockstep kernel rounds differently, but stays within rounding
+    /// errors of the one-filter path, resonating or not.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fused_lockstep_stays_close_to_scalar_processing() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for mode in [FilterType::Lowpass, FilterType::Bandpass, FilterType::Highpass] {
+            let input = signal(2048);
+            let cutoffs = [300.0, 2500.0, 9000.0, 18000.0, 22000.0, 50.0, 1200.0, 6000.0];
+            let resonances = [0.5, 3.0, 7.0, 9.5, 0.1, 10.0, 5.0, 8.5];
+            let make = || -> Vec<LadderFilter> {
+                (0..LADDER_LANES)
+                    .map(|i| {
+                        let mut filter = LadderFilter::with_seed(i as u64);
+                        filter.set_filter_type(mode);
+                        filter.set_params(44100.0, cutoffs[i], resonances[i]);
+                        filter
+                    })
+                    .collect()
+            };
+            let (mut scalar, mut fused) = (make(), make());
+            let expected: Vec<Vec<f32>> = scalar
+                .iter_mut()
+                .map(|filter| input.iter().map(|sample| filter.process(*sample)).collect())
+                .collect();
+            let mut buffers: Vec<Vec<f32>> = (0..LADDER_LANES).map(|_| input.clone()).collect();
+            for start in (0..input.len()).step_by(32) {
+                let mut filters = fused.iter_mut().zip(buffers.iter_mut());
+                let lanes = std::array::from_fn(|_| {
+                    filters.next().map(|(filter, buffer)| (filter, &mut buffer[start..start + 32]))
+                });
+                unsafe { LadderFilter::process_block_x8_fma(lanes) };
+            }
+            for lane in 0..LADDER_LANES {
+                let peak = expected[lane].iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                let worst = (0..input.len())
+                    .map(|i| (buffers[lane][i] - expected[lane][i]).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(peak > 1e-3, "{mode:?} lane {lane}");
+                assert!(worst <= 1e-4 * peak, "{mode:?} lane {lane}: {worst:e} of {peak}");
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

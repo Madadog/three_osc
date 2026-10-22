@@ -875,8 +875,9 @@ fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: Sim
                             other => Err(other),
                         }
                     },
-                    // SAFETY: this path is only taken when the CPU supports AVX.
-                    |lanes| unsafe { LadderFilter::process_block_x8(lanes) },
+                    // SAFETY: this path is only taken on the AVX2 levels, which are only
+                    // picked when the CPU supports AVX2 and FMA.
+                    |lanes| unsafe { LadderFilter::process_block_x8_fma(lanes) },
                 );
             }
         }

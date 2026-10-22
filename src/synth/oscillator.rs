@@ -28,7 +28,8 @@ pub enum SimdLevel {
 }
 
 impl SimdLevel {
-    /// Whether this level implies AVX support (used by the ladder filter).
+    /// Whether this level implies AVX support, which for the AVX2 levels means AVX2 and FMA as
+    /// well (used by the filters' lockstep kernels).
     pub fn has_avx(self) -> bool {
         !matches!(self, SimdLevel::Portable)
     }
