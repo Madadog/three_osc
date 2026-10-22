@@ -868,7 +868,7 @@ fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: Sim
                         }
                     },
                     // SAFETY: this path is only taken when the CPU supports AVX.
-                    |lanes| unsafe { LadderFilter::process_block_x4(lanes) },
+                    |lanes| unsafe { LadderFilter::process_block_x8(lanes) },
                 );
             }
         }

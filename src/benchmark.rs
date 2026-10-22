@@ -343,7 +343,7 @@ fn benchmark_ladder() {
         assert!(sink.is_finite());
     }
 
-    // Four filters in lockstep, in blocks of 32 samples like the synth runs them
+    // Filters in lockstep, in blocks of 32 samples like the synth runs them
     #[cfg(target_arch = "x86_64")]
     if SimdLevel::detect().has_avx() {
         use crate::synth::filter::LADDER_LANES;
@@ -366,7 +366,7 @@ fn benchmark_ladder() {
                 let lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES] =
                     lanes.try_into().ok().unwrap();
                 // SAFETY: checked for AVX above
-                unsafe { LadderFilter::process_block_x4(lanes) };
+                unsafe { LadderFilter::process_block_x8(lanes) };
             }
         };
         run(&mut filters, &mut buffers);
@@ -379,7 +379,7 @@ fn benchmark_ladder() {
             / (iterations * input.len() * LADDER_LANES) as f64;
         println!(
             "{:<52} {ns_per_voice_sample:>7.1} ns/sample",
-            "ladder filter, 4 in lockstep (per filter)"
+            "ladder filter, 8 in lockstep (per filter)"
         );
         assert!(buffers.iter().flatten().all(|sample| sample.is_finite()));
     }
