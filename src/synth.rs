@@ -28,7 +28,9 @@ pub struct ThreeOsc {
     pub portamento_rate: f32,
     pub portamento_offset: f32,
     pub lfo_params: LfoParams,
-    pub stereo_width: Option<f32>,
+    /// How far unison voices are spread across the stereo field, from 0 (mono: both outputs are
+    /// identical) to 1 (the lowest voice fully left and the highest fully right).
+    pub stereo_width: f32,
 }
 
 impl ThreeOsc {
@@ -53,7 +55,7 @@ impl ThreeOsc {
             portamento_rate: 0.1,
             portamento_offset: 0.0,
             lfo_params: Default::default(),
-            stereo_width: None,
+            stereo_width: 0.0,
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -150,14 +152,22 @@ impl ThreeOsc {
         self.release_voices();
         self.filter_controller.cutoff = self.filter_controller.target_cutoff;
 
+        // Unison voices are only spread across the stereo field when the width is above zero.
+        // Otherwise the cheaper mono path is used, and both outputs are identical.
+        let stereo = self.stereo_width > 0.0;
+
         // Minor optimisation: Semitone / octave / pitch multiplier offset is calculated and cached
         // once per run, not once per sample
         for osc in self.oscillators.iter_mut() {
             osc.update_total_pitch();
             osc.update_unison_amp();
+            if stereo {
+                osc.update_pan_gains(self.stereo_width);
+            }
         }
 
-        let lfo_delta = self.lfo_params.delta(self.sample_rate as f32);
+        let sample_rate = self.sample_rate as f32;
+        let lfo_delta = self.lfo_params.delta(sample_rate);
 
         // Write samples from all voices
         for voice in self.voices.iter_mut() {
@@ -179,26 +189,27 @@ impl ThreeOsc {
 
             for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
                 let mut out = 0.0;
-                let mut out_stereo = 0.0;
+                // Only used when `stereo` is set, `out` is then the left channel.
+                let mut out_right = 0.0;
 
                 voice.advance();
-                let envelope_index = voice.runtime as f32 / self.sample_rate as f32;
-                
-                let delta = voice.delta(self.sample_rate as f32);
-                
+                let envelope_index = voice.runtime as f32 / sample_rate;
+
+                let delta = voice.delta(sample_rate);
+
                 let mut osc_delta = [0.0; 3];
                 for (x, osc) in izip!(osc_delta.iter_mut(), self.oscillators.iter()) {
                     *x = osc.total_pitch_multiplier() * delta;
                 }
-                
+
                 for osc in self.oscillators.iter_mut() {
                     if let OscWave::Pulse { width } = &mut osc.wave {
                         *width = osc.pulse_width;
                     }
                 }
-                
+
                 voice.semitone_detune = lerp(voice.semitone_detune, 0.0, self.portamento_rate);
-                
+
                 let keytrack_freq = 2.0_f32.powf(
                     (voice.id as f32 - 69.0 + voice.semitone_detune) / 12.0
                         * self.filter_controller.keytrack,
@@ -206,11 +217,11 @@ impl ThreeOsc {
 
                 let lfo_phase = voice.lfo.add_phase(lfo_delta);
                 let lfo = self.lfo_params.wave.generate(lfo_phase);
-                
+
                 let mut osc_lfo_amp = [1.0; 3];
                 let mut osc_lfo_mod = [1.0; 3];
 
-                // set / bypass modulation depending on LFO target 
+                // set / bypass modulation depending on LFO target
                 match self.lfo_params.target_osc {
                     Some(x) => {
                         osc_lfo_amp[x] = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod);
@@ -228,6 +239,9 @@ impl ThreeOsc {
                     }
                 };
 
+                // Generate the oscillators from the last to the first, since each oscillator
+                // modulates the one before it. The fold's value is the (mono) output of the
+                // oscillator after the current one.
                 self.oscillators.iter_mut()
                 .enumerate()
                 .rev()
@@ -240,44 +254,52 @@ impl ThreeOsc {
                         osc.voices_detune,
                     );
 
-                    if let Some(width) = self.stereo_width {
-                        let (mut osc_out_l, mut osc_out_r) = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
-                            .generate_multi_stereo_pm(
-                            &phases,
+                    let table = self.waves.select(&osc.wave).delta_index(osc_delta[i], sample_rate);
+                    let pm_offset = mod_osc_out * osc.pm * 150.0;
+                    let gain = osc.unison_amp
+                        * osc.amp
+                        * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am)
+                        * osc_lfo_amp[i];
+
+                    let osc_out = if stereo {
+                        let (mut osc_out, mut osc_left, mut osc_right) = table.generate_multi_pm_panned(
+                            phases,
                             osc.voice_count.into(),
-                            mod_osc_out * osc.pm * 150.0,
+                            pm_offset,
+                            &osc.pan_gains,
                         );
-    
+
                         // if pulse wave, subtract 2 saw waves
                         if let OscWave::Pulse { width } = osc.wave {
-                            let pulse = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
-                            .generate_multi_stereo_pm(phases, osc.voice_count.into(), width);
-                            osc_out_l -= pulse.0;
-                            osc_out_r -= pulse.1;
+                            let (pulse, pulse_left, pulse_right) = table.generate_multi_pm_panned(
+                                phases,
+                                osc.voice_count.into(),
+                                width,
+                                &osc.pan_gains,
+                            );
+                            osc_out -= pulse;
+                            osc_left -= pulse_left;
+                            osc_right -= pulse_right;
                         }
-    
-                        out += osc_out_l * osc.unison_amp * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
-                        out_stereo += osc_out_r * osc.unison_amp * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
-    
-                        osc_out_l + osc_out_r
+
+                        out += osc_left * gain;
+                        out_right += osc_right * gain;
+
+                        osc_out
                     } else {
-                        let mut osc_out = self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
-                            .generate_multi_pm(
-                            &phases,
-                            osc.voice_count.into(),
-                            mod_osc_out * osc.pm * 150.0,
-                        );
-    
+                        let mut osc_out = table.generate_multi_pm(phases, osc.voice_count.into(), pm_offset);
+
                         // if pulse wave, subtract 2 saw waves
                         if let OscWave::Pulse { width } = osc.wave {
-                            osc_out -= self.waves.select(&osc.wave).delta_index(osc_delta[i], self.sample_rate as f32)
-                            .generate_multi_pm(phases, osc.voice_count.into(), width);
+                            osc_out -= table.generate_multi_pm(phases, osc.voice_count.into(), width);
                         }
-    
-                        out += osc_out * osc.unison_amp * osc.amp * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am) * osc_lfo_amp[i];
-    
-                        osc_out * osc_lfo_mod[i]
-                    }
+
+                        out += osc_out * gain;
+
+                        osc_out
+                    };
+
+                    osc_out * osc_lfo_mod[i]
                 });
 
                 // Update filter controls
@@ -285,64 +307,48 @@ impl ThreeOsc {
                     keytrack_freq + keytrack_freq * lfo * self.lfo_params.filter_mod,
                     envelope_index,
                     voice.release_time,
-                    self.sample_rate as f32,
-                );
-                
-                voice.filter.set(
-                    self.filter_controller.filter_model,
-                    cutoff,
-                    self.filter_controller.resonance,
-                    self.sample_rate as f32,
-                    self.filter_controller.filter_type,
+                    sample_rate,
                 );
 
-                voice
-                    .filter
-                    .set_filter_type(self.filter_controller.filter_type);
-                
+                let filter_controller = &self.filter_controller;
+                let configure_filter = |filter: &mut FilterContainer| {
+                    filter.set(
+                        filter_controller.filter_model,
+                        cutoff,
+                        filter_controller.resonance,
+                        sample_rate,
+                        filter_controller.filter_type,
+                    );
+                    filter.set_filter_type(filter_controller.filter_type);
+                    filter.set_params(sample_rate, cutoff, filter_controller.resonance);
+                };
+
                 // Process filter
-                voice.filter.set_params(
-                    self.sample_rate as f32,
-                    cutoff,
-                    self.filter_controller.resonance,
-                );
-
+                configure_filter(&mut voice.filter);
                 out = voice.filter.process(out * drive);
-
-                if let Some(width) = self.stereo_width {
-                    // amplitude envelope
-                    let envelope = if let Some(release_time) = voice.release_time {
-                        let release_index = release_time as f32 / self.sample_rate as f32;
-                        self
-                            .gain_envelope
-                            .sample_released(release_index, envelope_index)
-                    } else {
-                        self.gain_envelope.sample_held(envelope_index)
-                    };
-    
-                    // keyboard velocity scaling
-                    out *= velocity;
-                    out_stereo *= velocity;
-    
-                    *out_l += out * envelope;
-                    *out_r += out_stereo * envelope;
-                } else {
-                    // amplitude envelope
-                    out = if let Some(release_time) = voice.release_time {
-                        let release_index = release_time as f32 / self.sample_rate as f32;
-                        out * self
-                            .gain_envelope
-                            .sample_released(release_index, envelope_index)
-                    } else {
-                        out * self.gain_envelope.sample_held(envelope_index)
-                    };
-    
-                    // keyboard velocity scaling
-                    out *= velocity;
-    
-                    *out_l += out;
-                    *out_r += out;
+                if stereo {
+                    // Filters are stateful, so the right channel needs its own instance.
+                    configure_filter(&mut voice.filter_right);
+                    out_right = voice.filter_right.process(out_right * drive);
                 }
+
+                // amplitude envelope
+                let envelope = if let Some(release_time) = voice.release_time {
+                    let release_index = release_time as f32 / sample_rate;
+                    self.gain_envelope.sample_released(release_index, envelope_index)
+                } else {
+                    self.gain_envelope.sample_held(envelope_index)
+                };
+
+                // keyboard velocity scaling
+                out = out * envelope * velocity;
+
+                *out_l += out;
+                *out_r += if stereo {
+                    out_right * envelope * velocity
+                } else {
+                    out
+                };
             }
         }
         // Apply output volume
@@ -376,6 +382,8 @@ pub struct Voice {
     osc_voice: [SuperVoice; 3],
     lfo: OscVoice,
     filter: filter::FilterContainer,
+    /// Filter for the right channel, only used when the stereo width is above zero.
+    filter_right: filter::FilterContainer,
     velocity: u8,
     pitch_multiply: f32,
     semitone_detune: f32,
@@ -396,6 +404,7 @@ impl Voice {
             lfo: Default::default(),
             velocity,
             filter: filter::FilterContainer::None,
+            filter_right: filter::FilterContainer::None,
             pitch_multiply: 1.0,
             semitone_detune: 0.0,
         }

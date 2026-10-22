@@ -367,6 +367,15 @@ fn global(ui: &mut Ui, title: &str, global: &GlobalParams, setter: &ParamSetter)
         );
         slider(
             ui,
+            &global.stereo_width,
+            "Spreads each oscillator's unison voices across the stereo field, with the lowest \
+             pitched voice furthest left and the highest furthest right. At 0 the output is mono: \
+             both channels are identical. An oscillator with Unison = 1 always stays in the \
+             centre.",
+            setter,
+        );
+        slider(
+            ui,
             &global.global_pitch,
             "Pitch detune for the whole synth, in semitones.",
             setter,

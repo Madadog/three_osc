@@ -66,6 +66,7 @@ impl ThreeOscPlugin {
         synth.portamento_offset = global.pitch_offset.value();
         // multiplies delta: smaller = higher pitch
         synth.octave_detune = 1.0 - global.octave_detune.value();
+        synth.stereo_width = global.stereo_width.value();
 
         // Master gain envelope
         let vol_env = &params.vol_env;
@@ -381,6 +382,53 @@ mod tests {
         assert!(left.iter().any(|sample| *sample != 0.0), "the second note should be audible");
     }
 
+    /// Renders one note with the default patch, the given number of unison voices on every
+    /// oscillator, and the given stereo width.
+    fn render_stereo(voices: u8, width: f32) -> (Vec<f32>, Vec<f32>) {
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.apply_params();
+        plugin.synth.stereo_width = width;
+        for osc in plugin.synth.oscillators.iter_mut() {
+            osc.voice_count = voices;
+            osc.voices_detune = 0.05;
+            // Deterministic phases, so that different renders can be compared.
+            osc.phase_rand = 0.0;
+        }
+        plugin.synth.note_on(60, 100);
+
+        let mut left = vec![0.0; 2048];
+        let mut right = vec![0.0; 2048];
+        plugin.synth.run(&mut left, &mut right);
+        (left, right)
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn stereo_width_spreads_unison_voices() {
+        // A single voice stays in the centre whatever the width.
+        let (left, right) = render_stereo(1, 1.0);
+        assert!(left.iter().any(|sample| sample.abs() > 0.01));
+        assert!(max_abs_diff(&left, &right) < 1e-4);
+
+        // Unison voices are spread out...
+        let (left, right) = render_stereo(8, 1.0);
+        assert!(left.iter().chain(right.iter()).all(|sample| sample.is_finite()));
+        assert!(max_abs_diff(&left, &right) > 1e-2);
+
+        // ...and a width of (almost) zero matches the mono path.
+        let (mono_left, mono_right) = render_stereo(8, 0.0);
+        assert_eq!(max_abs_diff(&mono_left, &mono_right), 0.0);
+        let (left, right) = render_stereo(8, 1e-6);
+        assert!(max_abs_diff(&left, &mono_left) < 1e-3);
+        assert!(max_abs_diff(&right, &mono_right) < 1e-3);
+    }
+
     /// Feeds a deterministic stream of random notes, note offs, chokes and pitch bends through
     /// the sample accurate event handling, in randomly sized buffers, and checks that the output
     /// stays finite.
@@ -394,6 +442,8 @@ mod tests {
         let mut right = vec![0.0; 2048];
         for block in 0..300 {
             let len = rng.usize(1..=2048);
+            // Switch between the mono and stereo paths, and vary the width, between blocks.
+            plugin.synth.stereo_width = if rng.bool() { rng.f32() } else { 0.0 };
             let mut events = Vec::new();
             for _ in 0..rng.usize(0..8) {
                 // Timings at the end of the buffer are allowed, they are applied afterwards.

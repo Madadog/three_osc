@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto,
-    f32::consts::{FRAC_1_SQRT_2, PI},
+    f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4, PI, SQRT_2},
     iter,
 };
 
@@ -56,7 +56,7 @@ impl SuperVoice {
             .take(voice_count)
             .enumerate()
             .for_each(|(i, phase): (usize, &mut f32)| {
-                let i = i as i32 - ((i % 2) * i * 2) as i32;
+                let i = unison_detune_index(i);
                 let delta = delta + delta * i as f32 * detune / (voice_count as f32);
                 *phase = (*phase + delta) % (2.0 * PI);
             });
@@ -83,6 +83,13 @@ impl SuperVoice {
     }
 }
 
+/// The detune multiplier of unison voice `i`: 0 for the centre voice, then alternating
+/// -1, +2, -3, +4, ... so that the voices spread out on both sides of the centre pitch.
+#[inline]
+pub fn unison_detune_index(i: usize) -> i32 {
+    i as i32 - ((i % 2) * i * 2) as i32
+}
+
 #[derive(Debug, Clone)]
 /// Each voice generating a wave reads OscillatorParams once per sample,
 /// and applies its current parameters to the generated wave.
@@ -100,6 +107,8 @@ pub struct OscillatorParams {
     pub voices_detune: f32,
     /// Amp to keep volume roughly equal across different voice counts
     pub unison_amp: f32,
+    /// `(left, right)` gain of each unison voice, see `update_pan_gains()`.
+    pub pan_gains: [(f32, f32); 32],
     pub wave: OscWave,
     pub phase: f32,
     pub phase_rand: f32,
@@ -131,6 +140,32 @@ impl OscillatorParams {
     pub fn update_unison_amp(&mut self) {
         self.unison_amp = self.calc_unison_amp()
     }
+    /// Updates the left and right gain of each unison voice for the given stereo width, where 0
+    /// is mono and 1 spreads the voices across the whole stereo field.
+    ///
+    /// Voices are panned according to their detune, so the lowest voice ends up furthest left and
+    /// the highest furthest right, using a constant power pan law scaled so that a centred voice
+    /// has a gain of 1 on both channels. That way a width of 0 is identical to a mono mix, and an
+    /// oscillator with a single voice always stays in the centre.
+    pub fn update_pan_gains(&mut self, stereo_width: f32) {
+        let voice_count = (self.voice_count as usize).clamp(1, self.pan_gains.len());
+        let detune_indices = || (0..voice_count).map(unison_detune_index);
+        let min = detune_indices().min().unwrap_or(0) as f32;
+        let max = detune_indices().max().unwrap_or(0) as f32;
+        let range = max - min;
+
+        for (i, gains) in self.pan_gains.iter_mut().enumerate().take(voice_count) {
+            // Pan position between -1 (left) and 1 (right)
+            let pan = if range > 0.0 {
+                (unison_detune_index(i) as f32 - min) / range * 2.0 - 1.0
+            } else {
+                0.0
+            };
+            let angle = (pan * stereo_width + 1.0) * FRAC_PI_4;
+            let (sin, cos) = angle.sin_cos();
+            *gains = (cos * SQRT_2, sin * SQRT_2);
+        }
+    }
 }
 impl Default for OscillatorParams {
     fn default() -> Self {
@@ -143,6 +178,7 @@ impl Default for OscillatorParams {
             voice_count: 1,
             voices_detune: 0.1,
             unison_amp: 1.0,
+            pan_gains: [(1.0, 1.0); 32],
             wave: OscWave::Sine,
             phase: 0.0,
             phase_rand: PI * 2.0,
@@ -404,25 +440,29 @@ impl Wavetable {
             .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
             .sum()
     }
+    /// Like [`generate_multi_pm()`][Self::generate_multi_pm()], but also pans the voices into a
+    /// left and a right channel using `gains` (one `(left, right)` gain pair per voice).
+    ///
+    /// Returns `(mono, left, right)`, where `mono` is the plain sum of the voices.
     #[inline]
-    pub fn generate_multi_stereo_pm(
+    pub fn generate_multi_pm_panned(
         &self,
         phases: &[f32],
         max: usize,
         phase_offset: f32,
-    ) -> (f32, f32) {
-        phases
-            .iter()
-            .take(max)
-            .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
-            .enumerate()
-            .fold((0.0, 0.0), |(l, r), (i, gen)| {
-                if i % 2 == 0 {
-                    (l + gen, r)
-                } else {
-                    (l, r + gen)
-                }
-            })
+        gains: &[(f32, f32)],
+    ) -> (f32, f32, f32) {
+        phases.iter().zip(gains.iter()).take(max).fold(
+            (0.0, 0.0, 0.0),
+            |(mono, left, right), (phase, (gain_left, gain_right))| {
+                let sample = self.generate((*phase + phase_offset).rem_euclid(2.0 * PI));
+                (
+                    mono + sample,
+                    left + sample * gain_left,
+                    right + sample * gain_right,
+                )
+            },
+        )
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {

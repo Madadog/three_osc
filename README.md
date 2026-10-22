@@ -17,7 +17,7 @@ Currently a work in progress, but usable nevertheless.
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
 * Sine, triangle, absolute sine, saw, and square waves
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off)
-* Detunable unison with (up to) 128 voices for each oscillator (i.e. yes it can supersaw)
+* Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * Vibrato, tremolo and modulation control with an LFO
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
@@ -75,7 +75,6 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
     * Originally had no bandlimited wave generation.
 
 ## TODO
-* Stereo
 * Use naive wave generation for modulation between oscillators? (stop ringing artifacts)
 * Add oversampling with a control (for FM / PM)
 * Switch between Naive, Wavetable, and Additive synthesis with a control

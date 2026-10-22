@@ -558,6 +558,9 @@ pub struct GlobalParams {
     /// Master output gain in dB.
     #[id = "output_gain"]
     pub output_gain: FloatParam,
+    /// How far unison voices are spread across the stereo field, 0 (mono) to 1.
+    #[id = "stereo_width"]
+    pub stereo_width: FloatParam,
     /// Global pitch offset in semitones.
     #[id = "global_pitch"]
     pub global_pitch: IntParam,
@@ -608,6 +611,7 @@ impl GlobalParams {
             )
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            stereo_width: amount_param("Stereo Width", 0.0),
             global_pitch: IntParam::new("Output Pitch", 0, IntRange::Linear { min: -24, max: 24 })
                 .with_unit(" st"),
             bend_range: IntParam::new("Bend Range", 2, IntRange::Linear { min: -24, max: 24 })
