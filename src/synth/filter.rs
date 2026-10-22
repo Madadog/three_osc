@@ -216,7 +216,10 @@ impl FilterController {
             self.cutoff_envelope.sample_held(envelope_index)
         };
         let envelope = envelope * self.envelope_amount * (440.0 + self.cutoff * cutoff_mult) * 50.0;
-        (self.cutoff * cutoff_mult + envelope).clamp(10.0, 22000.0)
+        // The filters are only stable below the Nyquist frequency, which matters at low sample
+        // rates where the cutoff control's range extends past it.
+        let max_cutoff = (sample_rate * 0.49).clamp(10.0, 22000.0);
+        (self.cutoff * cutoff_mult + envelope).clamp(10.0, max_cutoff)
     }
 }
 

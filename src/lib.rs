@@ -140,6 +140,51 @@ impl ThreeOscPlugin {
             _ => (),
         }
     }
+
+    /// Renders a buffer of audio into the left and right output channels, applying `events`
+    /// (sorted by their timing) sample accurately: the buffer is rendered in chunks, with the
+    /// events that fall on a chunk's first sample applied before it is rendered.
+    fn render(
+        &mut self,
+        mut events: impl Iterator<Item = NoteEvent<()>>,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+    ) {
+        let num_samples = out_l.len().min(out_r.len());
+        // The synth adds its voices onto whatever is in the output buffers.
+        out_l.fill(0.0);
+        out_r.fill(0.0);
+
+        let mut next_event = events.next();
+        let mut block_start = 0;
+        while block_start < num_samples {
+            while let Some(event) = next_event {
+                if event.timing() as usize > block_start {
+                    break;
+                }
+                self.handle_event(event);
+                next_event = events.next();
+            }
+
+            let block_end = next_event
+                .map(|event| event.timing() as usize)
+                .unwrap_or(num_samples)
+                .clamp(block_start + 1, num_samples);
+
+            self.synth.run(
+                &mut out_l[block_start..block_end],
+                &mut out_r[block_start..block_end],
+            );
+            block_start = block_end;
+        }
+
+        // Events at or past the end of the buffer are still applied, so the next buffer starts
+        // with the right notes playing.
+        while let Some(event) = next_event {
+            self.handle_event(event);
+            next_event = events.next();
+        }
+    }
 }
 
 /// Applies the controls shared by all oscillators.
@@ -224,49 +269,12 @@ impl Plugin for ThreeOscPlugin {
     ) -> ProcessStatus {
         self.apply_params();
 
-        let num_samples = buffer.samples();
-        let output = buffer.as_slice();
-        // The synth adds its voices onto whatever is in the output buffers.
-        for channel in output.iter_mut() {
-            channel.fill(0.0);
-        }
-        let (out_l, out_r) = match output {
+        let (out_l, out_r) = match buffer.as_slice() {
             [out_l, out_r, ..] => (out_l, out_r),
             // Only a stereo layout is offered, so this shouldn't happen.
             _ => return ProcessStatus::Error("expected a stereo output"),
         };
-
-        // Note events are sample accurate: the buffer is rendered in chunks, with the events
-        // that fall on a chunk's first sample applied before it is rendered.
-        let mut next_event = context.next_event();
-        let mut block_start = 0;
-        while block_start < num_samples {
-            while let Some(event) = next_event {
-                if event.timing() as usize > block_start {
-                    break;
-                }
-                self.handle_event(event);
-                next_event = context.next_event();
-            }
-
-            let block_end = next_event
-                .map(|event| event.timing() as usize)
-                .unwrap_or(num_samples)
-                .clamp(block_start + 1, num_samples);
-
-            self.synth.run(
-                &mut out_l[block_start..block_end],
-                &mut out_r[block_start..block_end],
-            );
-            block_start = block_end;
-        }
-
-        // Events at or past the end of the buffer are still applied, so the next buffer starts
-        // with the right notes playing.
-        while let Some(event) = next_event {
-            self.handle_event(event);
-            next_event = context.next_event();
-        }
+        self.render(std::iter::from_fn(|| context.next_event()), out_l, out_r);
 
         ProcessStatus::KeepAlive
     }
@@ -292,3 +300,151 @@ impl Vst3Plugin for ThreeOscPlugin {
 
 nih_export_clap!(ThreeOscPlugin);
 nih_export_vst3!(ThreeOscPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders a note with the default patch and returns the first non-finite sample, if any.
+    fn first_non_finite_sample(sample_rate: f64, note: u8, samples: usize) -> Option<(usize, f32)> {
+        let mut plugin = ThreeOscPlugin {
+            synth: ThreeOsc::new(sample_rate),
+            ..Default::default()
+        };
+        plugin.apply_params();
+        plugin.synth.note_on(note, 100);
+
+        let mut left = vec![0.0; samples];
+        let mut right = vec![0.0; samples];
+        plugin.synth.run(&mut left, &mut right);
+
+        left.iter()
+            .chain(right.iter())
+            .enumerate()
+            .find(|(_, sample)| !sample.is_finite())
+            .map(|(index, sample)| (index % samples, *sample))
+    }
+
+    #[test]
+    fn default_patch_renders_finite_audio() {
+        let mut failures = Vec::new();
+        for sample_rate in [8000.0, 22050.0, 44100.0, 48000.0, 96000.0, 192000.0] {
+            for note in [0, 36, 60, 96, 127] {
+                if let Some((index, sample)) = first_non_finite_sample(sample_rate, note, 4096) {
+                    failures.push(format!(
+                        "{sample_rate} Hz, note {note}: sample {index} is {sample}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "non-finite output:\n{}", failures.join("\n"));
+    }
+
+    /// A note that is started and choked in the same instant samples the envelopes at index 0.
+    /// With a zero length attack this used to divide zero by zero and poison the filter with NaN.
+    #[test]
+    fn zero_length_note_renders_finite_audio() {
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.apply_params();
+        plugin.synth.gain_envelope.attack_time = 0.0;
+        plugin.synth.gain_envelope.decay_time = 0.0;
+        plugin.synth.filter_controller.cutoff_envelope.attack_time = 0.0;
+        plugin.synth.filter_controller.cutoff_envelope.decay_time = 0.0;
+
+        let events = [
+            NoteEvent::NoteOn {
+                timing: 10,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                velocity: 0.8,
+            },
+            NoteEvent::Choke {
+                timing: 10,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+            },
+            NoteEvent::NoteOn {
+                timing: 20,
+                voice_id: None,
+                channel: 0,
+                note: 64,
+                velocity: 0.8,
+            },
+        ];
+        let mut left = vec![0.0; 512];
+        let mut right = vec![0.0; 512];
+        plugin.render(events.into_iter(), &mut left, &mut right);
+
+        assert!(left.iter().chain(right.iter()).all(|sample| sample.is_finite()));
+        assert!(left.iter().any(|sample| *sample != 0.0), "the second note should be audible");
+    }
+
+    /// Feeds a deterministic stream of random notes, note offs, chokes and pitch bends through
+    /// the sample accurate event handling, in randomly sized buffers, and checks that the output
+    /// stays finite.
+    #[test]
+    fn random_note_streams_render_finite_audio() {
+        let rng = fastrand::Rng::with_seed(0x7_05C);
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.apply_params();
+
+        let mut left = vec![0.0; 2048];
+        let mut right = vec![0.0; 2048];
+        for block in 0..300 {
+            let len = rng.usize(1..=2048);
+            let mut events = Vec::new();
+            for _ in 0..rng.usize(0..8) {
+                // Timings at the end of the buffer are allowed, they are applied afterwards.
+                let timing = rng.u32(0..=len as u32);
+                let channel = rng.u8(0..16);
+                let note = rng.u8(0..128);
+                let voice_id = None;
+                events.push(match rng.usize(0..10) {
+                    0..=3 => NoteEvent::NoteOn {
+                        timing,
+                        voice_id,
+                        channel,
+                        note,
+                        velocity: rng.f32(),
+                    },
+                    4..=6 => NoteEvent::NoteOff {
+                        timing,
+                        voice_id,
+                        channel,
+                        note,
+                        velocity: rng.f32(),
+                    },
+                    7 => NoteEvent::Choke {
+                        timing,
+                        voice_id,
+                        channel,
+                        note,
+                    },
+                    _ => NoteEvent::MidiPitchBend {
+                        timing,
+                        channel,
+                        value: rng.f32(),
+                    },
+                });
+            }
+            events.sort_by_key(|event| event.timing());
+
+            plugin.render(events.into_iter(), &mut left[..len], &mut right[..len]);
+
+            let bad_sample = left[..len]
+                .iter()
+                .chain(right[..len].iter())
+                .enumerate()
+                .find(|(_, sample)| !sample.is_finite());
+            if let Some((index, sample)) = bad_sample {
+                panic!(
+                    "block {block} ({len} samples, {} voices): sample {} is {sample}",
+                    plugin.synth.voices.len(),
+                    index % len
+                );
+            }
+        }
+    }
+}

@@ -477,10 +477,14 @@ mod envelopes {
             }
         }
         /// Returns the envelope CV (between 0.0 and 1.0) associated with the given index
+        ///
+        /// The comparisons are strict so that a zero length attack or decay stage is skipped
+        /// instead of dividing zero by zero (e.g. a note that is released in the same instant
+        /// it was started samples the envelope at index 0).
         pub fn sample_held(&self, index: f32) -> f32 {
-            if index <= self.attack_time {
+            if index < self.attack_time {
                 (index / self.attack_time).powf(self.attack_slope)
-            } else if index - self.attack_time <= self.decay_time {
+            } else if index - self.attack_time < self.decay_time {
                 (1.0 - (index - self.attack_time) / self.decay_time).powf(self.slope)
                     * (1.0 - self.sustain_level)
                     + self.sustain_level
@@ -490,7 +494,7 @@ mod envelopes {
         }
         pub fn sample_released(&self, release_index: f32, index: f32) -> f32 {
             assert!(release_index <= index);
-            if index - release_index > self.release_time {
+            if index - release_index >= self.release_time {
                 0.0
             } else {
                 let level = self.sample_held(release_index);
