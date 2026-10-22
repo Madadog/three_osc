@@ -1,0 +1,6 @@
+[alias]
+# `cargo xtask bundle three-osc --release` builds the plugin and creates the CLAP/VST3 bundles.
+# The xtask package is built in release mode so its dependencies (serde etc.) don't need to be
+# compiled twice when also building the plugin in release mode.
+xtask = "run --package xtask --release --"
+xtask-debug = "run --package xtask --"

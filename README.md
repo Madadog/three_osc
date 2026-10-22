@@ -1,12 +1,12 @@
 # Three Osc
 
-An LV2 synthesizer based on [Triple Oscillator](https://github.com/LMMS/lmms), a polyphonic subtractive synthesizer with three oscillators that can modulate each other in various ways.
+A CLAP / VST3 synthesizer based on [Triple Oscillator](https://github.com/LMMS/lmms), a polyphonic subtractive synthesizer with three oscillators that can modulate each other in various ways. Built with [nih-plug](https://github.com/robbert-vdh/nih-plug).
 
 Extends the original with several useful QOL features, including bandlimited synthesis by default, unison with many detuned voices, and legato.
 
 Currently a work in progress, but usable nevertheless. 
 
-![alt text](/images/three_osc_v1.png "Ardour hosting a bass preset which uses the ladder filter.")
+![alt text](/images/three_osc_v1.png "Ardour hosting a bass preset which uses the ladder filter (this screenshot is of the older LV2 version's generic host UI).")
 
 
 ## Features
@@ -21,23 +21,38 @@ Currently a work in progress, but usable nevertheless.
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * Vibrato, tremolo and modulation control with an LFO
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
-* No GUI
+* MIDI pitch bend with an adjustable range
+* A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page. Hover a control's label for a description of what it does.
+* Sample-accurate note timing
 
 ## Sound Demo
 Coming soon...
 
 ## Building
+Three Osc is built with [nih-plug](https://github.com/robbert-vdh/nih-plug), which exports it as a CLAP plugin and a VST3 plugin. You need a [Rust toolchain](https://rustup.rs/); on Linux you also need the X11 and OpenGL development libraries for the GUI, the same as for any other nih-plug plugin. On Debian/Ubuntu:
+
+```shell
+sudo apt-get install libgl-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
+
 0. `cd` into the three_osc directory.
-1. Run `cargo build --release`. This compiles the synth and updates the .ttl metadata in `three_osc.lv2`
+1. Run `cargo xtask bundle three-osc --release`. This compiles the synth and creates the plugin bundles in `./target/bundled/`: `Three Osc.clap` and `Three Osc.vst3`.
+2. Copy the bundle(s) into a directory your host looks in:
+    * CLAP: `~/.clap/` on Linux, `~/Library/Audio/Plug-Ins/CLAP/` on macOS, `C:\Program Files\Common Files\CLAP\` on Windows.
+    * VST3: `~/.vst3/` on Linux, `~/Library/Audio/Plug-Ins/VST3/` on macOS, `C:\Program Files\Common Files\VST3\` on Windows.
+3. Load it into your preferred host (Ardour, Bitwig, Carla, Reaper, ...) and have fun.
 
-### Manual
-2. Copy the built binary (`./target/release/libthree_osc.so` or `libthree_osc.dll` depending on your OS) into `./three_osc.lv2`
-3. Copy `./three_osc.lv2` into any of the default LV2 directories (e.g. `YOUR_HOME_DIRECTORY/.lv2/`).
-4. Load it into your preferred LV2 host (Ardour, Carla, LMMS) and have fun.
+### Standalone
+The synth can also run on its own, outside of a plugin host, using JACK or your system's audio and MIDI APIs. This needs a few more dependencies (on Debian/Ubuntu: `libasound2-dev libjack-jackd2-dev`), so it is behind a feature flag:
 
-### Automatic
-2. Run `copy_lv2.sh`. This automatically does the manual instructions, copying `./three_osc.lv2` into your home `YOUR_HOME_DIRECTORY/.lv2/` directory. *Only works on linux because the script looks for `libthree_osc.so`, but should work on windows if you edit the script and change the copied file name to `libthree_osc.dll`.*
-3. Load it into your preferred LV2 host (Ardour, Carla, LMMS) and have fun.
+```shell
+cargo run --release --features standalone
+# or, to list the audio backend / device options:
+cargo run --release --features standalone -- --help
+```
+
+### Previous LV2 version
+Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the LV2 build is gone; if you need it, check out a commit from before the nih-plug port.
 
 ## Tips and Tricks
 * The absolute sine / exponential wave is like a saw wave where the harmonics decrease volume at -12dB per octave instead of -6 dB per octave (i.e. it's a saw wave tracked by a soft filter). Similarly, the triangle wave is like a square wave where the harmonics diminish at -12dB per octave instead of -6dB.
@@ -72,15 +87,13 @@ Coming soon...
 * Use audio buffering for more optimisations
 * Optimise
 * Extract DSP to internal crate
-* Port to https://github.com/robbert-vdh/nih-plug
 * Sinc interpolation for wavetables instead of Lerp
 * SIMD accelerate stereo paths
 * Approximate/cache expensive computations (i.e. any uses of `powf`)
 * Fix buffer size to reduce expensive modulation calculations at the expense of sample-accurate automation (make const so that you can play around with buffer lengths, see what is good)
-* Add midi pitch bend support
 * Come up with better name for "Initial Pitch Slide" control
-* Add UI using nih-plug, make it functional
-    * 1 page, all controls
+* Improve the UI
+    * Knobs instead of sliders, envelope / waveform displays
     * 2nd page for oversampling and other unimportant things
 * Load Scala .scl and .kbm files
 * Publish

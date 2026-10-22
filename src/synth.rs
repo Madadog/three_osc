@@ -129,6 +129,12 @@ impl ThreeOsc {
                 }),
         }
     }
+    /// Stops all sound immediately by removing every playing voice and held note. Doesn't
+    /// allocate, so this is safe to call from the audio thread.
+    pub fn reset(&mut self) {
+        self.voices.clear();
+        self.notes.notes.clear();
+    }
     pub fn release_voices(&mut self) {
         let duration = (self.gain_envelope.release_time * self.sample_rate as f32) as u32;
 

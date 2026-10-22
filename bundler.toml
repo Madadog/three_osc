@@ -1,0 +1,7 @@
+# Metadata for nih-plug's `cargo xtask bundle <package>` plugin bundler.
+#
+# [package_name]
+# name = "Human Readable Plugin Name"  # defaults to <package_name>
+
+[three-osc]
+name = "Three Osc"

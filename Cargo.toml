@@ -4,13 +4,42 @@ version = "0.0.0"
 authors = ["Adam Godwin <evilspamalt@gmail.com>"]
 license = "GPL-3.0"
 edition = "2021"
+description = "A polyphonic subtractive synthesizer with three oscillators that can modulate each other in various ways."
+homepage = "https://github.com/Madadog/three_osc"
+repository = "https://github.com/Madadog/three_osc"
+
+[workspace]
+members = ["xtask"]
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` is the plugin library that gets bundled as a CLAP / VST3 plugin, `lib` is needed so the
+# optional standalone binary can link against the plugin.
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "three_osc"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = []
+# Enables the standalone binary (`cargo run --release --features standalone`), which runs the synth
+# outside of a plugin host using JACK or the system audio and MIDI APIs. This pulls in extra
+# dependencies (and needs ALSA/JACK development libraries on Linux), so it is off by default.
+standalone = ["nih_plug/standalone"]
 
 [dependencies]
-lv2 = "0.6.0"
-wmidi = "3.1.0"
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 fastrand = "1.7.0"
 itertools = "0.10.3"
 rustfft = "6.0.1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
