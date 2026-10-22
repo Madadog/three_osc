@@ -570,4 +570,6 @@ impl Default for RcFilter {
 }
 
 mod ladder;
+#[cfg(target_arch = "x86_64")]
+mod simd;
 mod svf_simper;

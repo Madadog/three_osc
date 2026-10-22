@@ -23,7 +23,6 @@
 
 use crate::synth::filter::ladder::iir::IirFilter;
 use crate::synth::filter::FilterType;
-use fastrand::Rng;
 
 use super::Filter;
 
@@ -46,6 +45,37 @@ const LADDER_MAX_NEWTON_STEPS: i32 = 8;
 
 // check for newton-raphson breaking limit
 const LADDER_NEWTON_BREAKING_LIMIT: i32 = 1;
+
+/// Length of the [`NOISE`] table, a power of two.
+const NOISE_LEN: usize = 4096;
+
+/// The tiny amount of noise added to the input to keep the filter alive: uniformly distributed
+/// pseudo-random values in [-1e-6, 1e-6), worked out at compile time. Each filter reads it from
+/// its own position onwards, wrapping around. The table is padded with copies of its first
+/// [`LADDER_LANES`] values, so that the lockstep kernel can read that many values in a row from
+/// any position.
+static NOISE: [f32; NOISE_LEN + LADDER_LANES] = noise_table();
+
+const fn noise_table() -> [f32; NOISE_LEN + LADDER_LANES] {
+    let mut table = [0.0; NOISE_LEN + LADDER_LANES];
+    let mut state: u32 = 0x9e37_79b9;
+    let mut i = 0;
+    while i < NOISE_LEN {
+        // xorshift32
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        // The top 24 bits as a number in [0, 1)
+        let unit = (state >> 8) as f32 / (1 << 24) as f32;
+        table[i] = 1.0e-6 * 2.0 * (unit - 0.5);
+        i += 1;
+    }
+    while i < NOISE_LEN + LADDER_LANES {
+        table[i] = table[i - NOISE_LEN];
+        i += 1;
+    }
+    table
+}
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -96,8 +126,8 @@ pub struct LadderFilter {
     /// rate the tanh stages mix down into the audio band.
     iir_upsampler: IirFilter,
 
-    /// Source of the tiny amount of noise added to the input to keep the filter alive.
-    rng: Rng,
+    /// Where the filter reads the [`NOISE`] table next.
+    noise_position: usize,
 }
 
 impl Default for LadderFilter {
@@ -127,7 +157,8 @@ impl Default for LadderFilter {
                 IIR_DOWNSAMPLING_BANDWIDTH * 44100.0 / 2.0,
                 IIR_DOWNSAMPLE_ORDER,
             ),
-            rng: Rng::new(),
+            // A random start in the noise table, so that the voices' noise isn't the same
+            noise_position: fastrand::usize(..NOISE_LEN),
         }
     }
 }
@@ -143,7 +174,7 @@ impl LadderFilter {
     #[cfg(test)]
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            rng: Rng::with_seed(seed),
+            noise_position: fastrand::Rng::with_seed(seed).usize(..NOISE_LEN),
             ..Self::default()
         }
     }
@@ -169,6 +200,8 @@ impl LadderFilter {
     pub unsafe fn process_block_x8(mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
         use std::arch::x86_64::*;
 
+        use super::simd::transpose8;
+
         let Some(first) = lanes.iter().find_map(|lane| lane.as_ref().map(|(filter, _)| &**filter))
         else {
             return;
@@ -179,12 +212,7 @@ impl LadderFilter {
         let decimate = oversampling_factor > 1;
         let interpolate = first.interpolates();
         let biquads = first.iir_lowpass.decimator_order / 2;
-        // The resampling filters' coefficients, broadcast once (see `IirFilter::filter()`)
-        let coefficients = |index: usize| -> [__m256; IIR_MAX_ORDER / 2] {
-            std::array::from_fn(|i| _mm256_set1_ps(first.iir_lowpass.run[i][index]))
-        };
-        let (iir_k, iir_a1, iir_a2) = (coefficients(0), coefficients(1), coefficients(2));
-        let (iir_b1, iir_b2) = (coefficients(3), coefficients(4));
+        let coefficients = CascadeCoefficients::new(&first.iir_lowpass);
         let block_len = lanes
             .iter()
             .flatten()
@@ -216,26 +244,14 @@ impl LadderFilter {
         let half_dt = _mm256_mul_ps(_mm256_set1_ps(0.5), dt);
         let upsampling_gain = _mm256_set1_ps(oversampling_factor as f32);
 
-        // One sample through a resampling filter's cascade, with the same operations as
-        // `IirFilter::filter()`
-        let cascade = |z: &mut [__m256; IIR_MAX_ORDER], mut out: __m256| {
-            for biquad in 0..biquads {
-                let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
-                let recursive = _mm256_add_ps(
-                    _mm256_mul_ps(iir_a1[biquad], z0),
-                    _mm256_mul_ps(iir_a2[biquad], z1),
-                );
-                let feedforward = _mm256_add_ps(
-                    _mm256_mul_ps(iir_b1[biquad], z0),
-                    _mm256_mul_ps(iir_b2[biquad], z1),
-                );
-                let scaled = _mm256_mul_ps(iir_k[biquad], out);
-                let biquad_in = _mm256_sub_ps(scaled, recursive);
-                out = _mm256_add_ps(scaled, feedforward);
-                z[2 * biquad + 1] = z0;
-                z[2 * biquad] = biquad_in;
+        // One sample through a resampling filter's cascade. The synth's design has a version
+        // of its own, unrolled, which saves the loop's bookkeeping in every biquad.
+        let cascade = |z: &mut [__m256; IIR_MAX_ORDER], input: __m256| {
+            if biquads == IIR_DOWNSAMPLE_ORDER / 2 {
+                cascade_x8::<{ IIR_DOWNSAMPLE_ORDER / 2 }>(z, &coefficients, input, biquads)
+            } else {
+                cascade_x8::<0>(z, &coefficients, input, biquads)
             }
-            out
         };
 
         // Padé 3/2 approximant of tanh, with the same results as `tanh_pade32_f32()`. The
@@ -259,78 +275,105 @@ impl LadderFilter {
             )
         };
 
-        for sample in 0..block_len {
-            // The input, with the tiny amount of noise that keeps the filter alive
-            let mut input = [0.0_f32; LADDER_LANES];
-            for (lane, entry) in lanes.iter_mut().enumerate() {
+        let mut start = 0;
+        while start < block_len {
+            // Eight samples of every lane (fewer at the end of the block, padded with zeros),
+            // with the tiny amount of noise that keeps the filter alive, transposed into one
+            // vector per sample. Empty lanes are zero.
+            let len = LADDER_LANES.min(block_len - start);
+            let mut rows = [_mm256_setzero_ps(); LADDER_LANES];
+            for (row, entry) in rows.iter_mut().zip(lanes.iter_mut()) {
                 if let Some((filter, buffer)) = entry {
-                    let noise = 1.0e-6 * 2.0 * (filter.rng.f32() - 0.5);
-                    input[lane] = buffer[sample] + noise;
-                }
-            }
-            let input_sample = _mm256_loadu_ps(input.as_ptr());
-
-            // Predictor-corrector integration with full tanh stages, see `process_sample()`
-            for step in 0..oversampling_factor {
-                // The input at this oversampled step: interpolated from the zero-stuffed input,
-                // or held
-                let input = if interpolate {
-                    let stuffed = if step == 0 {
-                        _mm256_mul_ps(input_sample, upsampling_gain)
+                    let samples = &buffer[start..start + len];
+                    let input = if len == LADDER_LANES {
+                        _mm256_loadu_ps(samples.as_ptr())
                     } else {
-                        _mm256_setzero_ps()
+                        let mut padded = [0.0_f32; LADDER_LANES];
+                        padded[..len].copy_from_slice(samples);
+                        _mm256_loadu_ps(padded.as_ptr())
                     };
-                    cascade(&mut zu, stuffed)
-                } else {
-                    input_sample
-                };
-
-                let tanh_in = tanh(_mm256_sub_ps(ut_1, _mm256_mul_ps(feedback, p3)));
-                let tanh_p0 = tanh(p0);
-                let tanh_p1 = tanh(p1);
-                let tanh_p2 = tanh(p2);
-                let tanh_p3 = tanh(p3);
-
-                let p0_prime = _mm256_add_ps(p0, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_in, tanh_p0)));
-                let p1_prime = _mm256_add_ps(p1, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p0, tanh_p1)));
-                let p2_prime = _mm256_add_ps(p2, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p1, tanh_p2)));
-                let p3_prime = _mm256_add_ps(p3, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p2, tanh_p3)));
-                let tanh_p0_prime = tanh(p0_prime);
-                let tanh_p1_prime = tanh(p1_prime);
-                let tanh_p2_prime = tanh(p2_prime);
-                let tanh_p3_prime = tanh(p3_prime);
-
-                p3 = correct(p3, tanh_p2, tanh_p3, tanh_p2_prime, tanh_p3_prime);
-                p2 = correct(p2, tanh_p1, tanh_p2, tanh_p1_prime, tanh_p2_prime);
-                p1 = correct(p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
-                let tanh_new_in = tanh(_mm256_sub_ps(input, _mm256_mul_ps(feedback, p3)));
-                p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
-
-                // The input at the previous oversampled step
-                ut_1 = input;
-
-                out = match mode {
-                    FilterType::Lowpass => p3,
-                    FilterType::Bandpass => _mm256_sub_ps(p1, p3),
-                    FilterType::Highpass => tanh(_mm256_sub_ps(
-                        _mm256_sub_ps(input, p0),
-                        _mm256_mul_ps(feedback, p3),
-                    )),
-                };
-
-                if decimate {
-                    // Every oversampled output goes through the decimation filter
-                    out = cascade(&mut z, out);
+                    let position = filter.noise_position;
+                    let noise = &NOISE[position..position + LADDER_LANES];
+                    *row = _mm256_add_ps(input, _mm256_loadu_ps(noise.as_ptr()));
+                    filter.noise_position = (position + len) % NOISE_LEN;
                 }
             }
+            let mut frames = transpose8(rows);
 
-            let mut output = [0.0_f32; LADDER_LANES];
-            _mm256_storeu_ps(output.as_mut_ptr(), _mm256_mul_ps(out, _mm256_set1_ps(1.8)));
-            for (lane, entry) in lanes.iter_mut().enumerate() {
+            for frame in frames[..len].iter_mut() {
+                let input_sample = *frame;
+
+                // Predictor-corrector integration with full tanh stages, see `process_sample()`
+                for step in 0..oversampling_factor {
+                    // The input at this oversampled step: interpolated from the zero-stuffed input,
+                    // or held
+                    let input = if interpolate {
+                        let stuffed = if step == 0 {
+                            _mm256_mul_ps(input_sample, upsampling_gain)
+                        } else {
+                            _mm256_setzero_ps()
+                        };
+                        cascade(&mut zu, stuffed)
+                    } else {
+                        input_sample
+                    };
+
+                    let tanh_in = tanh(_mm256_sub_ps(ut_1, _mm256_mul_ps(feedback, p3)));
+                    let tanh_p0 = tanh(p0);
+                    let tanh_p1 = tanh(p1);
+                    let tanh_p2 = tanh(p2);
+                    let tanh_p3 = tanh(p3);
+
+                    let p0_prime = _mm256_add_ps(p0, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_in, tanh_p0)));
+                    let p1_prime = _mm256_add_ps(p1, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p0, tanh_p1)));
+                    let p2_prime = _mm256_add_ps(p2, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p1, tanh_p2)));
+                    let p3_prime = _mm256_add_ps(p3, _mm256_mul_ps(dt, _mm256_sub_ps(tanh_p2, tanh_p3)));
+                    let tanh_p0_prime = tanh(p0_prime);
+                    let tanh_p1_prime = tanh(p1_prime);
+                    let tanh_p2_prime = tanh(p2_prime);
+                    let tanh_p3_prime = tanh(p3_prime);
+
+                    p3 = correct(p3, tanh_p2, tanh_p3, tanh_p2_prime, tanh_p3_prime);
+                    p2 = correct(p2, tanh_p1, tanh_p2, tanh_p1_prime, tanh_p2_prime);
+                    p1 = correct(p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
+                    let tanh_new_in = tanh(_mm256_sub_ps(input, _mm256_mul_ps(feedback, p3)));
+                    p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
+
+                    // The input at the previous oversampled step
+                    ut_1 = input;
+
+                    out = match mode {
+                        FilterType::Lowpass => p3,
+                        FilterType::Bandpass => _mm256_sub_ps(p1, p3),
+                        FilterType::Highpass => tanh(_mm256_sub_ps(
+                            _mm256_sub_ps(input, p0),
+                            _mm256_mul_ps(feedback, p3),
+                        )),
+                    };
+
+                    if decimate {
+                        // Every oversampled output goes through the decimation filter
+                        out = cascade(&mut z, out);
+                    }
+                }
+
+                *frame = _mm256_mul_ps(out, _mm256_set1_ps(1.8));
+            }
+
+            let rows = transpose8(frames);
+            for (row, entry) in rows.iter().zip(lanes.iter_mut()) {
                 if let Some((_, buffer)) = entry {
-                    buffer[sample] = output[lane];
+                    let samples = &mut buffer[start..start + len];
+                    if len == LADDER_LANES {
+                        _mm256_storeu_ps(samples.as_mut_ptr(), *row);
+                    } else {
+                        let mut padded = [0.0_f32; LADDER_LANES];
+                        _mm256_storeu_ps(padded.as_mut_ptr(), *row);
+                        samples.copy_from_slice(&padded[..len]);
+                    }
                 }
             }
+            start += len;
         }
 
         // Scatter the state back
@@ -362,7 +405,8 @@ impl LadderFilter {
     }
     pub fn process_sample(&mut self, input: f32) {
         let feedback = 8.0 * self.resonance;
-        let noise = 1.0e-6 * 2.0 * (self.rng.f32() - 0.5);
+        let noise = NOISE[self.noise_position];
+        self.noise_position = (self.noise_position + 1) % NOISE_LEN;
         let input_sample = input + noise;
         let interpolate = self.interpolates();
         let upsampling_gain = self.oversampling_factor as f32;
@@ -596,6 +640,65 @@ impl Filter for LadderFilter {
 }
 
 use self::iir::IIR_MAX_ORDER;
+
+/// A resampling filter's coefficients for [`cascade_x8()`], each broadcast to a vector.
+#[cfg(target_arch = "x86_64")]
+struct CascadeCoefficients {
+    k: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
+    a1: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
+    a2: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
+    b1: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
+    b2: [std::arch::x86_64::__m256; IIR_MAX_ORDER / 2],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CascadeCoefficients {
+    #[target_feature(enable = "avx")]
+    unsafe fn new(iir: &IirFilter) -> Self {
+        use std::arch::x86_64::*;
+        let broadcast = |index: usize| std::array::from_fn(|i| _mm256_set1_ps(iir.run[i][index]));
+        Self {
+            k: broadcast(0),
+            a1: broadcast(1),
+            a2: broadcast(2),
+            b1: broadcast(3),
+            b2: broadcast(4),
+        }
+    }
+}
+
+/// One sample of eight filters through the first `biquads` biquads of a resampling filter's
+/// cascade, with the same operations as [`IirFilter::filter()`]. A `FIXED` above zero is the
+/// number of biquads instead, known at compile time, so that the loop unrolls.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[inline]
+unsafe fn cascade_x8<const FIXED: usize>(
+    z: &mut [std::arch::x86_64::__m256; IIR_MAX_ORDER],
+    coefficients: &CascadeCoefficients,
+    mut out: std::arch::x86_64::__m256,
+    biquads: usize,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let biquads = if FIXED > 0 { FIXED } else { biquads };
+    for biquad in 0..biquads {
+        let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
+        let recursive = _mm256_add_ps(
+            _mm256_mul_ps(coefficients.a1[biquad], z0),
+            _mm256_mul_ps(coefficients.a2[biquad], z1),
+        );
+        let feedforward = _mm256_add_ps(
+            _mm256_mul_ps(coefficients.b1[biquad], z0),
+            _mm256_mul_ps(coefficients.b2[biquad], z1),
+        );
+        let scaled = _mm256_mul_ps(coefficients.k[biquad], out);
+        let biquad_in = _mm256_sub_ps(scaled, recursive);
+        out = _mm256_add_ps(scaled, feedforward);
+        z[2 * biquad + 1] = z0;
+        z[2 * biquad] = biquad_in;
+    }
+    out
+}
 
 mod iir {
     use std::f64::consts::PI;
@@ -947,24 +1050,31 @@ mod tests {
         if !is_x86_feature_detected!("avx") {
             return;
         }
-        for (lanes, mode) in [
-            (8, FilterType::Lowpass),
-            (8, FilterType::Bandpass),
-            (8, FilterType::Highpass),
-            (5, FilterType::Lowpass),
-            (2, FilterType::Lowpass),
-            (1, FilterType::Lowpass),
+        // The filters, in these lanes
+        let all: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7];
+        for (positions, mode) in [
+            (all, FilterType::Lowpass),
+            (all, FilterType::Bandpass),
+            (all, FilterType::Highpass),
+            (&all[..5], FilterType::Lowpass),
+            (&all[..2], FilterType::Lowpass),
+            (&all[..1], FilterType::Lowpass),
+            (&[1, 4, 7][..], FilterType::Lowpass),
         ] {
+            let lanes = positions.len();
             let input = signal(300);
             let cutoffs = [300.0, 2500.0, 9000.0, 18000.0, 22000.0, 50.0, 1200.0, 6000.0];
             let resonances = [0.5, 3.0, 7.0, 9.5, 0.1, 10.0, 5.0, 8.5];
-            // (Cloning a `fastrand::Rng` forks it, so both sets are seeded explicitly.)
             let mut scalar: Vec<LadderFilter> = (0..lanes).map(|i| LadderFilter::with_seed(i as u64)).collect();
             let mut lockstep: Vec<LadderFilter> = (0..lanes).map(|i| LadderFilter::with_seed(i as u64)).collect();
             for (i, filter) in scalar.iter_mut().chain(lockstep.iter_mut()).enumerate() {
                 let i = i % lanes;
                 filter.set_filter_type(mode);
                 filter.set_params(44100.0, cutoffs[i], resonances[i]);
+                // The first filter's noise wraps around the end of the table within a group
+                if i == 0 {
+                    filter.noise_position = NOISE_LEN - 5;
+                }
             }
 
             let expected: Vec<Vec<f32>> = scalar
@@ -972,38 +1082,41 @@ mod tests {
                 .map(|filter| input.iter().map(|sample| filter.process(*sample)).collect())
                 .collect();
 
-            // Process in two blocks to cover the state being carried across calls
+            // Process in two blocks to cover the state being carried across calls, the second
+            // not a multiple of eight samples long
             let mut buffers: Vec<Vec<f32>> = (0..lanes).map(|_| input.clone()).collect();
             for (start, end) in [(0, 128), (128, 300)] {
-                let mut entries: Vec<Option<(&mut LadderFilter, &mut [f32])>> = lockstep
-                    .iter_mut()
-                    .zip(buffers.iter_mut())
-                    .map(|(filter, buffer)| Some((filter, &mut buffer[start..end])))
-                    .collect();
-                entries.resize_with(LADDER_LANES, || None);
+                let mut filters = lockstep.iter_mut().zip(buffers.iter_mut());
                 let entries: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES] =
-                    entries.try_into().ok().unwrap();
+                    std::array::from_fn(|lane| {
+                        if positions.contains(&lane) {
+                            filters.next().map(|(filter, buffer)| (filter, &mut buffer[start..end]))
+                        } else {
+                            None
+                        }
+                    });
                 unsafe { LadderFilter::process_block_x8(entries) };
             }
 
             for lane in 0..lanes {
+                let case = format!("{mode:?} filter {lane} in lanes {positions:?}");
                 if let Some(first) = (0..input.len()).find(|&i| buffers[lane][i] != expected[lane][i]) {
                     let max_diff = (0..input.len())
                         .map(|i| (buffers[lane][i] - expected[lane][i]).abs())
                         .fold(0.0_f32, f32::max);
                     panic!(
-                        "{mode:?} lane {lane} of {lanes}: first difference at sample {first}: lockstep {} vs scalar {} (max difference {max_diff:e}, {} of {} samples differ)",
+                        "{case}: first difference at sample {first}: lockstep {} vs scalar {} (max difference {max_diff:e}, {} of {} samples differ)",
                         buffers[lane][first],
                         expected[lane][first],
                         (0..input.len()).filter(|&i| buffers[lane][i] != expected[lane][i]).count(),
                         input.len()
                     );
                 }
-                assert_eq!(buffers[lane], expected[lane], "{mode:?} lane {lane} of {lanes}");
-                assert!(expected[lane].iter().any(|sample| sample.abs() > 1e-3));
+                assert!(expected[lane].iter().any(|sample| sample.abs() > 1e-3), "{case}");
             }
             // and the state is carried over identically
             for lane in 0..lanes {
+                assert_eq!(scalar[lane].noise_position, lockstep[lane].noise_position);
                 assert_eq!(scalar[lane].process(0.25), lockstep[lane].process(0.25));
             }
         }
