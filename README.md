@@ -16,7 +16,7 @@ Currently a work in progress, but usable nevertheless.
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
 * Wavetable oscillators with sine, triangle, absolute sine, saw, square and pulse waves, plus a pulse width sweep wavetable that each oscillator's position control morphs through
-* Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic interpolation (AVX2 gathers where available)
+* Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic, linear or no interpolation (a global control, for trading quality against CPU)
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * Vibrato, tremolo and modulation control with an LFO
@@ -61,8 +61,13 @@ cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 ### Control rate
 Envelopes, pitch (including portamento and vibrato), the LFO, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFO, which can't go faster than half the control rate. Change the constant to try other sizes.
 
+### Interpolation
+The global Interpolation control picks how the wavetables are read in between their samples: Cubic (4-point Hermite, the default and cleanest), Linear, or None (the sample below the read position, which steps audibly on all but the lowest notes). Each mode has its own specialised lookup kernels, so there is no per-sample cost to the choice. On an 8 note, 3 x 8 voice supersaw, Linear is about 25% cheaper than Cubic and None about 40% cheaper.
+
 ### SIMD
-Unison voices are processed eight at a time: their phases advance as vectors and their wavetable reads (4-point cubic Hermite interpolation) run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. The ladder filter processes four voices in lockstep with AVX, producing exactly the same output as the one-voice-at-a-time version. Everything is detected at runtime, so one build runs on any x86-64 CPU.
+Unison voices are processed eight at a time: their phases advance as vectors and their wavetable reads run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. There are two AVX2 variants, one reading each voice's taps with a 128-bit load and transposing them, the other using gather instructions; which is faster depends on the CPU (gathers are slow on the Intel generations with the "Downfall" mitigation, Skylake to Tiger Lake, and faster elsewhere), so the two are timed against each other when the synth starts. The ladder filter processes four voices in lockstep with AVX, producing exactly the same output as the one-voice-at-a-time version. Everything is detected at runtime, so one build runs on any x86-64 CPU.
+
+The wavetable lookups are bound by latency rather than by memory or arithmetic: each 8 voice read is one long dependency chain (phase advance, index, loads, interpolation, horizontal sum), and the lookups of different samples are only overlapped as far as the CPU's out-of-order window reaches. Shrinking the tables 8 times or tripling the number of notes changes the cost per voice by a few percent, which is also why a 16-bit table format would buy little. The remaining big win would be rendering a whole control rate block per oscillator inside one kernel call, so that consecutive samples overlap properly.
 
 ### Previous LV2 version
 Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the LV2 build is gone; if you need it, check out a commit from before the nih-plug port.
@@ -99,8 +104,8 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Use audio buffering for more optimisations
 * Optimise
 * Extract DSP to internal crate
-* Better wavetable interpolation (sinc or Niemitalo's optimal interpolators; currently 4-point cubic Hermite)
-* SIMD accelerate stereo paths
+* Better wavetable interpolation (sinc or Niemitalo's optimal interpolators; currently 4-point cubic Hermite at best)
+* Render a whole control rate block per oscillator in one SIMD kernel call, so consecutive samples overlap (see SIMD above)
 * Approximate/cache expensive computations (i.e. any uses of `powf`)
 * Fix buffer size to reduce expensive modulation calculations at the expense of sample-accurate automation (make const so that you can play around with buffer lengths, see what is good)
 * Come up with better name for "Initial Pitch Slide" control

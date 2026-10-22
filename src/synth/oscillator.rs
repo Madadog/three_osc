@@ -18,9 +18,10 @@ pub enum SimdLevel {
     /// vectors, and interpolated 8 voices at a time.
     #[cfg(target_arch = "x86_64")]
     Avx2,
-    /// Like `Avx2`, but the taps are read with gather instructions. Gathers are microcoded and
-    /// slow on many Intel CPUs (since the 2023 "Downfall" mitigation), so this is kept for
-    /// benchmarking rather than used by default.
+    /// Like `Avx2`, but the taps are read with gather instructions. Whether that is faster
+    /// depends on the CPU: gathers are microcoded and slow on the Intel generations affected by
+    /// the 2023 "Downfall" mitigation (Skylake to Tiger Lake), and a good deal faster than the
+    /// loads and shuffles on newer ones, so `detect()` times both.
     #[cfg(target_arch = "x86_64")]
     Avx2Gather,
 }
@@ -30,15 +31,84 @@ impl SimdLevel {
     pub fn has_avx(self) -> bool {
         !matches!(self, SimdLevel::Portable)
     }
-    /// The best level supported by this CPU.
+    /// The fastest level supported by this CPU. On AVX2 CPUs the two lookup variants are timed
+    /// against each other, which takes well under a millisecond.
     pub fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return SimdLevel::Avx2;
+            return Self::fastest_avx2();
         }
         SimdLevel::Portable
     }
+    /// Times the two AVX2 lookup variants on a small table and returns the faster one. The
+    /// timing mimics the common case of one vector of 8 unison voices per call; the loads and
+    /// shuffles variant is kept unless the gathers are clearly faster.
+    #[cfg(target_arch = "x86_64")]
+    fn fastest_avx2() -> Self {
+        use std::time::{Duration, Instant};
+        const CALLS: usize = 2000;
+        const ROUNDS: usize = 3;
+
+        let len = 256;
+        let table = Wavetable::new((0..len).map(|i| i as f32 / len as f32 * 2.0 - 1.0).collect());
+        let frames = FramePair {
+            a: &table,
+            b: &table,
+            mix: 0.0,
+        };
+        let factors: [f32x8; UNISON_VECTORS] = std::array::from_fn(|vector| {
+            f32x8::new(std::array::from_fn(|lane| 1.0 + (vector * UNISON_LANES + lane) as f32 * 1e-3))
+        });
+        let mask = [f32x8::splat(1.0); UNISON_VECTORS];
+        let time = |simd: SimdLevel| {
+            let mut voice = SuperVoice::new(0.0, 1.0);
+            let mut sink = 0.0;
+            let start = Instant::now();
+            for _ in 0..CALLS {
+                sink += frames.advance_and_sum(
+                    &mut voice, 0.0123, &factors, 0.0, UNISON_LANES, &mask, simd, Interpolation::Cubic,
+                );
+            }
+            std::hint::black_box(sink);
+            start.elapsed()
+        };
+        // Alternate between the variants and keep each one's best time, to ride out
+        // interruptions by other threads.
+        let (mut transpose, mut gather) = (Duration::MAX, Duration::MAX);
+        for _ in 0..ROUNDS {
+            transpose = transpose.min(time(SimdLevel::Avx2));
+            gather = gather.min(time(SimdLevel::Avx2Gather));
+        }
+        if gather.as_nanos() * 20 < transpose.as_nanos() * 19 {
+            SimdLevel::Avx2Gather
+        } else {
+            SimdLevel::Avx2
+        }
+    }
 }
+
+/// How the wavetables are read in between their samples, from cheapest to cleanest.
+///
+/// The lookup kernels are specialised for each mode at compile time through a `const INTERP:
+/// u8` parameter holding the mode's discriminant, so switching modes costs nothing per sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Interpolation {
+    /// No interpolation: the sample below the read position is used as is. The cheapest, and
+    /// the noisiest: the steps between samples alias audibly on all but the lowest notes.
+    None = NONE,
+    /// Linear interpolation between the two nearest samples.
+    Linear = LINEAR,
+    /// 4-point cubic Hermite (Catmull-Rom) interpolation. The cleanest, with the most reads and
+    /// arithmetic per voice.
+    #[default]
+    Cubic = CUBIC,
+}
+
+/// Const generic tags for the interpolation modes, see [`Interpolation`].
+const NONE: u8 = 0;
+const LINEAR: u8 = 1;
+const CUBIC: u8 = 2;
 
 /// Up to this many unison voices are read one at a time instead of in SIMD vectors, since
 /// filling a vector for one or two voices costs more than it saves.
@@ -560,10 +630,26 @@ impl Wavetable {
     /// interpolation. Out of range indices are clamped.
     #[inline]
     pub fn read(&self, index: f32) -> f32 {
+        self.read_with::<CUBIC>(index)
+    }
+    /// Reads the table at a fractional sample index in `[0, cycle_len)` with the given
+    /// interpolation mode (an [`Interpolation`] discriminant). Out of range indices are clamped.
+    #[inline]
+    pub fn read_with<const INTERP: u8>(&self, index: f32) -> f32 {
         let floor = (index as usize).min(self.cycle_len() - 1);
-        let frac = index - floor as f32;
+        // The table is padded, so the 4 taps around the index are always inside it
         let taps = &self.table[floor..floor + 4];
-        hermite(taps[0], taps[1], taps[2], taps[3], frac)
+        match INTERP {
+            NONE => taps[1],
+            LINEAR => {
+                let frac = index - floor as f32;
+                taps[1] + (taps[2] - taps[1]) * frac
+            }
+            _ => {
+                let frac = index - floor as f32;
+                hermite(taps[0], taps[1], taps[2], taps[3], frac)
+            }
+        }
     }
     /// Generates a sample at the given phase in cycles.
     #[inline]
@@ -620,12 +706,19 @@ impl FramePair<'_> {
     pub fn cycle_len(&self) -> usize {
         self.a.cycle_len()
     }
-    /// Reads the frames at a fractional sample index in `[0, cycle_len)`.
+    /// Reads the frames at a fractional sample index in `[0, cycle_len)` with cubic
+    /// interpolation.
     #[inline]
     pub fn read(&self, index: f32) -> f32 {
-        let a = self.a.read(index);
+        self.read_with::<CUBIC>(index)
+    }
+    /// Reads the frames at a fractional sample index in `[0, cycle_len)` with the given
+    /// interpolation mode (an [`Interpolation`] discriminant).
+    #[inline]
+    pub fn read_with<const INTERP: u8>(&self, index: f32) -> f32 {
+        let a = self.a.read_with::<INTERP>(index);
         if self.mix > 0.0 {
-            lerp(a, self.b.read(index), self.mix)
+            lerp(a, self.b.read_with::<INTERP>(index), self.mix)
         } else {
             a
         }
@@ -643,13 +736,39 @@ impl FramePair<'_> {
         voices: usize,
         mask: &[f32x8; UNISON_VECTORS],
         simd: SimdLevel,
+        interpolation: Interpolation,
+    ) -> f32 {
+        match interpolation {
+            Interpolation::None => self.advance_and_sum_with::<NONE>(
+                voice, delta, detune_factors, phase_offset, voices, mask, simd,
+            ),
+            Interpolation::Linear => self.advance_and_sum_with::<LINEAR>(
+                voice, delta, detune_factors, phase_offset, voices, mask, simd,
+            ),
+            Interpolation::Cubic => self.advance_and_sum_with::<CUBIC>(
+                voice, delta, detune_factors, phase_offset, voices, mask, simd,
+            ),
+        }
+    }
+    /// [`advance_and_sum()`][Self::advance_and_sum()] specialised for one interpolation mode.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn advance_and_sum_with<const INTERP: u8>(
+        &self,
+        voice: &mut SuperVoice,
+        delta: f32,
+        detune_factors: &[f32x8; UNISON_VECTORS],
+        phase_offset: f32,
+        voices: usize,
+        mask: &[f32x8; UNISON_VECTORS],
+        simd: SimdLevel,
     ) -> f32 {
         let table_len = self.cycle_len() as f32;
         if voices <= SCALAR_VOICE_LIMIT {
             let mut total = 0.0;
             for i in 0..voices {
                 let index = voice.advance_one(i, delta, lane(detune_factors, i), phase_offset, table_len);
-                total += self.read(index) * lane(mask, i);
+                total += self.read_with::<INTERP>(index) * lane(mask, i);
             }
             return total;
         }
@@ -657,19 +776,19 @@ impl FramePair<'_> {
             SimdLevel::Portable => {
                 let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
                 voice.advance(delta, voices, detune_factors, phase_offset, table_len, &mut indices);
-                lookup::portable::sum(self, &indices, voices.div_ceil(UNISON_LANES), mask)
+                lookup::portable::sum::<INTERP>(self, &indices, voices.div_ceil(UNISON_LANES), mask)
             }
             // SAFETY: the AVX2 levels are only produced by `SimdLevel::detect()` when the CPU
             // supports AVX2 and FMA.
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2 => unsafe {
-                lookup::avx2::advance_and_sum::<false>(
+                lookup::avx2::advance_and_sum::<false, INTERP>(
                     self, voice, delta, detune_factors, phase_offset, voices, mask,
                 )
             },
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2Gather => unsafe {
-                lookup::avx2::advance_and_sum::<true>(
+                lookup::avx2::advance_and_sum::<true, INTERP>(
                     self, voice, delta, detune_factors, phase_offset, voices, mask,
                 )
             },
@@ -691,13 +810,42 @@ impl FramePair<'_> {
         pan_left: &[f32x8; UNISON_VECTORS],
         pan_right: &[f32x8; UNISON_VECTORS],
         simd: SimdLevel,
+        interpolation: Interpolation,
+    ) -> (f32, f32, f32) {
+        match interpolation {
+            Interpolation::None => self.advance_and_sum_panned_with::<NONE>(
+                voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right, simd,
+            ),
+            Interpolation::Linear => self.advance_and_sum_panned_with::<LINEAR>(
+                voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right, simd,
+            ),
+            Interpolation::Cubic => self.advance_and_sum_panned_with::<CUBIC>(
+                voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right, simd,
+            ),
+        }
+    }
+    /// [`advance_and_sum_panned()`][Self::advance_and_sum_panned()] specialised for one
+    /// interpolation mode.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn advance_and_sum_panned_with<const INTERP: u8>(
+        &self,
+        voice: &mut SuperVoice,
+        delta: f32,
+        detune_factors: &[f32x8; UNISON_VECTORS],
+        phase_offset: f32,
+        voices: usize,
+        mask: &[f32x8; UNISON_VECTORS],
+        pan_left: &[f32x8; UNISON_VECTORS],
+        pan_right: &[f32x8; UNISON_VECTORS],
+        simd: SimdLevel,
     ) -> (f32, f32, f32) {
         let table_len = self.cycle_len() as f32;
         if voices <= SCALAR_VOICE_LIMIT {
             let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
             for i in 0..voices {
                 let index = voice.advance_one(i, delta, lane(detune_factors, i), phase_offset, table_len);
-                let sample = self.read(index);
+                let sample = self.read_with::<INTERP>(index);
                 mono += sample * lane(mask, i);
                 left += sample * lane(pan_left, i);
                 right += sample * lane(pan_right, i);
@@ -708,7 +856,7 @@ impl FramePair<'_> {
             SimdLevel::Portable => {
                 let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
                 voice.advance(delta, voices, detune_factors, phase_offset, table_len, &mut indices);
-                lookup::portable::sum_panned(
+                lookup::portable::sum_panned::<INTERP>(
                     self,
                     &indices,
                     voices.div_ceil(UNISON_LANES),
@@ -717,16 +865,16 @@ impl FramePair<'_> {
                     pan_right,
                 )
             }
-            // SAFETY: see `advance_and_sum()`
+            // SAFETY: see `advance_and_sum_with()`
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2 => unsafe {
-                lookup::avx2::advance_and_sum_panned::<false>(
+                lookup::avx2::advance_and_sum_panned::<false, INTERP>(
                     self, voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right,
                 )
             },
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2Gather => unsafe {
-                lookup::avx2::advance_and_sum_panned::<true>(
+                lookup::avx2::advance_and_sum_panned::<true, INTERP>(
                     self, voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right,
                 )
             },
@@ -740,7 +888,9 @@ fn lane(vectors: &[f32x8; UNISON_VECTORS], voice: usize) -> f32 {
     vectors[voice / UNISON_LANES].as_array()[voice % UNISON_LANES]
 }
 
-/// The hot loop: reading and interpolating all unison voices from the wavetable frames.
+/// The hot loop: reading and interpolating all unison voices from the wavetable frames. Each
+/// kernel is specialised per interpolation mode through `INTERP`, an [`Interpolation`]
+/// discriminant.
 mod lookup {
     use super::*;
 
@@ -764,37 +914,61 @@ mod lookup {
             ((c3 * t + c2) * t + c1) * t + y1
         }
 
-        /// Reads 8 voices from a table at the given fractional indices.
+        /// Reads 8 voices from a table at the given fractional indices, with the interpolation
+        /// mode given by `INTERP` (an [`Interpolation`] discriminant).
         #[inline]
-        fn read8(table: &[f32], max_index: i32x8, indices: f32x8) -> f32x8 {
+        fn read8<const INTERP: u8>(table: &[f32], max_index: i32x8, indices: f32x8) -> f32x8 {
             let floor = indices.trunc_int().min(max_index).max(i32x8::splat(0));
-            let frac = indices - floor.round_float();
-            let floor = floor.to_array();
+            let floors = floor.to_array();
             let mut taps = [[0.0_f32; UNISON_LANES]; 4];
-            for (lane, &floor) in floor.iter().enumerate() {
+            for (lane, &floor) in floors.iter().enumerate() {
                 let floor = floor as usize;
                 // Clamped above, so the 4 taps are always inside the padded table
                 let samples = &table[floor..floor + 4];
-                taps[0][lane] = samples[0];
-                taps[1][lane] = samples[1];
-                taps[2][lane] = samples[2];
-                taps[3][lane] = samples[3];
+                match INTERP {
+                    NONE => taps[1][lane] = samples[1],
+                    LINEAR => {
+                        taps[1][lane] = samples[1];
+                        taps[2][lane] = samples[2];
+                    }
+                    _ => {
+                        taps[0][lane] = samples[0];
+                        taps[1][lane] = samples[1];
+                        taps[2][lane] = samples[2];
+                        taps[3][lane] = samples[3];
+                    }
+                }
             }
-            hermite8(
-                f32x8::new(taps[0]),
-                f32x8::new(taps[1]),
-                f32x8::new(taps[2]),
-                f32x8::new(taps[3]),
-                frac,
-            )
+            let y1 = f32x8::new(taps[1]);
+            match INTERP {
+                NONE => y1,
+                LINEAR => {
+                    let frac = indices - floor.round_float();
+                    y1 + (f32x8::new(taps[2]) - y1) * frac
+                }
+                _ => {
+                    let frac = indices - floor.round_float();
+                    hermite8(
+                        f32x8::new(taps[0]),
+                        y1,
+                        f32x8::new(taps[2]),
+                        f32x8::new(taps[3]),
+                        frac,
+                    )
+                }
+            }
         }
 
         /// Reads 8 voices from the frame pair.
         #[inline]
-        fn read_frames8(frames: &FramePair, max_index: i32x8, indices: f32x8) -> f32x8 {
-            let a = read8(&frames.a.table, max_index, indices);
+        fn read_frames8<const INTERP: u8>(
+            frames: &FramePair,
+            max_index: i32x8,
+            indices: f32x8,
+        ) -> f32x8 {
+            let a = read8::<INTERP>(&frames.a.table, max_index, indices);
             if frames.mix > 0.0 {
-                let b = read8(&frames.b.table, max_index, indices);
+                let b = read8::<INTERP>(&frames.b.table, max_index, indices);
                 a + (b - a) * f32x8::splat(frames.mix)
             } else {
                 a
@@ -802,7 +976,7 @@ mod lookup {
         }
 
         #[inline]
-        pub fn sum(
+        pub fn sum<const INTERP: u8>(
             frames: &FramePair,
             indices: &[f32x8; UNISON_VECTORS],
             vectors: usize,
@@ -811,13 +985,13 @@ mod lookup {
             let max_index = i32x8::splat(frames.cycle_len() as i32 - 1);
             let mut total = f32x8::splat(0.0);
             for vector in 0..vectors.min(UNISON_VECTORS) {
-                total += read_frames8(frames, max_index, indices[vector]) * mask[vector];
+                total += read_frames8::<INTERP>(frames, max_index, indices[vector]) * mask[vector];
             }
             horizontal_sum(total)
         }
 
         #[inline]
-        pub fn sum_panned(
+        pub fn sum_panned<const INTERP: u8>(
             frames: &FramePair,
             indices: &[f32x8; UNISON_VECTORS],
             vectors: usize,
@@ -830,7 +1004,7 @@ mod lookup {
             let mut left = f32x8::splat(0.0);
             let mut right = f32x8::splat(0.0);
             for vector in 0..vectors.min(UNISON_VECTORS) {
-                let samples = read_frames8(frames, max_index, indices[vector]);
+                let samples = read_frames8::<INTERP>(frames, max_index, indices[vector]);
                 mono += samples * mask[vector];
                 left += samples * pan_left[vector];
                 right += samples * pan_right[vector];
@@ -925,49 +1099,71 @@ mod lookup {
             _mm256_fmadd_ps(poly, t, y1)
         }
 
-        /// The 4 taps of 8 voices, each as a vector with one lane per voice.
+        /// The 4 taps `(y0, y1, y2, y3)` of 8 voices, each as a vector with one lane per voice.
+        /// `y1` is the sample below the read position. Modes that use fewer taps leave the
+        /// others zero.
         type Taps = (__m256, __m256, __m256, __m256);
 
-        /// Reads the 4 taps of 8 voices with gather instructions.
+        /// Reads the taps of 8 voices with gather instructions.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn taps_gather(base: *const f32, floor: __m256i) -> Taps {
+        unsafe fn taps_gather<const INTERP: u8>(base: *const f32, floor: __m256i) -> Taps {
+            let zero = _mm256_setzero_ps();
+            let y1 = _mm256_i32gather_ps::<4>(base.add(1), floor);
+            if INTERP == NONE {
+                return (zero, y1, zero, zero);
+            }
+            let y2 = _mm256_i32gather_ps::<4>(base.add(2), floor);
+            if INTERP == LINEAR {
+                return (zero, y1, y2, zero);
+            }
             (
                 _mm256_i32gather_ps::<4>(base, floor),
-                _mm256_i32gather_ps::<4>(base.add(1), floor),
-                _mm256_i32gather_ps::<4>(base.add(2), floor),
+                y1,
+                y2,
                 _mm256_i32gather_ps::<4>(base.add(3), floor),
             )
         }
 
-        /// Reads the 4 taps of 8 voices with one 128-bit load per voice, then transposes the
-        /// 8 rows of 4 taps into 4 vectors of 8 voices.
+        /// Reads the taps of 8 voices with one 128-bit load per voice (all 4 taps, which is
+        /// no dearer than loading fewer), then transposes the 8 rows of 4 taps into one vector
+        /// of 8 voices per tap the interpolation needs.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn taps_transpose(base: *const f32, floor: __m256i) -> Taps {
+        unsafe fn taps_transpose<const INTERP: u8>(base: *const f32, floor: __m256i) -> Taps {
             let mut offsets = [0_i32; UNISON_LANES];
             _mm256_storeu_si256(offsets.as_mut_ptr() as *mut __m256i, floor);
             let row = |voice: usize| _mm_loadu_ps(base.add(offsets[voice] as usize));
             // Pair up rows so that each 128-bit half holds one row: (r0|r4), (r1|r5), ...
             let pair = |low: usize| _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(row(low)), row(low + 4));
             let (a, b, c, d) = (pair(0), pair(1), pair(2), pair(3));
+            let zero = _mm256_setzero_ps();
             // Interleave: t0 = r0[0] r1[0] r0[1] r1[1] | r4[0] r5[0] r4[1] r5[1], etc.
             let t0 = _mm256_unpacklo_ps(a, b);
-            let t1 = _mm256_unpackhi_ps(a, b);
             let t2 = _mm256_unpacklo_ps(c, d);
+            let y1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+            if INTERP == NONE {
+                return (zero, y1, zero, zero);
+            }
+            let t1 = _mm256_unpackhi_ps(a, b);
             let t3 = _mm256_unpackhi_ps(c, d);
+            let y2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+            if INTERP == LINEAR {
+                return (zero, y1, y2, zero);
+            }
             (
                 _mm256_shuffle_ps::<0x44>(t0, t2),
-                _mm256_shuffle_ps::<0xEE>(t0, t2),
-                _mm256_shuffle_ps::<0x44>(t1, t3),
+                y1,
+                y2,
                 _mm256_shuffle_ps::<0xEE>(t1, t3),
             )
         }
 
-        /// Reads 8 voices from a table at the given fractional indices.
+        /// Reads 8 voices from a table at the given fractional indices, with the interpolation
+        /// mode given by `INTERP` (an [`Interpolation`] discriminant).
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn read8<const GATHER: bool>(
+        unsafe fn read8<const GATHER: bool, const INTERP: u8>(
             table: &[f32],
             max_index: __m256i,
             indices: __m256,
@@ -976,29 +1172,38 @@ mod lookup {
                 _mm256_min_epi32(_mm256_cvttps_epi32(indices), max_index),
                 _mm256_setzero_si256(),
             );
-            let frac = _mm256_sub_ps(indices, _mm256_cvtepi32_ps(floor));
             // SAFETY: the indices are clamped to the cycle, and the table is padded with the
             // neighbouring samples, so all 4 taps are inside it.
             let base = table.as_ptr();
             let (y0, y1, y2, y3) = if GATHER {
-                taps_gather(base, floor)
+                taps_gather::<INTERP>(base, floor)
             } else {
-                taps_transpose(base, floor)
+                taps_transpose::<INTERP>(base, floor)
             };
-            hermite8(y0, y1, y2, y3, frac)
+            match INTERP {
+                NONE => y1,
+                LINEAR => {
+                    let frac = _mm256_sub_ps(indices, _mm256_cvtepi32_ps(floor));
+                    _mm256_fmadd_ps(_mm256_sub_ps(y2, y1), frac, y1)
+                }
+                _ => {
+                    let frac = _mm256_sub_ps(indices, _mm256_cvtepi32_ps(floor));
+                    hermite8(y0, y1, y2, y3, frac)
+                }
+            }
         }
 
         /// Reads 8 voices from the frame pair.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn read_frames8<const GATHER: bool>(
+        unsafe fn read_frames8<const GATHER: bool, const INTERP: u8>(
             frames: &FramePair,
             max_index: __m256i,
             indices: __m256,
         ) -> __m256 {
-            let a = read8::<GATHER>(&frames.a.table, max_index, indices);
+            let a = read8::<GATHER, INTERP>(&frames.a.table, max_index, indices);
             if frames.mix > 0.0 {
-                let b = read8::<GATHER>(&frames.b.table, max_index, indices);
+                let b = read8::<GATHER, INTERP>(&frames.b.table, max_index, indices);
                 _mm256_fmadd_ps(_mm256_sub_ps(b, a), _mm256_set1_ps(frames.mix), a)
             } else {
                 a
@@ -1006,7 +1211,7 @@ mod lookup {
         }
 
         #[target_feature(enable = "avx2,fma")]
-        pub unsafe fn advance_and_sum<const GATHER: bool>(
+        pub unsafe fn advance_and_sum<const GATHER: bool, const INTERP: u8>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             delta: f32,
@@ -1028,7 +1233,7 @@ mod lookup {
                     phase_offset,
                     table_len,
                 );
-                let samples = read_frames8::<GATHER>(frames, max_index, indices);
+                let samples = read_frames8::<GATHER, INTERP>(frames, max_index, indices);
                 total = _mm256_fmadd_ps(samples, load(&mask[vector]), total);
             }
             horizontal_sum(total)
@@ -1036,7 +1241,7 @@ mod lookup {
 
         #[target_feature(enable = "avx2,fma")]
         #[allow(clippy::too_many_arguments)]
-        pub unsafe fn advance_and_sum_panned<const GATHER: bool>(
+        pub unsafe fn advance_and_sum_panned<const GATHER: bool, const INTERP: u8>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             delta: f32,
@@ -1062,7 +1267,7 @@ mod lookup {
                     phase_offset,
                     table_len,
                 );
-                let samples = read_frames8::<GATHER>(frames, max_index, indices);
+                let samples = read_frames8::<GATHER, INTERP>(frames, max_index, indices);
                 mono = _mm256_fmadd_ps(samples, load(&mask[vector]), mono);
                 left = _mm256_fmadd_ps(samples, load(&pan_left[vector]), left);
                 right = _mm256_fmadd_ps(samples, load(&pan_right[vector]), right);
@@ -1395,8 +1600,8 @@ impl<const N: usize> AdditiveOsc<N> {
     }
 }
 
+#[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     #[test]
@@ -1499,6 +1704,51 @@ mod tests {
         assert!(table.read(-1.0).is_finite());
     }
 
+    /// Reads the frames with a runtime selected interpolation mode.
+    fn read_mode(frames: &FramePair, index: f32, mode: Interpolation) -> f32 {
+        match mode {
+            Interpolation::None => frames.read_with::<NONE>(index),
+            Interpolation::Linear => frames.read_with::<LINEAR>(index),
+            Interpolation::Cubic => frames.read_with::<CUBIC>(index),
+        }
+    }
+
+    const MODES: [Interpolation; 3] = [Interpolation::None, Interpolation::Linear, Interpolation::Cubic];
+
+    #[test]
+    fn interpolation_modes_read_as_expected() {
+        let len = 64;
+        let cycle: Vec<f32> = (0..len)
+            .map(|i| (2.0 * PI * i as f32 / len as f32).sin())
+            .collect();
+        let table = Wavetable::new(cycle.clone());
+        assert_eq!(Interpolation::default(), Interpolation::Cubic);
+        assert_eq!(Interpolation::Cubic as u8, CUBIC);
+        for (i, sample) in cycle.iter().enumerate() {
+            let next = cycle[(i + 1) % len];
+            // Every mode reproduces the samples themselves
+            assert_eq!(table.read_with::<NONE>(i as f32), *sample);
+            assert_eq!(table.read_with::<LINEAR>(i as f32), *sample);
+            assert_eq!(table.read_with::<CUBIC>(i as f32), *sample);
+            // No interpolation holds the sample below the read position
+            assert_eq!(table.read_with::<NONE>(i as f32 + 0.75), *sample);
+            // Linear interpolation is the weighted average of the two neighbours
+            let linear = table.read_with::<LINEAR>(i as f32 + 0.25);
+            assert!((linear - (0.75 * sample + 0.25 * next)).abs() < 1e-6, "{i}: {linear}");
+            // Cubic interpolation is closer to the true sine than linear
+            let want = (2.0 * PI * (i as f32 + 0.5) / len as f32).sin();
+            let cubic = table.read_with::<CUBIC>(i as f32 + 0.5);
+            let linear = table.read_with::<LINEAR>(i as f32 + 0.5);
+            assert!((cubic - want).abs() <= (linear - want).abs() + 1e-7, "{i}: {cubic} vs {linear}");
+        }
+        // Out of range reads are clamped in every mode
+        for index in [len as f32, 1e9, -1.0] {
+            assert!(table.read_with::<NONE>(index).is_finite());
+            assert!(table.read_with::<LINEAR>(index).is_finite());
+            assert!(table.read_with::<CUBIC>(index).is_finite());
+        }
+    }
+
     #[test]
     fn simd_lookups_match_the_scalar_reads() {
         let len = 256;
@@ -1526,7 +1776,7 @@ mod tests {
             levels.push(SimdLevel::Avx2Gather);
         }
 
-        for mix in [0.0, 0.3] {
+        for (mix, mode) in MODES.iter().flat_map(|mode| [(0.0, *mode), (0.3, *mode)]) {
             let frames = FramePair {
                 a: &sine,
                 b: &saw,
@@ -1542,7 +1792,7 @@ mod tests {
                 let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
                 for i in 0..voices {
                     let index = reference.advance_one(i, delta, lane(&osc.detune_factors, i), offset, len as f32);
-                    let sample = frames.read(index);
+                    let sample = read_mode(&frames, index, mode);
                     let (gain_left, gain_right) = osc.pan_gain(i);
                     mono += sample;
                     left += sample * gain_left;
@@ -1556,16 +1806,16 @@ mod tests {
                 let mut voice_panned = start.clone();
                 for (delta, offset, mono, left, right) in &expected {
                     let got = frames.advance_and_sum(
-                        &mut voice, *delta, &osc.detune_factors, *offset, voices, &osc.voice_mask, *simd,
+                        &mut voice, *delta, &osc.detune_factors, *offset, voices, &osc.voice_mask, *simd, mode,
                     );
-                    assert!((got - mono).abs() < 1e-3, "{simd:?} mix {mix}: {got} vs {mono}");
+                    assert!((got - mono).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got} vs {mono}");
                     let (got_mono, got_left, got_right) = frames.advance_and_sum_panned(
                         &mut voice_panned, *delta, &osc.detune_factors, *offset, voices,
-                        &osc.voice_mask, &osc.pan_left, &osc.pan_right, *simd,
+                        &osc.voice_mask, &osc.pan_left, &osc.pan_right, *simd, mode,
                     );
-                    assert!((got_mono - mono).abs() < 1e-3, "{simd:?} mix {mix}: {got_mono} vs {mono}");
-                    assert!((got_left - left).abs() < 1e-3, "{simd:?} mix {mix}: {got_left} vs {left}");
-                    assert!((got_right - right).abs() < 1e-3, "{simd:?} mix {mix}: {got_right} vs {right}");
+                    assert!((got_mono - mono).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got_mono} vs {mono}");
+                    assert!((got_left - left).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got_left} vs {left}");
+                    assert!((got_right - right).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got_right} vs {right}");
                 }
                 // The phases of the voices in use advanced identically
                 for i in 0..voices {
@@ -1578,12 +1828,36 @@ mod tests {
             // Few voices take the scalar path
             let mut few = start.clone();
             let mut few_reference = start.clone();
-            let got = frames.advance_and_sum(&mut few, 0.01, &osc.detune_factors, 0.2, 2, &osc.voice_mask, levels[0]);
+            let got = frames.advance_and_sum(
+                &mut few, 0.01, &osc.detune_factors, 0.2, 2, &osc.voice_mask, levels[0], mode,
+            );
             let mut want = 0.0;
             for i in 0..2 {
-                want += frames.read(few_reference.advance_one(i, 0.01, lane(&osc.detune_factors, i), 0.2, len as f32));
+                let index = few_reference.advance_one(i, 0.01, lane(&osc.detune_factors, i), 0.2, len as f32);
+                want += read_mode(&frames, index, mode);
             }
             assert!((got - want).abs() < 1e-4);
+        }
+
+        // The modes really differ from each other in between the samples
+        let frames = FramePair { a: &saw, b: &saw, mix: 0.0 };
+        let between = 100.5;
+        let none = read_mode(&frames, between, Interpolation::None);
+        let linear = read_mode(&frames, between, Interpolation::Linear);
+        assert!((linear - none).abs() > 1e-4);
+    }
+
+    #[test]
+    fn simd_detection_picks_an_avx2_level_on_avx2_cpus() {
+        let level = SimdLevel::detect();
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            assert!(level.has_avx(), "{level:?}");
+            // Both variants have to work since either can be picked
+            assert!(SimdLevel::fastest_avx2().has_avx());
+        }
+        if !level.has_avx() {
+            assert_eq!(level, SimdLevel::Portable);
         }
     }
 

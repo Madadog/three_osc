@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use crate::params::OscillatorWave;
 use crate::synth::filter::{Filter, FilterModel, LadderFilter};
-use crate::synth::oscillator::{OscillatorParams, SimdLevel};
+use crate::synth::oscillator::{
+    FramePair, Interpolation, OscillatorParams, SimdLevel, SuperVoice, Wavetable, WavetableSet,
+};
 use crate::synth::ThreeOsc;
 use crate::ThreeOscPlugin;
 
@@ -23,11 +25,16 @@ const CHORD: [u8; 8] = [36, 43, 48, 52, 55, 60, 64, 67];
 
 /// Renders `SECONDS` of audio with the given patch and prints the time per sample.
 fn measure(name: &str, setup: impl Fn(&mut ThreeOscPlugin)) {
+    measure_notes(name, &CHORD, setup);
+}
+
+/// Like [`measure()`], holding down the given notes instead of the usual chord.
+fn measure_notes(name: &str, notes: &[u8], setup: impl Fn(&mut ThreeOscPlugin)) {
     let mut plugin = ThreeOscPlugin::default();
     plugin.apply_params();
     setup(&mut plugin);
-    for note in CHORD {
-        plugin.synth.note_on(note, 100);
+    for note in notes {
+        plugin.synth.note_on(*note, 100);
     }
 
     // The number of unison voices rendered per sample, across all notes and oscillators.
@@ -37,7 +44,7 @@ fn measure(name: &str, setup: impl Fn(&mut ThreeOscPlugin)) {
         .iter()
         .map(|osc| osc.voice_count as usize)
         .sum::<usize>()
-        * CHORD.len();
+        * notes.len();
 
     let mut left = vec![0.0; BLOCK_SIZE];
     let mut right = vec![0.0; BLOCK_SIZE];
@@ -97,11 +104,28 @@ fn benchmark_synth() {
         plugin.synth.oscillators.iter_mut().for_each(supersaw);
         plugin.synth.simd = SimdLevel::Portable;
     });
+    // Both AVX2 variants explicitly, since `detect()` picks either depending on the CPU
     #[cfg(target_arch = "x86_64")]
     if SimdLevel::detect() != SimdLevel::Portable {
-        measure("3 x saw, unison 8, AVX2 gather lookups", |plugin| {
+        measure("3 x saw, unison 8, AVX2 load+transpose", |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            plugin.synth.simd = SimdLevel::Avx2;
+        });
+        measure("3 x saw, unison 8, AVX2 gather", |plugin| {
             plugin.synth.oscillators.iter_mut().for_each(supersaw);
             plugin.synth.simd = SimdLevel::Avx2Gather;
+        });
+    }
+    for (name, interpolation) in [
+        ("linear interpolation", Interpolation::Linear),
+        ("no interpolation", Interpolation::None),
+    ] {
+        measure(&format!("default patch, {name}"), |plugin| {
+            plugin.synth.interpolation = interpolation;
+        });
+        measure(&format!("3 x saw, unison 8, {name}"), |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            plugin.synth.interpolation = interpolation;
         });
     }
     measure("3 x saw, unison 8, stereo width 1", |plugin| {
@@ -139,6 +163,88 @@ fn benchmark_synth() {
             osc.fm = 0.01;
         });
     });
+}
+
+/// How much of the lookup cost is memory: the supersaw patch with the wavetables shrunk so that
+/// every note's table fits in the L1 cache, and with three times as many notes as usual.
+#[test]
+#[ignore]
+fn benchmark_table_memory() {
+    println!("\nwavetable lookups: {:?}", SimdLevel::detect());
+    // Three octaves of semitones, with none of the chord's note sharing a table.
+    let many_notes: Vec<u8> = (36..60).collect();
+    for interpolation in [Interpolation::Cubic, Interpolation::Linear, Interpolation::None] {
+        for table_len in [256, 2048, 8192] {
+            let name = format!("{interpolation:?}, {table_len} sample tables");
+            measure(&format!("3 x saw, unison 8, 8 notes, {name}"), |plugin| {
+                plugin.synth.oscillators.iter_mut().for_each(supersaw);
+                plugin.synth.interpolation = interpolation;
+                plugin.synth.waves = WavetableSet::new(SAMPLE_RATE as f32, table_len);
+            });
+            measure_notes(&format!("3 x saw, unison 8, 24 notes, {name}"), &many_notes, |plugin| {
+                plugin.synth.oscillators.iter_mut().for_each(supersaw);
+                plugin.synth.interpolation = interpolation;
+                plugin.synth.waves = WavetableSet::new(SAMPLE_RATE as f32, table_len);
+            });
+        }
+    }
+}
+
+/// One 8 voice wavetable lookup on its own, for every SIMD level and interpolation mode. The
+/// "chain" column runs one voice, so each call waits for the previous one's phases; the
+/// "overlapped" column interleaves 8 independent voices like the synth does.
+#[test]
+#[ignore]
+fn benchmark_lookup_kernel() {
+    let len = 2048;
+    let table = Wavetable::new((0..len).map(|i| i as f32 / len as f32 * 2.0 - 1.0).collect());
+    let frames = FramePair {
+        a: &table,
+        b: &table,
+        mix: 0.0,
+    };
+    let mut osc = OscillatorParams::default();
+    osc.voice_count = 8;
+    osc.voices_detune = 0.01;
+    osc.update_detune_factors();
+
+    let mut levels = vec![SimdLevel::Portable];
+    #[cfg(target_arch = "x86_64")]
+    if SimdLevel::detect() != SimdLevel::Portable {
+        levels.insert(0, SimdLevel::Avx2);
+        levels.insert(1, SimdLevel::Avx2Gather);
+    }
+    const CALLS: usize = 2_000_000;
+    const INDEPENDENT: usize = 8;
+    println!();
+    for simd in levels {
+        for interpolation in [Interpolation::None, Interpolation::Linear, Interpolation::Cubic] {
+            let mut voice = SuperVoice::new(0.0, 1.0);
+            let mut sink = 0.0;
+            let start = Instant::now();
+            for _ in 0..CALLS {
+                sink += frames.advance_and_sum(
+                    &mut voice, 0.0123, &osc.detune_factors, 0.0, 8, &osc.voice_mask, simd, interpolation,
+                );
+            }
+            let chain = start.elapsed().as_nanos() as f64 / CALLS as f64;
+
+            let mut voices: Vec<SuperVoice> = (0..INDEPENDENT).map(|_| SuperVoice::new(0.0, 1.0)).collect();
+            let start = Instant::now();
+            for _ in 0..CALLS / INDEPENDENT {
+                for voice in voices.iter_mut() {
+                    sink += frames.advance_and_sum(
+                        voice, 0.0123, &osc.detune_factors, 0.0, 8, &osc.voice_mask, simd, interpolation,
+                    );
+                }
+            }
+            let overlapped = start.elapsed().as_nanos() as f64 / CALLS as f64;
+            println!(
+                "{simd:<12?} {interpolation:<8?} {chain:>6.1} ns/call as a chain {overlapped:>6.1} ns/call overlapped",
+            );
+            assert!(sink.is_finite());
+        }
+    }
 }
 
 /// The ladder filter on its own, and without its two oversampling related costs.

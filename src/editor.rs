@@ -388,6 +388,15 @@ fn global(ui: &mut Ui, title: &str, global: &GlobalParams, setter: &ParamSetter)
              keyboard.",
             setter,
         );
+        combo(
+            ui,
+            &global.interpolation,
+            "How the oscillators read their wavetables in between samples. Cubic is the \
+             cleanest. Linear is a little cheaper and adds some aliasing noise on high notes. \
+             None (no interpolation) is the cheapest and the grittiest: it steps between the \
+             samples, which is clearly audible on all but the lowest notes.",
+            setter,
+        );
     });
 }
 

@@ -68,6 +68,7 @@ impl ThreeOscPlugin {
         // multiplies delta: smaller = higher pitch
         synth.octave_detune = 1.0 - global.octave_detune.value();
         synth.stereo_width = global.stereo_width.value();
+        synth.interpolation = global.interpolation.value().to_interpolation();
 
         // Master gain envelope
         let vol_env = &params.vol_env;
@@ -420,6 +421,44 @@ mod tests {
 
         assert!(left.iter().chain(right.iter()).all(|sample| sample.is_finite()));
         assert!(left.iter().any(|sample| *sample != 0.0), "the second note should be audible");
+    }
+
+    /// Every interpolation mode renders finite audio, through both the scalar (1 voice) and the
+    /// SIMD (8 voices) lookups, and the modes differ from each other.
+    #[test]
+    fn interpolation_modes_render_finite_and_distinct_audio() {
+        use crate::synth::oscillator::Interpolation;
+
+        let mut plugin = ThreeOscPlugin::default();
+        assert_eq!(
+            plugin.params.global.interpolation.value().to_interpolation(),
+            Interpolation::Cubic
+        );
+        let mut render = |interpolation: Interpolation, voices: u8| {
+            plugin.synth.reset();
+            plugin.apply_params();
+            plugin.synth.interpolation = interpolation;
+            for osc in plugin.synth.oscillators.iter_mut() {
+                osc.voice_count = voices;
+                osc.phase_rand = 0.0;
+            }
+            plugin.synth.note_on(84, 100);
+            let mut left = vec![0.0; 2048];
+            let mut right = vec![0.0; 2048];
+            plugin.synth.run(&mut left, &mut right);
+            assert!(left.iter().all(|sample| sample.is_finite()), "{interpolation:?}");
+            assert!(left.iter().any(|sample| sample.abs() > 0.01), "{interpolation:?}");
+            left
+        };
+        for voices in [1, 8] {
+            let none = render(Interpolation::None, voices);
+            let linear = render(Interpolation::Linear, voices);
+            let cubic = render(Interpolation::Cubic, voices);
+            assert!(max_abs_diff(&none, &linear) > 1e-4, "{voices} voices");
+            assert!(max_abs_diff(&linear, &cubic) > 1e-6, "{voices} voices");
+            // The modes only differ in between the table samples, so they stay close
+            assert!(max_abs_diff(&none, &cubic) < 0.1, "{voices} voices");
+        }
     }
 
     /// Renders one note with the default patch, the given number of unison voices on every

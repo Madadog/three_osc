@@ -13,7 +13,7 @@ use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 
 use crate::synth::filter::{FilterModel, FilterType};
-use crate::synth::oscillator::OscWave;
+use crate::synth::oscillator::{Interpolation, OscWave};
 use crate::synth::Polyphony;
 
 /// Waveforms available to the LFO.
@@ -121,6 +121,27 @@ impl FilterTypeParam {
             FilterTypeParam::Lowpass => FilterType::Lowpass,
             FilterTypeParam::Bandpass => FilterType::Bandpass,
             FilterTypeParam::Highpass => FilterType::Highpass,
+        }
+    }
+}
+
+/// How the oscillators read their wavetables in between samples, see [`Interpolation`].
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpolationParam {
+    #[id = "none"]
+    None,
+    #[id = "linear"]
+    Linear,
+    #[id = "cubic"]
+    Cubic,
+}
+
+impl InterpolationParam {
+    pub fn to_interpolation(self) -> Interpolation {
+        match self {
+            InterpolationParam::None => Interpolation::None,
+            InterpolationParam::Linear => Interpolation::Linear,
+            InterpolationParam::Cubic => Interpolation::Cubic,
         }
     }
 }
@@ -565,6 +586,9 @@ pub struct GlobalParams {
     /// Pitch wheel range in semitones.
     #[id = "bend_range"]
     pub bend_range: IntParam,
+    /// How the oscillators read their wavetables in between samples.
+    #[id = "interpolation"]
+    pub interpolation: EnumParam<InterpolationParam>,
 }
 
 impl GlobalParams {
@@ -614,6 +638,7 @@ impl GlobalParams {
                 .with_unit(" st"),
             bend_range: IntParam::new("Bend Range", 2, IntRange::Linear { min: -24, max: 24 })
                 .with_unit(" st"),
+            interpolation: EnumParam::new("Interpolation", InterpolationParam::Cubic),
         }
     }
 }

@@ -11,6 +11,7 @@ use self::filter::{LadderFilter, LADDER_LANES};
 use self::notes::Notes;
 use self::oscillator::wrap_cycles_signed;
 use self::oscillator::FramePair;
+use self::oscillator::Interpolation;
 use self::oscillator::OscVoice;
 use self::oscillator::OscWave;
 use self::oscillator::OscillatorParams;
@@ -52,6 +53,8 @@ pub struct ThreeOsc {
     pub stereo_width: f32,
     /// The SIMD instructions the wavetable lookups use.
     pub simd: SimdLevel,
+    /// How the wavetables are read in between their samples.
+    pub interpolation: Interpolation,
 }
 
 impl ThreeOsc {
@@ -78,6 +81,7 @@ impl ThreeOsc {
             lfo_params: Default::default(),
             stereo_width: 0.0,
             simd: SimdLevel::detect(),
+            interpolation: Interpolation::default(),
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -214,6 +218,7 @@ impl ThreeOsc {
             portamento_rate: self.portamento_rate,
             active,
             simd: self.simd,
+            interpolation: self.interpolation,
         };
 
         // Write samples from all voices, one control rate block at a time. Each block goes
@@ -277,6 +282,7 @@ struct VoiceContext<'a> {
     /// modulate anything are skipped.
     active: [bool; 3],
     simd: SimdLevel,
+    interpolation: Interpolation,
 }
 
 /// An individual note press.
@@ -500,14 +506,25 @@ impl Voice {
                 }
                 let osc = &oscillators[i];
 
+                // The modulation inputs are only read when the modulation is on: the three
+                // oscillators are then independent, and the CPU can overlap their work. With
+                // them always connected, every sample waits for the whole chain of
+                // modulator -> phase -> table read -> sum -> modulator ..., which costs more
+                // than the arithmetic itself.
                 let mut delta = self.osc_delta[i];
                 self.osc_delta[i] += self.osc_delta_step[i];
                 if osc.fm > 0.0 {
                     delta = wrap_cycles_signed(delta * (1.0 + mod_out * osc.fm * FM_DEPTH));
                 }
-
-                let phase_offset = mod_out * osc.pm * PM_DEPTH_CYCLES;
-                let gain = self.osc_gain[i] * lerp(1.0, (mod_out + 1.0) / 2.0, osc.am);
+                let phase_offset = if osc.pm > 0.0 {
+                    mod_out * osc.pm * PM_DEPTH_CYCLES
+                } else {
+                    0.0
+                };
+                let mut gain = self.osc_gain[i];
+                if osc.am > 0.0 {
+                    gain *= lerp(1.0, (mod_out + 1.0) / 2.0, osc.am);
+                }
                 self.osc_gain[i] += self.osc_gain_step[i];
 
                 let mono = if stereo {
@@ -521,6 +538,7 @@ impl Voice {
                         &osc.pan_left,
                         &osc.pan_right,
                         context.simd,
+                        context.interpolation,
                     );
                     out += left * gain;
                     out_right += right * gain;
@@ -534,6 +552,7 @@ impl Voice {
                         voice_counts[i],
                         &osc.voice_mask,
                         context.simd,
+                        context.interpolation,
                     );
                     out += mono * gain;
                     mono
