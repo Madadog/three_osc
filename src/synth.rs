@@ -9,9 +9,10 @@ use self::filter::FilterController;
 #[cfg(target_arch = "x86_64")]
 use self::filter::{LadderFilter, LADDER_LANES};
 use self::notes::Notes;
-use self::oscillator::wrap_cycles_signed;
-use self::oscillator::FramePair;
+use self::oscillator::BlockOutput;
+use self::oscillator::BlockParams;
 use self::oscillator::Interpolation;
+use self::oscillator::Modulation;
 use self::oscillator::OscVoice;
 use self::oscillator::OscWave;
 use self::oscillator::OscillatorParams;
@@ -482,89 +483,88 @@ impl Voice {
         };
     }
     /// Renders one control rate block of the oscillators into the voice's pre-filter buffers.
+    ///
+    /// Each oscillator renders the whole block in one kernel call (see
+    /// [`FramePair::render_block()`][oscillator::FramePair::render_block()]). The oscillators
+    /// go from the last to the first, since each one modulates the one before it: a modulated
+    /// oscillator reads its modulator's block of output, sample for sample.
     fn render_oscillators(&mut self, context: &VoiceContext, block_len: usize) {
+        let block_len = block_len.min(CONTROL_BLOCK_SAMPLES);
         let stereo = context.stereo;
         let oscillators = context.oscillators;
-        let frames: [FramePair; 3] =
-            std::array::from_fn(|i| oscillators[i].frame_pair(context.waves, self.osc_note[i]));
-        let voice_counts: [usize; 3] = std::array::from_fn(|i| oscillators[i].unison_voices());
+        self.pre_filter[..block_len].fill(0.0);
+        if stereo {
+            self.pre_filter_right[..block_len].fill(0.0);
+        }
 
-        for sample in 0..block_len.min(CONTROL_BLOCK_SAMPLES) {
-            let mut out = 0.0;
-            // Only used when `stereo` is set, `out` is then the left channel.
-            let mut out_right = 0.0;
-
-            // Generate the oscillators from the last to the first, since each oscillator
-            // modulates the one before it. `mod_out` is the (mono) output of the oscillator
-            // after the current one.
-            let mut mod_out = 0.0;
-            for i in (0..3).rev() {
-                if !context.active[i] {
-                    // Its output would be silent, and it isn't modulating anything that matters
-                    mod_out = 0.0;
-                    continue;
-                }
-                let osc = &oscillators[i];
-
-                // The modulation inputs are only read when the modulation is on: the three
-                // oscillators are then independent, and the CPU can overlap their work. With
-                // them always connected, every sample waits for the whole chain of
-                // modulator -> phase -> table read -> sum -> modulator ..., which costs more
-                // than the arithmetic itself.
-                let mut delta = self.osc_delta[i];
-                self.osc_delta[i] += self.osc_delta_step[i];
-                if osc.fm > 0.0 {
-                    delta = wrap_cycles_signed(delta * (1.0 + mod_out * osc.fm * FM_DEPTH));
-                }
-                let phase_offset = if osc.pm > 0.0 {
-                    mod_out * osc.pm * PM_DEPTH_CYCLES
-                } else {
-                    0.0
-                };
-                let mut gain = self.osc_gain[i];
-                if osc.am > 0.0 {
-                    gain *= lerp(1.0, (mod_out + 1.0) / 2.0, osc.am);
-                }
-                self.osc_gain[i] += self.osc_gain_step[i];
-
-                let mono = if stereo {
-                    let (mono, left, right) = frames[i].advance_and_sum_panned(
-                        &mut self.osc_voice[i],
-                        delta,
-                        &osc.detune_factors,
-                        phase_offset,
-                        voice_counts[i],
-                        &osc.voice_mask,
-                        &osc.pan_left,
-                        &osc.pan_right,
-                        context.simd,
-                        context.interpolation,
-                    );
-                    out += left * gain;
-                    out_right += right * gain;
-                    mono
-                } else {
-                    let mono = frames[i].advance_and_sum(
-                        &mut self.osc_voice[i],
-                        delta,
-                        &osc.detune_factors,
-                        phase_offset,
-                        voice_counts[i],
-                        &osc.voice_mask,
-                        context.simd,
-                        context.interpolation,
-                    );
-                    out += mono * gain;
-                    mono
-                };
-
-                mod_out = mono * self.osc_mod_scale[i];
+        // The block of output of the oscillator after the current one (its modulator), and
+        // the current oscillator's output when the oscillator before it is modulated.
+        let mut modulator = [0.0_f32; CONTROL_BLOCK_SAMPLES];
+        let mut modulator_next = [0.0_f32; CONTROL_BLOCK_SAMPLES];
+        let mut have_modulator = false;
+        for i in (0..3).rev() {
+            if !context.active[i] {
+                // Its output would be silent, and it isn't modulating anything that matters
+                have_modulator = false;
+                continue;
             }
+            let osc = &oscillators[i];
+            let modulated = osc.pm > 0.0 || osc.fm > 0.0 || osc.am > 0.0;
+            let modulation = if modulated && have_modulator {
+                Some(Modulation {
+                    input: &modulator[..block_len],
+                    fm: osc.fm * FM_DEPTH,
+                    pm: osc.pm * PM_DEPTH_CYCLES,
+                    am: osc.am,
+                })
+            } else {
+                None
+            };
+            let modulates_next = i > 0 && context.active[i - 1] && {
+                let next = &oscillators[i - 1];
+                next.pm > 0.0 || next.fm > 0.0 || next.am > 0.0
+            };
 
-            self.pre_filter[sample] = out * self.drive;
-            if stereo {
-                self.pre_filter_right[sample] = out_right * self.drive;
-            }
+            let params = BlockParams {
+                delta: self.osc_delta[i],
+                delta_step: self.osc_delta_step[i],
+                gain: self.osc_gain[i] * self.drive,
+                gain_step: self.osc_gain_step[i] * self.drive,
+                modulation,
+                voices: osc.unison_voices(),
+                detune_factors: &osc.detune_factors,
+                mask: &osc.voice_mask,
+                pan_left: &osc.pan_left,
+                pan_right: &osc.pan_right,
+            };
+            let mod_scale = self.osc_mod_scale[i];
+            let mut output = BlockOutput {
+                left: &mut self.pre_filter[..block_len],
+                right: if stereo {
+                    Some(&mut self.pre_filter_right[..block_len])
+                } else {
+                    None
+                },
+                mono: if modulates_next {
+                    Some((&mut modulator_next[..block_len], mod_scale))
+                } else {
+                    None
+                },
+            };
+            let frames = osc.frame_pair(context.waves, self.osc_note[i]);
+            frames.render_block(
+                &mut self.osc_voice[i],
+                &params,
+                &mut output,
+                context.simd,
+                context.interpolation,
+            );
+
+            // The ramps continue from where the block left them
+            self.osc_delta[i] += self.osc_delta_step[i] * block_len as f32;
+            self.osc_gain[i] += self.osc_gain_step[i] * block_len as f32;
+            have_modulator = modulates_next;
+            std::mem::swap(&mut modulator, &mut modulator_next);
         }
     }
     /// Runs the voice's filter(s) over the current block, one sample at a time.

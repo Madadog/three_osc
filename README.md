@@ -62,12 +62,14 @@ cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 Envelopes, pitch (including portamento and vibrato), the LFO, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFO, which can't go faster than half the control rate. Change the constant to try other sizes.
 
 ### Interpolation
-The global Interpolation control picks how the wavetables are read in between their samples: Cubic (4-point Hermite, the default and cleanest), Linear, or None (the sample below the read position, which steps audibly on all but the lowest notes). Each mode has its own specialised lookup kernels, so there is no per-sample cost to the choice. On an 8 note, 3 x 8 voice supersaw, Linear is about 25% cheaper than Cubic and None about 40% cheaper.
+The global Interpolation control picks how the wavetables are read in between their samples: Cubic (4-point Hermite, the default and cleanest), Linear, or None (the sample below the read position, which steps audibly on all but the lowest notes). Each mode has its own specialised lookup kernels, so there is no per-sample cost to the choice. On an 8 note, 3 x 8 voice supersaw, Linear is about 20% cheaper than Cubic and None about 30% cheaper.
 
-### SIMD
-Unison voices are processed eight at a time: their phases advance as vectors and their wavetable reads run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. There are two AVX2 variants, one reading each voice's taps with a 128-bit load and transposing them, the other using gather instructions; which is faster depends on the CPU (gathers are slow on the Intel generations with the "Downfall" mitigation, Skylake to Tiger Lake, and faster elsewhere), so the two are timed against each other when the synth starts. The ladder filter processes four voices in lockstep with AVX, producing exactly the same output as the one-voice-at-a-time version. Everything is detected at runtime, so one build runs on any x86-64 CPU.
+### Oscillator kernels and SIMD
+Each oscillator renders a whole control rate block in one kernel call: the unison voices' phases advance as vectors, every sample reads and interpolates the wavetable at each voice and sums the voices into the block, and a modulated oscillator reads its modulator's block sample for sample (the oscillators are rendered from the last to the first, so the modulation is still instantaneous). Phases are 32-bit fixed point: one cycle is 2^32, so they wrap for free and pitch resolves to 2^-32 cycles per sample, and a phase splits into a table index and a fraction with a shift and a mask (wavetable cycles are powers of two long).
 
-The wavetable lookups are bound by latency rather than by memory or arithmetic: each 8 voice read is one long dependency chain (phase advance, index, loads, interpolation, horizontal sum), and the lookups of different samples are only overlapped as far as the CPU's out-of-order window reaches. Shrinking the tables 8 times or tripling the number of notes changes the cost per voice by a few percent, which is also why a 16-bit table format would buy little. The remaining big win would be rendering a whole control rate block per oscillator inside one kernel call, so that consecutive samples overlap properly.
+The reads run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. There are two AVX2 variants, one reading each voice's taps with a 128-bit load and transposing them, the other using gather instructions; which is faster depends on the CPU (gathers are slow on the Intel generations with the "Downfall" mitigation, Skylake to Tiger Lake), so the two are timed against each other when the synth starts. The ladder filter processes four voices in lockstep with AVX, producing exactly the same output as the one-voice-at-a-time version. Everything is detected at runtime, so one build runs on any x86-64 CPU.
+
+The lookups are not memory bound: shrinking the tables 8 times or tripling the number of notes changes the cost per voice by a few percent, so a 16-bit table format would buy little.
 
 ### Previous LV2 version
 Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the LV2 build is gone; if you need it, check out a commit from before the nih-plug port.
@@ -105,7 +107,6 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Optimise
 * Extract DSP to internal crate
 * Better wavetable interpolation (sinc or Niemitalo's optimal interpolators; currently 4-point cubic Hermite at best)
-* Render a whole control rate block per oscillator in one SIMD kernel call, so consecutive samples overlap (see SIMD above)
 * Approximate/cache expensive computations (i.e. any uses of `powf`)
 * Fix buffer size to reduce expensive modulation calculations at the expense of sample-accurate automation (make const so that you can play around with buffer lengths, see what is good)
 * Come up with better name for "Initial Pitch Slide" control

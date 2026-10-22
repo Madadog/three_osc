@@ -12,7 +12,8 @@ use std::time::Instant;
 use crate::params::OscillatorWave;
 use crate::synth::filter::{Filter, FilterModel, LadderFilter};
 use crate::synth::oscillator::{
-    FramePair, Interpolation, OscillatorParams, SimdLevel, SuperVoice, Wavetable, WavetableSet,
+    BlockOutput, BlockParams, FramePair, Interpolation, OscillatorParams, SimdLevel, SuperVoice,
+    Wavetable, WavetableSet,
 };
 use crate::synth::ThreeOsc;
 use crate::ThreeOscPlugin;
@@ -190,9 +191,8 @@ fn benchmark_table_memory() {
     }
 }
 
-/// One 8 voice wavetable lookup on its own, for every SIMD level and interpolation mode. The
-/// "chain" column runs one voice, so each call waits for the previous one's phases; the
-/// "overlapped" column interleaves 8 independent voices like the synth does.
+/// One oscillator's block kernel on its own: 8 unison voices, for every SIMD level and
+/// interpolation mode, in mono and in stereo.
 #[test]
 #[ignore]
 fn benchmark_lookup_kernel() {
@@ -207,6 +207,19 @@ fn benchmark_lookup_kernel() {
     osc.voice_count = 8;
     osc.voices_detune = 0.01;
     osc.update_detune_factors();
+    osc.update_pan_gains(1.0);
+    let params = BlockParams {
+        delta: 0.0123,
+        delta_step: 0.0,
+        gain: 1.0,
+        gain_step: 0.0,
+        modulation: None,
+        voices: 8,
+        detune_factors: &osc.detune_factors,
+        mask: &osc.voice_mask,
+        pan_left: &osc.pan_left,
+        pan_right: &osc.pan_right,
+    };
 
     let mut levels = vec![SimdLevel::Portable];
     #[cfg(target_arch = "x86_64")]
@@ -214,35 +227,32 @@ fn benchmark_lookup_kernel() {
         levels.insert(0, SimdLevel::Avx2);
         levels.insert(1, SimdLevel::Avx2Gather);
     }
-    const CALLS: usize = 2_000_000;
-    const INDEPENDENT: usize = 8;
+    const BLOCK: usize = 32;
+    const BLOCKS: usize = 100_000;
     println!();
     for simd in levels {
         for interpolation in [Interpolation::None, Interpolation::Linear, Interpolation::Cubic] {
-            let mut voice = SuperVoice::new(0.0, 1.0);
-            let mut sink = 0.0;
-            let start = Instant::now();
-            for _ in 0..CALLS {
-                sink += frames.advance_and_sum(
-                    &mut voice, 0.0123, &osc.detune_factors, 0.0, 8, &osc.voice_mask, simd, interpolation,
-                );
-            }
-            let chain = start.elapsed().as_nanos() as f64 / CALLS as f64;
-
-            let mut voices: Vec<SuperVoice> = (0..INDEPENDENT).map(|_| SuperVoice::new(0.0, 1.0)).collect();
-            let start = Instant::now();
-            for _ in 0..CALLS / INDEPENDENT {
-                for voice in voices.iter_mut() {
-                    sink += frames.advance_and_sum(
-                        voice, 0.0123, &osc.detune_factors, 0.0, 8, &osc.voice_mask, simd, interpolation,
-                    );
+            let mut times = Vec::new();
+            for stereo in [false, true] {
+                let mut voice = SuperVoice::new(0.0, 1.0);
+                let mut left = [0.0_f32; BLOCK];
+                let mut right = [0.0_f32; BLOCK];
+                let start = Instant::now();
+                for _ in 0..BLOCKS {
+                    let mut output = BlockOutput {
+                        left: &mut left,
+                        right: if stereo { Some(&mut right) } else { None },
+                        mono: None,
+                    };
+                    frames.render_block(&mut voice, &params, &mut output, simd, interpolation);
                 }
+                times.push(start.elapsed().as_nanos() as f64 / (BLOCKS * BLOCK) as f64);
+                assert!(left.iter().all(|sample| sample.is_finite()));
             }
-            let overlapped = start.elapsed().as_nanos() as f64 / CALLS as f64;
             println!(
-                "{simd:<12?} {interpolation:<8?} {chain:>6.1} ns/call as a chain {overlapped:>6.1} ns/call overlapped",
+                "{simd:<12?} {interpolation:<8?} {:>6.1} ns/sample mono {:>6.1} ns/sample stereo (8 voices)",
+                times[0], times[1]
             );
-            assert!(sink.is_finite());
         }
     }
 }

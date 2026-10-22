@@ -5,7 +5,7 @@ use std::{
 
 use itertools::izip;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
-use wide::{f32x8, i32x8};
+use wide::{bytemuck::cast, f32x8, i32x8, u32x8};
 
 use super::lerp;
 
@@ -41,12 +41,12 @@ impl SimdLevel {
         SimdLevel::Portable
     }
     /// Times the two AVX2 lookup variants on a small table and returns the faster one. The
-    /// timing mimics the common case of one vector of 8 unison voices per call; the loads and
-    /// shuffles variant is kept unless the gathers are clearly faster.
+    /// timing mimics the common case of one vector of 8 unison voices per block; the loads
+    /// and shuffles variant is kept unless the gathers are clearly faster.
     #[cfg(target_arch = "x86_64")]
     fn fastest_avx2() -> Self {
         use std::time::{Duration, Instant};
-        const CALLS: usize = 2000;
+        const BLOCKS: usize = 64;
         const ROUNDS: usize = 3;
 
         let len = 256;
@@ -60,16 +60,31 @@ impl SimdLevel {
             f32x8::new(std::array::from_fn(|lane| 1.0 + (vector * UNISON_LANES + lane) as f32 * 1e-3))
         });
         let mask = [f32x8::splat(1.0); UNISON_VECTORS];
+        let params = BlockParams {
+            delta: 0.0123,
+            delta_step: 0.0,
+            gain: 1.0,
+            gain_step: 0.0,
+            modulation: None,
+            voices: UNISON_LANES,
+            detune_factors: &factors,
+            mask: &mask,
+            pan_left: &mask,
+            pan_right: &mask,
+        };
         let time = |simd: SimdLevel| {
             let mut voice = SuperVoice::new(0.0, 1.0);
-            let mut sink = 0.0;
+            let mut out = [0.0_f32; 32];
             let start = Instant::now();
-            for _ in 0..CALLS {
-                sink += frames.advance_and_sum(
-                    &mut voice, 0.0123, &factors, 0.0, UNISON_LANES, &mask, simd, Interpolation::Cubic,
-                );
+            for _ in 0..BLOCKS {
+                let mut output = BlockOutput {
+                    left: &mut out,
+                    right: None,
+                    mono: None,
+                };
+                frames.render_block(&mut voice, &params, &mut output, simd, Interpolation::Cubic);
             }
-            std::hint::black_box(sink);
+            std::hint::black_box(out);
             start.elapsed()
         };
         // Alternate between the variants and keep each one's best time, to ride out
@@ -121,20 +136,28 @@ pub const UNISON_LANES: usize = 8;
 /// Number of SIMD vectors needed for all unison voices.
 pub const UNISON_VECTORS: usize = MAX_UNISON / UNISON_LANES;
 
-/// The largest value below 1.0: a wrapped phase is clamped to this so that the scaled read index
-/// stays below the table length.
-const BELOW_ONE: f32 = 0.999_999_94;
+/// Phases are kept in 32-bit fixed point: one cycle is `2^32`, so they wrap for free when they
+/// overflow, and the pitch resolution is `2^-32` cycles per sample (10 nHz at 44.1 kHz).
+const FIXED_CYCLE: f64 = 4_294_967_296.0;
 
-/// Wraps a non-negative phase in cycles into `[0, 1)`.
+/// Converts a phase or phase delta in cycles (of either sign and any size) to fixed point,
+/// keeping only the fraction of a cycle.
 #[inline]
-pub fn wrap_cycles(phase: f32) -> f32 {
-    phase - (phase as i32) as f32
+pub fn cycles_to_fixed(cycles: f32) -> u32 {
+    (cycles as f64 * FIXED_CYCLE).floor() as i64 as u32
+}
+
+/// Converts a fixed point phase back to cycles in `[0, 1)`.
+#[inline]
+#[allow(dead_code)] // only needed by the tests so far
+pub fn fixed_to_cycles(phase: u32) -> f32 {
+    (phase as f64 / FIXED_CYCLE) as f32
 }
 
 /// Wraps a phase (or phase delta) in cycles of either sign into `[0, 1)`.
 #[inline]
 pub fn wrap_cycles_signed(phase: f32) -> f32 {
-    let wrapped = wrap_cycles(phase);
+    let wrapped = phase - (phase as i32) as f32;
     if wrapped < 0.0 {
         wrapped + 1.0
     } else {
@@ -162,76 +185,31 @@ impl OscVoice {
 /// Brute force approach to oscillator super (playing multiple detuned copies
 /// of a wave simultaneously) which tracks the phase of every wave copy.
 ///
-/// Implemented as a buffer of independent phases (in cycles, kept in `[0, 1)`) with a common
-/// base frequency (delta) which differs for each phase according to the oscillator's detune
-/// factors. The phases are stored as SIMD vectors so all voices advance at once.
+/// Implemented as a buffer of independent phases in fixed point (see [`cycles_to_fixed()`])
+/// with a common base frequency (delta) which differs for each phase according to the
+/// oscillator's detune factors. The phases are stored as SIMD vectors so all voices advance at
+/// once, see [`FramePair::render_block()`].
 pub struct SuperVoice {
-    pub voice_phases: [f32x8; UNISON_VECTORS],
+    pub voice_phases: [u32x8; UNISON_VECTORS],
 }
 impl SuperVoice {
     pub fn new(phase: f32, phase_random: f32) -> Self {
         let rng = fastrand::Rng::new();
-        let mut phases = [0.0_f32; MAX_UNISON];
+        let mut phases = [0_u32; MAX_UNISON];
         for phase_out in phases.iter_mut() {
-            *phase_out = wrap_cycles(phase + rng.f32() * phase_random);
+            *phase_out = cycles_to_fixed(phase + rng.f32() * phase_random);
         }
         Self {
             voice_phases: std::array::from_fn(|vector| {
                 let lanes = &phases[vector * UNISON_LANES..(vector + 1) * UNISON_LANES];
-                f32x8::new(lanes.try_into().unwrap())
+                u32x8::new(lanes.try_into().unwrap())
             }),
         }
     }
-    /// Advances one voice by `delta` (cycles per sample) times its detune factor and returns its
-    /// wavetable read position, see [`advance()`][Self::advance()].
-    #[inline]
-    pub fn advance_one(
-        &mut self,
-        voice: usize,
-        delta: f32,
-        detune_factor: f32,
-        phase_offset: f32,
-        table_len: f32,
-    ) -> f32 {
-        let phase = &mut self.voice_phases[voice / UNISON_LANES].as_mut_array()[voice % UNISON_LANES];
-        *phase = wrap_cycles(*phase + delta * detune_factor);
-        wrap_cycles_signed(*phase + phase_offset).min(BELOW_ONE) * table_len
-    }
-    /// Advances the first `voice_count` voices by `delta` (cycles per sample) times each voice's
-    /// detune factor, then writes each voice's wavetable read position into `indices`: the phase
-    /// offset by `phase_offset` cycles (for phase modulation), scaled to `table_len` samples.
-    ///
-    /// `delta` must be non-negative; the detune factors are positive, so the phases stay in
-    /// `[0, 1)` with a cheap truncating wrap.
-    #[inline]
-    pub fn advance(
-        &mut self,
-        delta: f32,
-        voice_count: usize,
-        detune_factors: &[f32x8; UNISON_VECTORS],
-        phase_offset: f32,
-        table_len: f32,
-        indices: &mut [f32x8; UNISON_VECTORS],
-    ) {
-        let delta = f32x8::splat(delta);
-        let phase_offset = f32x8::splat(phase_offset);
-        let table_len = f32x8::splat(table_len);
-        let zero = f32x8::splat(0.0);
-        let one = f32x8::splat(1.0);
-        let below_one = f32x8::splat(BELOW_ONE);
-
-        let vectors = voice_count.div_ceil(UNISON_LANES).min(UNISON_VECTORS);
-        for vector in 0..vectors {
-            let mut phase = self.voice_phases[vector] + delta * detune_factors[vector];
-            phase -= phase.trunc_int().round_float();
-            self.voice_phases[vector] = phase;
-
-            // The offset can be negative, and the wrapped result can round up to exactly 1.0
-            let mut read = phase + phase_offset;
-            read -= read.trunc_int().round_float();
-            read += read.simd_lt(zero).select(one, zero);
-            indices[vector] = read.min(below_one) * table_len;
-        }
+    /// One voice's phase, in cycles.
+    #[allow(dead_code)] // only needed by the tests so far
+    pub fn phase_cycles(&self, voice: usize) -> f32 {
+        fixed_to_cycles(lane_u32(&self.voice_phases, voice))
     }
 }
 
@@ -601,21 +579,35 @@ const TABLE_PADDING_AFTER: usize = 2;
 
 #[derive(Debug, Clone)]
 /// One cycle of a waveform, padded with copies of its neighbouring samples (see
-/// [`TABLE_PADDING_BEFORE`]).
+/// [`TABLE_PADDING_BEFORE`]). The cycle is a power of two samples long, so that a fixed point
+/// phase splits into a sample index and a fraction of a sample with a shift and a mask.
 pub struct Wavetable {
     pub table: Vec<f32>,
+    /// `32 - log2(cycle_len)`: shifting a fixed point phase right by this many bits gives the
+    /// index of the sample below it.
+    index_shift: u32,
+    /// Scales the phase bits below the index to a fraction of a sample.
+    frac_scale: f32,
 }
 
 impl Wavetable {
     pub fn new(cycle: Vec<f32>) -> Self {
-        assert!(!cycle.is_empty(), "a wavetable needs at least one sample");
         let len = cycle.len();
+        assert!(
+            len >= 2 && len.is_power_of_two(),
+            "a wavetable cycle must be a power of two samples long, not {len}"
+        );
         let mut table = Vec::with_capacity(len + TABLE_PADDING_BEFORE + TABLE_PADDING_AFTER);
         table.push(cycle[len - 1]);
         table.extend_from_slice(&cycle);
         table.push(cycle[0]);
-        table.push(cycle[1 % len]);
-        Self { table }
+        table.push(cycle[1]);
+        let index_shift = 32 - len.trailing_zeros();
+        Self {
+            table,
+            index_shift,
+            frac_scale: 1.0 / (1_u64 << index_shift) as f32,
+        }
     }
     /// Samples per cycle.
     #[inline]
@@ -625,6 +617,38 @@ impl Wavetable {
     /// The cycle's samples, without the padding.
     pub fn cycle(&self) -> &[f32] {
         &self.table[TABLE_PADDING_BEFORE..TABLE_PADDING_BEFORE + self.cycle_len()]
+    }
+    /// Shifting a fixed point phase right by this many bits gives the index of the sample
+    /// below it.
+    #[inline]
+    pub fn index_shift(&self) -> u32 {
+        self.index_shift
+    }
+    /// The bits of a fixed point phase below the sample index.
+    #[inline]
+    pub fn frac_mask(&self) -> u32 {
+        (1_u32 << self.index_shift) - 1
+    }
+    /// Scales the masked phase bits to a fraction of a sample.
+    #[inline]
+    pub fn frac_scale(&self) -> f32 {
+        self.frac_scale
+    }
+    /// Splits a fixed point phase into the index of the sample below it and the fraction of a
+    /// sample above that.
+    #[inline]
+    pub fn split_phase(&self, phase: u32) -> (usize, f32) {
+        (
+            (phase >> self.index_shift) as usize,
+            (phase & self.frac_mask()) as f32 * self.frac_scale,
+        )
+    }
+    /// Reads the table at a fixed point phase with the given interpolation mode (an
+    /// [`Interpolation`] discriminant).
+    #[inline]
+    pub fn read_fixed<const INTERP: u8>(&self, phase: u32) -> f32 {
+        let (floor, frac) = self.split_phase(phase);
+        self.read_taps::<INTERP>(floor, frac)
     }
     /// Reads the table at a fractional sample index in `[0, cycle_len)` with cubic
     /// interpolation. Out of range indices are clamped.
@@ -637,36 +661,23 @@ impl Wavetable {
     #[inline]
     pub fn read_with<const INTERP: u8>(&self, index: f32) -> f32 {
         let floor = (index as usize).min(self.cycle_len() - 1);
-        // The table is padded, so the 4 taps around the index are always inside it
+        self.read_taps::<INTERP>(floor, index - floor as f32)
+    }
+    /// Interpolates `frac` samples past sample `floor` of the cycle. The table is padded, so
+    /// the 4 taps around any sample of the cycle are inside it.
+    #[inline]
+    fn read_taps<const INTERP: u8>(&self, floor: usize, frac: f32) -> f32 {
         let taps = &self.table[floor..floor + 4];
         match INTERP {
             NONE => taps[1],
-            LINEAR => {
-                let frac = index - floor as f32;
-                taps[1] + (taps[2] - taps[1]) * frac
-            }
-            _ => {
-                let frac = index - floor as f32;
-                hermite(taps[0], taps[1], taps[2], taps[3], frac)
-            }
+            LINEAR => taps[1] + (taps[2] - taps[1]) * frac,
+            _ => hermite(taps[0], taps[1], taps[2], taps[3], frac),
         }
     }
-    /// Generates a sample at the given phase in cycles.
+    /// Generates a sample at the given phase in cycles, with cubic interpolation.
     #[inline]
     pub fn generate(&self, phase: f32) -> f32 {
-        self.read(wrap_cycles_signed(phase) * self.cycle_len() as f32)
-    }
-    /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
-    pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
-        assert!(
-            harmonics <= (len / 2),
-            "Generated {harmonics} harmonics with {len} len"
-        );
-        let table: Vec<f32> = (0..len)
-            .into_iter()
-            .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
-            .collect();
-        Self::new(table)
+        self.read_fixed::<CUBIC>(cycles_to_fixed(phase))
     }
     pub fn from_additive_osc_ifft(
         osc: &AdditiveOsc,
@@ -692,12 +703,64 @@ pub fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
 
 /// A position within a multi-frame wavetable, resolved to the (bandlimited) tables of the two
 /// frames to crossfade between. Single frame wavetables have `mix` set to 0, which skips the
-/// second lookup.
+/// second lookup. Both frames must have the same cycle length.
 #[derive(Debug, Clone, Copy)]
 pub struct FramePair<'a> {
     pub a: &'a Wavetable,
     pub b: &'a Wavetable,
     pub mix: f32,
+}
+
+/// The inputs to [`FramePair::render_block()`] that are shared by all of an oscillator's
+/// unison voices over one block.
+pub struct BlockParams<'a> {
+    /// The base phase delta in cycles per sample at the first sample of the block, and how
+    /// much it changes per sample.
+    pub delta: f32,
+    pub delta_step: f32,
+    /// The output gain at the first sample of the block, and how much it changes per sample.
+    pub gain: f32,
+    pub gain_step: f32,
+    /// Modulation by the output of another oscillator, if any.
+    pub modulation: Option<Modulation<'a>>,
+    /// Number of unison voices in use.
+    pub voices: usize,
+    /// Per voice multipliers of the phase delta, see
+    /// [`OscillatorParams::update_detune_factors()`].
+    pub detune_factors: &'a [f32x8; UNISON_VECTORS],
+    /// 1 for the voices in use and 0 for the rest.
+    pub mask: &'a [f32x8; UNISON_VECTORS],
+    /// Per voice gains for the left and right outputs, zero for unused voices, see
+    /// [`OscillatorParams::update_pan_gains()`]. Only used when the output is stereo.
+    pub pan_left: &'a [f32x8; UNISON_VECTORS],
+    pub pan_right: &'a [f32x8; UNISON_VECTORS],
+}
+
+/// One oscillator's output modulating another's over a block, see [`BlockParams`]. The depths
+/// are in the units the kernels use; a depth of zero switches that modulation off.
+pub struct Modulation<'a> {
+    /// The modulator's output, one sample per sample of the block.
+    pub input: &'a [f32],
+    /// Frequency modulation: the phase delta is multiplied by `1 + input * fm`.
+    pub fm: f32,
+    /// Phase modulation: `input * pm` cycles are added to the phase that is read.
+    pub pm: f32,
+    /// Amplitude modulation: the gain is scaled by the unipolar input, `(input + 1) / 2`, fully
+    /// at `am = 1` and not at all at `am = 0`.
+    pub am: f32,
+}
+
+/// Where [`FramePair::render_block()`] puts its samples. The oscillator's output is added to
+/// `left` (and `right`), so several oscillators can render into the same buffers.
+pub struct BlockOutput<'a> {
+    /// The left output or, without `right`, the mono output.
+    pub left: &'a mut [f32],
+    /// The right output. When given, the voices are panned with their pan gains instead of
+    /// being summed with the mask.
+    pub right: Option<&'a mut [f32]>,
+    /// The plain (masked, gain-free) sum of the voices times the given scale, for modulating
+    /// another oscillator.
+    pub mono: Option<(&'a mut [f32], f32)>,
 }
 
 impl FramePair<'_> {
@@ -723,160 +786,69 @@ impl FramePair<'_> {
             a
         }
     }
-    /// Advances the first `voices` unison voices (see [`SuperVoice::advance()`]) and sums their
-    /// samples, skipping the voices masked out by `mask`.
+    /// Reads the frames at a fixed point phase with the given interpolation mode.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn advance_and_sum(
-        &self,
-        voice: &mut SuperVoice,
-        delta: f32,
-        detune_factors: &[f32x8; UNISON_VECTORS],
-        phase_offset: f32,
-        voices: usize,
-        mask: &[f32x8; UNISON_VECTORS],
-        simd: SimdLevel,
-        interpolation: Interpolation,
-    ) -> f32 {
-        match interpolation {
-            Interpolation::None => self.advance_and_sum_with::<NONE>(
-                voice, delta, detune_factors, phase_offset, voices, mask, simd,
-            ),
-            Interpolation::Linear => self.advance_and_sum_with::<LINEAR>(
-                voice, delta, detune_factors, phase_offset, voices, mask, simd,
-            ),
-            Interpolation::Cubic => self.advance_and_sum_with::<CUBIC>(
-                voice, delta, detune_factors, phase_offset, voices, mask, simd,
-            ),
+    pub fn read_fixed<const INTERP: u8>(&self, phase: u32) -> f32 {
+        let a = self.a.read_fixed::<INTERP>(phase);
+        if self.mix > 0.0 {
+            lerp(a, self.b.read_fixed::<INTERP>(phase), self.mix)
+        } else {
+            a
         }
     }
-    /// [`advance_and_sum()`][Self::advance_and_sum()] specialised for one interpolation mode.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn advance_and_sum_with<const INTERP: u8>(
+    /// Renders one block of an oscillator's unison voices into the output: every sample
+    /// advances the voices' phases by their (detuned, possibly modulated) deltas, reads and
+    /// interpolates the frames at each voice, and sums the voices. The block is
+    /// `output.left.len()` samples long; the other buffers must be at least that long.
+    pub fn render_block(
         &self,
         voice: &mut SuperVoice,
-        delta: f32,
-        detune_factors: &[f32x8; UNISON_VECTORS],
-        phase_offset: f32,
-        voices: usize,
-        mask: &[f32x8; UNISON_VECTORS],
+        params: &BlockParams,
+        output: &mut BlockOutput,
         simd: SimdLevel,
-    ) -> f32 {
-        let table_len = self.cycle_len() as f32;
-        if voices <= SCALAR_VOICE_LIMIT {
-            let mut total = 0.0;
-            for i in 0..voices {
-                let index = voice.advance_one(i, delta, lane(detune_factors, i), phase_offset, table_len);
-                total += self.read_with::<INTERP>(index) * lane(mask, i);
-            }
-            return total;
+        interpolation: Interpolation,
+    ) {
+        let block_len = output.left.len();
+        if let Some(right) = &output.right {
+            assert!(right.len() >= block_len);
+        }
+        if let Some((mono, _)) = &output.mono {
+            assert!(mono.len() >= block_len);
+        }
+        if let Some(modulation) = &params.modulation {
+            assert!(modulation.input.len() >= block_len);
+        }
+        debug_assert_eq!(self.a.cycle_len(), self.b.cycle_len());
+        match interpolation {
+            Interpolation::None => self.render_block_with::<NONE>(voice, params, output, simd),
+            Interpolation::Linear => self.render_block_with::<LINEAR>(voice, params, output, simd),
+            Interpolation::Cubic => self.render_block_with::<CUBIC>(voice, params, output, simd),
+        }
+    }
+    /// [`render_block()`][Self::render_block()] specialised for one interpolation mode.
+    fn render_block_with<const INTERP: u8>(
+        &self,
+        voice: &mut SuperVoice,
+        params: &BlockParams,
+        output: &mut BlockOutput,
+        simd: SimdLevel,
+    ) {
+        if params.voices <= SCALAR_VOICE_LIMIT {
+            return lookup::scalar::render_block::<INTERP>(self, voice, params, output);
         }
         match simd {
             SimdLevel::Portable => {
-                let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
-                voice.advance(delta, voices, detune_factors, phase_offset, table_len, &mut indices);
-                lookup::portable::sum::<INTERP>(self, &indices, voices.div_ceil(UNISON_LANES), mask)
+                lookup::portable::render_block::<INTERP>(self, voice, params, output)
             }
             // SAFETY: the AVX2 levels are only produced by `SimdLevel::detect()` when the CPU
             // supports AVX2 and FMA.
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2 => unsafe {
-                lookup::avx2::advance_and_sum::<false, INTERP>(
-                    self, voice, delta, detune_factors, phase_offset, voices, mask,
-                )
+                lookup::avx2::render_block::<false, INTERP>(self, voice, params, output)
             },
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2Gather => unsafe {
-                lookup::avx2::advance_and_sum::<true, INTERP>(
-                    self, voice, delta, detune_factors, phase_offset, voices, mask,
-                )
-            },
-        }
-    }
-    /// Like [`advance_and_sum()`][Self::advance_and_sum()], but also pans the voices into a
-    /// left and a right channel using the per voice gains (which are zero for unused voices).
-    /// Returns `(mono, left, right)`, where `mono` is the plain sum of the voices.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn advance_and_sum_panned(
-        &self,
-        voice: &mut SuperVoice,
-        delta: f32,
-        detune_factors: &[f32x8; UNISON_VECTORS],
-        phase_offset: f32,
-        voices: usize,
-        mask: &[f32x8; UNISON_VECTORS],
-        pan_left: &[f32x8; UNISON_VECTORS],
-        pan_right: &[f32x8; UNISON_VECTORS],
-        simd: SimdLevel,
-        interpolation: Interpolation,
-    ) -> (f32, f32, f32) {
-        match interpolation {
-            Interpolation::None => self.advance_and_sum_panned_with::<NONE>(
-                voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right, simd,
-            ),
-            Interpolation::Linear => self.advance_and_sum_panned_with::<LINEAR>(
-                voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right, simd,
-            ),
-            Interpolation::Cubic => self.advance_and_sum_panned_with::<CUBIC>(
-                voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right, simd,
-            ),
-        }
-    }
-    /// [`advance_and_sum_panned()`][Self::advance_and_sum_panned()] specialised for one
-    /// interpolation mode.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn advance_and_sum_panned_with<const INTERP: u8>(
-        &self,
-        voice: &mut SuperVoice,
-        delta: f32,
-        detune_factors: &[f32x8; UNISON_VECTORS],
-        phase_offset: f32,
-        voices: usize,
-        mask: &[f32x8; UNISON_VECTORS],
-        pan_left: &[f32x8; UNISON_VECTORS],
-        pan_right: &[f32x8; UNISON_VECTORS],
-        simd: SimdLevel,
-    ) -> (f32, f32, f32) {
-        let table_len = self.cycle_len() as f32;
-        if voices <= SCALAR_VOICE_LIMIT {
-            let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
-            for i in 0..voices {
-                let index = voice.advance_one(i, delta, lane(detune_factors, i), phase_offset, table_len);
-                let sample = self.read_with::<INTERP>(index);
-                mono += sample * lane(mask, i);
-                left += sample * lane(pan_left, i);
-                right += sample * lane(pan_right, i);
-            }
-            return (mono, left, right);
-        }
-        match simd {
-            SimdLevel::Portable => {
-                let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
-                voice.advance(delta, voices, detune_factors, phase_offset, table_len, &mut indices);
-                lookup::portable::sum_panned::<INTERP>(
-                    self,
-                    &indices,
-                    voices.div_ceil(UNISON_LANES),
-                    mask,
-                    pan_left,
-                    pan_right,
-                )
-            }
-            // SAFETY: see `advance_and_sum_with()`
-            #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx2 => unsafe {
-                lookup::avx2::advance_and_sum_panned::<false, INTERP>(
-                    self, voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx2Gather => unsafe {
-                lookup::avx2::advance_and_sum_panned::<true, INTERP>(
-                    self, voice, delta, detune_factors, phase_offset, voices, mask, pan_left, pan_right,
-                )
+                lookup::avx2::render_block::<true, INTERP>(self, voice, params, output)
             },
         }
     }
@@ -888,12 +860,156 @@ fn lane(vectors: &[f32x8; UNISON_VECTORS], voice: usize) -> f32 {
     vectors[voice / UNISON_LANES].as_array()[voice % UNISON_LANES]
 }
 
-/// The hot loop: reading and interpolating all unison voices from the wavetable frames. Each
+/// One voice's phase from the per voice vectors.
+#[inline]
+fn lane_u32(vectors: &[u32x8; UNISON_VECTORS], voice: usize) -> u32 {
+    vectors[voice / UNISON_LANES].as_array()[voice % UNISON_LANES]
+}
+
+/// One voice's phase in the per voice vectors.
+#[inline]
+fn lane_u32_mut(vectors: &mut [u32x8; UNISON_VECTORS], voice: usize) -> &mut u32 {
+    &mut vectors[voice / UNISON_LANES].as_mut_array()[voice % UNISON_LANES]
+}
+
+/// The hot loop: rendering a block of all the unison voices from the wavetable frames. Each
 /// kernel is specialised per interpolation mode through `INTERP`, an [`Interpolation`]
-/// discriminant.
+/// discriminant. The kernels agree with each other to the last bit of the phases: the fixed
+/// point conversions are exact, so only the interpolation arithmetic differs (by rounding).
 mod lookup {
     use super::*;
 
+    /// The control values of a block that are shared by all the voices: the ramped gain and
+    /// base delta, and the modulation of each sample.
+    pub struct Controls<'a> {
+        params: &'a BlockParams<'a>,
+        delta: f32,
+        gain: f32,
+    }
+
+    /// One sample's control values.
+    pub struct SampleControls {
+        /// The base phase delta in cycles when frequency modulation changed it this sample.
+        /// Otherwise the per voice deltas just ramp.
+        pub fm_delta: Option<f32>,
+        /// Added to the phases that are read (phase modulation).
+        pub phase_offset: u32,
+        pub gain: f32,
+    }
+
+    impl<'a> Controls<'a> {
+        pub fn new(params: &'a BlockParams<'a>) -> Self {
+            Self {
+                params,
+                delta: params.delta,
+                gain: params.gain,
+            }
+        }
+        /// The control values of sample `n` of the block.
+        #[inline]
+        pub fn next(&mut self, n: usize) -> SampleControls {
+            let mut controls = SampleControls {
+                fm_delta: None,
+                phase_offset: 0,
+                gain: self.gain,
+            };
+            if let Some(modulation) = &self.params.modulation {
+                let input = modulation.input[n];
+                if modulation.fm > 0.0 {
+                    controls.fm_delta =
+                        Some(wrap_cycles_signed(self.delta * (1.0 + input * modulation.fm)));
+                }
+                if modulation.pm > 0.0 {
+                    controls.phase_offset = cycles_to_fixed(input * modulation.pm);
+                }
+                if modulation.am > 0.0 {
+                    controls.gain *= lerp(1.0, (input + 1.0) / 2.0, modulation.am);
+                }
+            }
+            self.delta += self.params.delta_step;
+            self.gain += self.params.gain_step;
+            controls
+        }
+    }
+
+    /// Adds one sample's voice sums to the outputs. The sums are closures so that only the
+    /// ones needed are reduced.
+    #[inline]
+    fn write_sample(
+        output: &mut BlockOutput,
+        n: usize,
+        gain: f32,
+        mono: impl Fn() -> f32,
+        left: impl FnOnce() -> f32,
+        right: impl FnOnce() -> f32,
+    ) {
+        if let Some(right_out) = output.right.as_deref_mut() {
+            output.left[n] += left() * gain;
+            right_out[n] += right() * gain;
+        } else {
+            output.left[n] += mono() * gain;
+        }
+        if let Some((mono_out, scale)) = &mut output.mono {
+            mono_out[n] = mono() * *scale;
+        }
+    }
+
+    /// Up to [`SCALAR_VOICE_LIMIT`] voices, one at a time.
+    pub mod scalar {
+        use super::*;
+
+        pub fn render_block<const INTERP: u8>(
+            frames: &FramePair,
+            voice: &mut SuperVoice,
+            params: &BlockParams,
+            output: &mut BlockOutput,
+        ) {
+            let voices = params.voices.min(SCALAR_VOICE_LIMIT);
+            let mut phases = [0_u32; SCALAR_VOICE_LIMIT];
+            let mut deltas = [0_u32; SCALAR_VOICE_LIMIT];
+            let mut delta_steps = [0_u32; SCALAR_VOICE_LIMIT];
+            for i in 0..voices {
+                let factor = lane(params.detune_factors, i);
+                phases[i] = lane_u32(&voice.voice_phases, i);
+                deltas[i] = cycles_to_fixed(params.delta * factor);
+                delta_steps[i] = cycles_to_fixed(params.delta_step * factor);
+            }
+            let stereo = output.right.is_some();
+            let needs_mono = !stereo || output.mono.is_some();
+
+            let mut controls = Controls::new(params);
+            for n in 0..output.left.len() {
+                let sample = controls.next(n);
+                if let Some(delta) = sample.fm_delta {
+                    for (i, voice_delta) in deltas.iter_mut().enumerate().take(voices) {
+                        *voice_delta = cycles_to_fixed(delta * lane(params.detune_factors, i));
+                    }
+                }
+                let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
+                for i in 0..voices {
+                    phases[i] = phases[i].wrapping_add(deltas[i]);
+                    if sample.fm_delta.is_none() {
+                        deltas[i] = deltas[i].wrapping_add(delta_steps[i]);
+                    }
+                    let value =
+                        frames.read_fixed::<INTERP>(phases[i].wrapping_add(sample.phase_offset));
+                    if needs_mono {
+                        mono += value * lane(params.mask, i);
+                    }
+                    if stereo {
+                        left += value * lane(params.pan_left, i);
+                        right += value * lane(params.pan_right, i);
+                    }
+                }
+                write_sample(output, n, sample.gain, || mono, || left, || right);
+            }
+            for (i, phase) in phases.iter().enumerate().take(voices) {
+                *lane_u32_mut(&mut voice.voice_phases, i) = *phase;
+            }
+        }
+    }
+
+    /// The `wide` path: vector arithmetic (SSE2 or NEON), scalar table reads.
     pub mod portable {
         use super::*;
 
@@ -914,111 +1030,140 @@ mod lookup {
             ((c3 * t + c2) * t + c1) * t + y1
         }
 
-        /// Reads 8 voices from a table at the given fractional indices, with the interpolation
+        /// [`cycles_to_fixed()`] for 8 lanes. Exact: the fraction of a cycle is converted in
+        /// two halves of 16 bits, each of which fits a float's mantissa.
+        #[inline]
+        pub fn cycles_to_fixed8(cycles: f32x8) -> u32x8 {
+            let scale = f32x8::splat(65536.0);
+            let scaled = (cycles - cycles.floor()) * scale;
+            let high = scaled.trunc_int();
+            let low = ((scaled - high.round_float()) * scale).trunc_int();
+            (cast::<i32x8, u32x8>(high) << 16) | cast::<i32x8, u32x8>(low)
+        }
+
+        /// The fixed point phase deltas of one vector of voices: the base delta times their
+        /// detune factors.
+        #[inline]
+        fn voice_deltas(delta: f32, factors: &f32x8) -> u32x8 {
+            cycles_to_fixed8(f32x8::splat(delta) * *factors)
+        }
+
+        /// Reads 8 voices from a table at the given fixed point phases, with the interpolation
         /// mode given by `INTERP` (an [`Interpolation`] discriminant).
         #[inline]
-        fn read8<const INTERP: u8>(table: &[f32], max_index: i32x8, indices: f32x8) -> f32x8 {
-            let floor = indices.trunc_int().min(max_index).max(i32x8::splat(0));
-            let floors = floor.to_array();
+        fn read8<const INTERP: u8>(table: &Wavetable, phases: u32x8) -> f32x8 {
+            let floors = (phases >> table.index_shift()).to_array();
+            let samples = &table.table;
             let mut taps = [[0.0_f32; UNISON_LANES]; 4];
             for (lane, &floor) in floors.iter().enumerate() {
                 let floor = floor as usize;
-                // Clamped above, so the 4 taps are always inside the padded table
-                let samples = &table[floor..floor + 4];
+                // The index is below the cycle length and the table is padded, so the 4 taps
+                // are always inside it
+                let row = &samples[floor..floor + 4];
                 match INTERP {
-                    NONE => taps[1][lane] = samples[1],
+                    NONE => taps[1][lane] = row[1],
                     LINEAR => {
-                        taps[1][lane] = samples[1];
-                        taps[2][lane] = samples[2];
+                        taps[1][lane] = row[1];
+                        taps[2][lane] = row[2];
                     }
                     _ => {
-                        taps[0][lane] = samples[0];
-                        taps[1][lane] = samples[1];
-                        taps[2][lane] = samples[2];
-                        taps[3][lane] = samples[3];
+                        taps[0][lane] = row[0];
+                        taps[1][lane] = row[1];
+                        taps[2][lane] = row[2];
+                        taps[3][lane] = row[3];
                     }
                 }
             }
             let y1 = f32x8::new(taps[1]);
-            match INTERP {
-                NONE => y1,
-                LINEAR => {
-                    let frac = indices - floor.round_float();
-                    y1 + (f32x8::new(taps[2]) - y1) * frac
-                }
-                _ => {
-                    let frac = indices - floor.round_float();
-                    hermite8(
-                        f32x8::new(taps[0]),
-                        y1,
-                        f32x8::new(taps[2]),
-                        f32x8::new(taps[3]),
-                        frac,
-                    )
-                }
+            if INTERP == NONE {
+                return y1;
+            }
+            let frac = cast::<u32x8, i32x8>(phases & u32x8::splat(table.frac_mask())).round_float()
+                * f32x8::splat(table.frac_scale());
+            if INTERP == LINEAR {
+                y1 + (f32x8::new(taps[2]) - y1) * frac
+            } else {
+                hermite8(
+                    f32x8::new(taps[0]),
+                    y1,
+                    f32x8::new(taps[2]),
+                    f32x8::new(taps[3]),
+                    frac,
+                )
             }
         }
 
         /// Reads 8 voices from the frame pair.
         #[inline]
-        fn read_frames8<const INTERP: u8>(
-            frames: &FramePair,
-            max_index: i32x8,
-            indices: f32x8,
-        ) -> f32x8 {
-            let a = read8::<INTERP>(&frames.a.table, max_index, indices);
+        fn read_frames8<const INTERP: u8>(frames: &FramePair, phases: u32x8) -> f32x8 {
+            let a = read8::<INTERP>(frames.a, phases);
             if frames.mix > 0.0 {
-                let b = read8::<INTERP>(&frames.b.table, max_index, indices);
+                let b = read8::<INTERP>(frames.b, phases);
                 a + (b - a) * f32x8::splat(frames.mix)
             } else {
                 a
             }
         }
 
-        #[inline]
-        pub fn sum<const INTERP: u8>(
+        pub fn render_block<const INTERP: u8>(
             frames: &FramePair,
-            indices: &[f32x8; UNISON_VECTORS],
-            vectors: usize,
-            mask: &[f32x8; UNISON_VECTORS],
-        ) -> f32 {
-            let max_index = i32x8::splat(frames.cycle_len() as i32 - 1);
-            let mut total = f32x8::splat(0.0);
-            for vector in 0..vectors.min(UNISON_VECTORS) {
-                total += read_frames8::<INTERP>(frames, max_index, indices[vector]) * mask[vector];
+            voice: &mut SuperVoice,
+            params: &BlockParams,
+            output: &mut BlockOutput,
+        ) {
+            let vectors = params.voices.div_ceil(UNISON_LANES).min(UNISON_VECTORS);
+            let mut phases = voice.voice_phases;
+            // Unused voices get a delta of zero, so they stay where they are
+            let factors: [f32x8; UNISON_VECTORS] =
+                std::array::from_fn(|vector| params.detune_factors[vector] * params.mask[vector]);
+            let mut deltas = [u32x8::ZERO; UNISON_VECTORS];
+            let mut delta_steps = [u32x8::ZERO; UNISON_VECTORS];
+            for vector in 0..vectors {
+                deltas[vector] = voice_deltas(params.delta, &factors[vector]);
+                delta_steps[vector] = voice_deltas(params.delta_step, &factors[vector]);
             }
-            horizontal_sum(total)
-        }
+            let stereo = output.right.is_some();
+            let needs_mono = !stereo || output.mono.is_some();
 
-        #[inline]
-        pub fn sum_panned<const INTERP: u8>(
-            frames: &FramePair,
-            indices: &[f32x8; UNISON_VECTORS],
-            vectors: usize,
-            mask: &[f32x8; UNISON_VECTORS],
-            pan_left: &[f32x8; UNISON_VECTORS],
-            pan_right: &[f32x8; UNISON_VECTORS],
-        ) -> (f32, f32, f32) {
-            let max_index = i32x8::splat(frames.cycle_len() as i32 - 1);
-            let mut mono = f32x8::splat(0.0);
-            let mut left = f32x8::splat(0.0);
-            let mut right = f32x8::splat(0.0);
-            for vector in 0..vectors.min(UNISON_VECTORS) {
-                let samples = read_frames8::<INTERP>(frames, max_index, indices[vector]);
-                mono += samples * mask[vector];
-                left += samples * pan_left[vector];
-                right += samples * pan_right[vector];
+            let mut controls = Controls::new(params);
+            for n in 0..output.left.len() {
+                let sample = controls.next(n);
+                if let Some(delta) = sample.fm_delta {
+                    for (vector_deltas, factors) in deltas.iter_mut().zip(&factors).take(vectors) {
+                        *vector_deltas = voice_deltas(delta, factors);
+                    }
+                }
+                let offset = u32x8::splat(sample.phase_offset);
+                let (mut mono, mut left, mut right) = (f32x8::ZERO, f32x8::ZERO, f32x8::ZERO);
+                for vector in 0..vectors {
+                    phases[vector] += deltas[vector];
+                    if sample.fm_delta.is_none() {
+                        deltas[vector] += delta_steps[vector];
+                    }
+                    let samples = read_frames8::<INTERP>(frames, phases[vector] + offset);
+                    if needs_mono {
+                        mono += samples * params.mask[vector];
+                    }
+                    if stereo {
+                        left += samples * params.pan_left[vector];
+                        right += samples * params.pan_right[vector];
+                    }
+                }
+                write_sample(
+                    output,
+                    n,
+                    sample.gain,
+                    || horizontal_sum(mono),
+                    || horizontal_sum(left),
+                    || horizontal_sum(right),
+                );
             }
-            (
-                horizontal_sum(mono),
-                horizontal_sum(left),
-                horizontal_sum(right),
-            )
+            voice.voice_phases = phases;
         }
     }
 
-    /// The same lookups using AVX2 gathers and FMA. Every function here must only be called
-    /// after checking that the CPU supports both.
+    /// The same with AVX2 and FMA. Every function here must only be called after checking
+    /// that the CPU supports both.
     #[cfg(target_arch = "x86_64")]
     pub mod avx2 {
         use std::arch::x86_64::*;
@@ -1044,36 +1189,35 @@ mod lookup {
 
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn store(vector: &mut f32x8, value: __m256) {
-            _mm256_storeu_ps(vector.as_mut_array().as_mut_ptr(), value)
+        unsafe fn load_u32(vector: &u32x8) -> __m256i {
+            _mm256_loadu_si256(vector.as_array().as_ptr() as *const __m256i)
         }
 
-        /// Wraps non-negative phases into `[0, 1)`.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn wrap(phase: __m256) -> __m256 {
-            _mm256_sub_ps(phase, _mm256_cvtepi32_ps(_mm256_cvttps_epi32(phase)))
+        unsafe fn store_u32(vector: &mut u32x8, value: __m256i) {
+            _mm256_storeu_si256(vector.as_mut_array().as_mut_ptr() as *mut __m256i, value)
         }
 
-        /// Advances one vector of voices, see [`SuperVoice::advance()`], returning their read
-        /// indices.
+        /// [`cycles_to_fixed()`] for 8 lanes, see the portable version.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn advance(
-            phases: &mut f32x8,
-            delta: __m256,
-            detune_factors: &f32x8,
-            phase_offset: __m256,
-            table_len: __m256,
-        ) -> __m256 {
-            let phase = wrap(_mm256_fmadd_ps(delta, load(detune_factors), load(phases)));
-            store(phases, phase);
+        pub unsafe fn cycles_to_fixed8(cycles: __m256) -> __m256i {
+            let scale = _mm256_set1_ps(65536.0);
+            let scaled = _mm256_mul_ps(_mm256_sub_ps(cycles, _mm256_floor_ps(cycles)), scale);
+            let high = _mm256_cvttps_epi32(scaled);
+            let low = _mm256_cvttps_epi32(_mm256_mul_ps(
+                _mm256_sub_ps(scaled, _mm256_cvtepi32_ps(high)),
+                scale,
+            ));
+            _mm256_or_si256(_mm256_slli_epi32::<16>(high), low)
+        }
 
-            // The offset can be negative, and the wrapped result can round up to exactly 1.0
-            let read = wrap(_mm256_add_ps(phase, phase_offset));
-            let negative = _mm256_cmp_ps::<_CMP_LT_OQ>(read, _mm256_setzero_ps());
-            let read = _mm256_add_ps(read, _mm256_and_ps(negative, _mm256_set1_ps(1.0)));
-            _mm256_mul_ps(_mm256_min_ps(read, _mm256_set1_ps(BELOW_ONE)), table_len)
+        /// The fixed point phase deltas of one vector of voices.
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn voice_deltas(delta: f32, factors: &f32x8) -> __m256i {
+            cycles_to_fixed8(_mm256_mul_ps(_mm256_set1_ps(delta), load(factors)))
         }
 
         /// Cubic interpolation of 8 voices, see [`hermite()`][super::super::hermite()].
@@ -1097,6 +1241,28 @@ mod lookup {
             let poly = _mm256_fmadd_ps(c3, t, c2);
             let poly = _mm256_fmadd_ps(poly, t, c1);
             _mm256_fmadd_ps(poly, t, y1)
+        }
+
+        /// A wavetable's lookup constants in vector form.
+        struct Table {
+            base: *const f32,
+            /// The index shift as a shift count.
+            shift: __m128i,
+            frac_mask: __m256i,
+            frac_scale: __m256,
+        }
+
+        impl Table {
+            #[inline]
+            #[target_feature(enable = "avx2,fma")]
+            unsafe fn new(table: &Wavetable) -> Self {
+                Self {
+                    base: table.table.as_ptr(),
+                    shift: _mm_cvtsi32_si128(table.index_shift() as i32),
+                    frac_mask: _mm256_set1_epi32(table.frac_mask() as i32),
+                    frac_scale: _mm256_set1_ps(table.frac_scale()),
+                }
+            }
         }
 
         /// The 4 taps `(y0, y1, y2, y3)` of 8 voices, each as a vector with one lane per voice.
@@ -1159,37 +1325,33 @@ mod lookup {
             )
         }
 
-        /// Reads 8 voices from a table at the given fractional indices, with the interpolation
+        /// Reads 8 voices from a table at the given fixed point phases, with the interpolation
         /// mode given by `INTERP` (an [`Interpolation`] discriminant).
         #[inline]
         #[target_feature(enable = "avx2,fma")]
         unsafe fn read8<const GATHER: bool, const INTERP: u8>(
-            table: &[f32],
-            max_index: __m256i,
-            indices: __m256,
+            table: &Table,
+            phases: __m256i,
         ) -> __m256 {
-            let floor = _mm256_max_epi32(
-                _mm256_min_epi32(_mm256_cvttps_epi32(indices), max_index),
-                _mm256_setzero_si256(),
-            );
-            // SAFETY: the indices are clamped to the cycle, and the table is padded with the
+            let floor = _mm256_srl_epi32(phases, table.shift);
+            // SAFETY: the index is below the cycle length, and the table is padded with the
             // neighbouring samples, so all 4 taps are inside it.
-            let base = table.as_ptr();
             let (y0, y1, y2, y3) = if GATHER {
-                taps_gather::<INTERP>(base, floor)
+                taps_gather::<INTERP>(table.base, floor)
             } else {
-                taps_transpose::<INTERP>(base, floor)
+                taps_transpose::<INTERP>(table.base, floor)
             };
-            match INTERP {
-                NONE => y1,
-                LINEAR => {
-                    let frac = _mm256_sub_ps(indices, _mm256_cvtepi32_ps(floor));
-                    _mm256_fmadd_ps(_mm256_sub_ps(y2, y1), frac, y1)
-                }
-                _ => {
-                    let frac = _mm256_sub_ps(indices, _mm256_cvtepi32_ps(floor));
-                    hermite8(y0, y1, y2, y3, frac)
-                }
+            if INTERP == NONE {
+                return y1;
+            }
+            let frac = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_and_si256(phases, table.frac_mask)),
+                table.frac_scale,
+            );
+            if INTERP == LINEAR {
+                _mm256_fmadd_ps(_mm256_sub_ps(y2, y1), frac, y1)
+            } else {
+                hermite8(y0, y1, y2, y3, frac)
             }
         }
 
@@ -1197,86 +1359,87 @@ mod lookup {
         #[inline]
         #[target_feature(enable = "avx2,fma")]
         unsafe fn read_frames8<const GATHER: bool, const INTERP: u8>(
-            frames: &FramePair,
-            max_index: __m256i,
-            indices: __m256,
+            a: &Table,
+            b: &Table,
+            mix: f32,
+            phases: __m256i,
         ) -> __m256 {
-            let a = read8::<GATHER, INTERP>(&frames.a.table, max_index, indices);
-            if frames.mix > 0.0 {
-                let b = read8::<GATHER, INTERP>(&frames.b.table, max_index, indices);
-                _mm256_fmadd_ps(_mm256_sub_ps(b, a), _mm256_set1_ps(frames.mix), a)
+            let a = read8::<GATHER, INTERP>(a, phases);
+            if mix > 0.0 {
+                let b = read8::<GATHER, INTERP>(b, phases);
+                _mm256_fmadd_ps(_mm256_sub_ps(b, a), _mm256_set1_ps(mix), a)
             } else {
                 a
             }
         }
 
         #[target_feature(enable = "avx2,fma")]
-        pub unsafe fn advance_and_sum<const GATHER: bool, const INTERP: u8>(
+        pub unsafe fn render_block<const GATHER: bool, const INTERP: u8>(
             frames: &FramePair,
             voice: &mut SuperVoice,
-            delta: f32,
-            detune_factors: &[f32x8; UNISON_VECTORS],
-            phase_offset: f32,
-            voices: usize,
-            mask: &[f32x8; UNISON_VECTORS],
-        ) -> f32 {
-            let max_index = _mm256_set1_epi32(frames.cycle_len() as i32 - 1);
-            let table_len = _mm256_set1_ps(frames.cycle_len() as f32);
-            let delta = _mm256_set1_ps(delta);
-            let phase_offset = _mm256_set1_ps(phase_offset);
-            let mut total = _mm256_setzero_ps();
-            for vector in 0..voices.div_ceil(UNISON_LANES).min(UNISON_VECTORS) {
-                let indices = advance(
-                    &mut voice.voice_phases[vector],
-                    delta,
-                    &detune_factors[vector],
-                    phase_offset,
-                    table_len,
-                );
-                let samples = read_frames8::<GATHER, INTERP>(frames, max_index, indices);
-                total = _mm256_fmadd_ps(samples, load(&mask[vector]), total);
+            params: &BlockParams,
+            output: &mut BlockOutput,
+        ) {
+            let table_a = Table::new(frames.a);
+            let table_b = Table::new(frames.b);
+            let vectors = params.voices.div_ceil(UNISON_LANES).min(UNISON_VECTORS);
+            let mut phases: [__m256i; UNISON_VECTORS] =
+                std::array::from_fn(|vector| load_u32(&voice.voice_phases[vector]));
+            // Unused voices get a delta of zero, so they stay where they are
+            let factors: [f32x8; UNISON_VECTORS] =
+                std::array::from_fn(|vector| params.detune_factors[vector] * params.mask[vector]);
+            let mut deltas = [_mm256_setzero_si256(); UNISON_VECTORS];
+            let mut delta_steps = [_mm256_setzero_si256(); UNISON_VECTORS];
+            for vector in 0..vectors {
+                deltas[vector] = voice_deltas(params.delta, &factors[vector]);
+                delta_steps[vector] = voice_deltas(params.delta_step, &factors[vector]);
             }
-            horizontal_sum(total)
-        }
+            let stereo = output.right.is_some();
+            let needs_mono = !stereo || output.mono.is_some();
 
-        #[target_feature(enable = "avx2,fma")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn advance_and_sum_panned<const GATHER: bool, const INTERP: u8>(
-            frames: &FramePair,
-            voice: &mut SuperVoice,
-            delta: f32,
-            detune_factors: &[f32x8; UNISON_VECTORS],
-            phase_offset: f32,
-            voices: usize,
-            mask: &[f32x8; UNISON_VECTORS],
-            pan_left: &[f32x8; UNISON_VECTORS],
-            pan_right: &[f32x8; UNISON_VECTORS],
-        ) -> (f32, f32, f32) {
-            let max_index = _mm256_set1_epi32(frames.cycle_len() as i32 - 1);
-            let table_len = _mm256_set1_ps(frames.cycle_len() as f32);
-            let delta = _mm256_set1_ps(delta);
-            let phase_offset = _mm256_set1_ps(phase_offset);
-            let mut mono = _mm256_setzero_ps();
-            let mut left = _mm256_setzero_ps();
-            let mut right = _mm256_setzero_ps();
-            for vector in 0..voices.div_ceil(UNISON_LANES).min(UNISON_VECTORS) {
-                let indices = advance(
-                    &mut voice.voice_phases[vector],
-                    delta,
-                    &detune_factors[vector],
-                    phase_offset,
-                    table_len,
+            let mut controls = Controls::new(params);
+            for n in 0..output.left.len() {
+                let sample = controls.next(n);
+                if let Some(delta) = sample.fm_delta {
+                    for (vector_deltas, factors) in deltas.iter_mut().zip(&factors).take(vectors) {
+                        *vector_deltas = voice_deltas(delta, factors);
+                    }
+                }
+                let offset = _mm256_set1_epi32(sample.phase_offset as i32);
+                let mut mono = _mm256_setzero_ps();
+                let mut left = _mm256_setzero_ps();
+                let mut right = _mm256_setzero_ps();
+                for vector in 0..vectors {
+                    phases[vector] = _mm256_add_epi32(phases[vector], deltas[vector]);
+                    if sample.fm_delta.is_none() {
+                        deltas[vector] = _mm256_add_epi32(deltas[vector], delta_steps[vector]);
+                    }
+                    let samples = read_frames8::<GATHER, INTERP>(
+                        &table_a,
+                        &table_b,
+                        frames.mix,
+                        _mm256_add_epi32(phases[vector], offset),
+                    );
+                    if needs_mono {
+                        mono = _mm256_fmadd_ps(samples, load(&params.mask[vector]), mono);
+                    }
+                    if stereo {
+                        left = _mm256_fmadd_ps(samples, load(&params.pan_left[vector]), left);
+                        right = _mm256_fmadd_ps(samples, load(&params.pan_right[vector]), right);
+                    }
+                }
+                write_sample(
+                    output,
+                    n,
+                    sample.gain,
+                    || horizontal_sum(mono),
+                    || horizontal_sum(left),
+                    || horizontal_sum(right),
                 );
-                let samples = read_frames8::<GATHER, INTERP>(frames, max_index, indices);
-                mono = _mm256_fmadd_ps(samples, load(&mask[vector]), mono);
-                left = _mm256_fmadd_ps(samples, load(&pan_left[vector]), left);
-                right = _mm256_fmadd_ps(samples, load(&pan_right[vector]), right);
             }
-            (
-                horizontal_sum(mono),
-                horizontal_sum(left),
-                horizontal_sum(right),
-            )
+            for (vector, phase) in phases.iter().enumerate() {
+                store_u32(&mut voice.voice_phases[vector], *phase);
+            }
         }
     }
 }
@@ -1318,53 +1481,6 @@ impl WavetableNotes {
     /// delta * sample_rate`, rounded up.
     pub fn cycles_to_note(delta: f32, sample_rate: f32) -> usize {
         (((sample_rate * delta / 440.0).log2() * 12.0 + 69.0).ceil() as usize).clamp(0, 137)
-    }
-    /// Create a bandlimited wavetable for each midi note from a base additive function.
-    ///
-    /// Each note is given a wavetable with the exact number of samples required to reproduce the note and all its harmonics.
-    /// The table size will be multiplied by `max_oversample` (to reduce aliasing from linear interpolation) but limited by
-    /// min and max `table_len`.
-    ///
-    /// Limiting `max_table_len` mostly prevents low notes from growing too big (given you have `(sample_rate * max_oversample) / note_freq` samples per table)
-    /// at the expense of sample quality.
-    ///
-    /// Increasing `min_table_len` emulates increased oversampling for higher notes which, for reasons I now understand, require much more oversampling
-    /// than the middle notes to achieve comparative noise reduction. E.g. a note at 2000 Hz theoretically requires a minimum of 22.05 samples, so a
-    /// `min_table_len` of 2560 is equivalent to 116 times oversampling which is usually enough.
-    pub fn from_additive_osc(
-        osc: &AdditiveOsc,
-        sample_rate: f32,
-        max_oversample: f32,
-        max_table_len: usize,
-        min_table_len: usize,
-    ) -> Self {
-        debug_assert!(
-            max_oversample >= 1.0,
-            "Oversampling factor should be 1.0 or greater"
-        );
-        let tables: Vec<Wavetable> = (0..=137)
-            .into_iter()
-            .map(|x| {
-                if x == 137 {
-                    // highest note has no harmonics, so notes above nyquist are silent
-                    1
-                } else {
-                    // Sample length required for note
-                    (max_oversample * sample_rate / (440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0)))
-                        .ceil() as usize
-                }
-            })
-            .map(|len| {
-                let clamped_len = len.clamp(min_table_len, max_table_len);
-                // Ensure waveform is bandlimited
-                let harmonics =
-                    ((len as f32 / (2.0 * max_oversample)) as usize).min(clamped_len / 2);
-                Wavetable::from_additive_osc(osc, clamped_len, harmonics)
-            })
-            .collect();
-        Self {
-            tables: tables.try_into().unwrap(),
-        }
     }
     /// Generates a bandlimited wavetable for each midi note using fast fourier transforms, with constant wavetable length
     pub fn from_additive_osc_ifft(
@@ -1704,12 +1820,12 @@ mod tests {
         assert!(table.read(-1.0).is_finite());
     }
 
-    /// Reads the frames with a runtime selected interpolation mode.
-    fn read_mode(frames: &FramePair, index: f32, mode: Interpolation) -> f32 {
+    /// Reads the frames at a fixed point phase with a runtime selected interpolation mode.
+    fn read_fixed_mode(frames: &FramePair, phase: u32, mode: Interpolation) -> f32 {
         match mode {
-            Interpolation::None => frames.read_with::<NONE>(index),
-            Interpolation::Linear => frames.read_with::<LINEAR>(index),
-            Interpolation::Cubic => frames.read_with::<CUBIC>(index),
+            Interpolation::None => frames.read_fixed::<NONE>(phase),
+            Interpolation::Linear => frames.read_fixed::<LINEAR>(phase),
+            Interpolation::Cubic => frames.read_fixed::<CUBIC>(phase),
         }
     }
 
@@ -1724,33 +1840,146 @@ mod tests {
         let table = Wavetable::new(cycle.clone());
         assert_eq!(Interpolation::default(), Interpolation::Cubic);
         assert_eq!(Interpolation::Cubic as u8, CUBIC);
+        assert_eq!(table.index_shift(), 26);
+        assert_eq!(table.frac_mask(), (1 << 26) - 1);
         for (i, sample) in cycle.iter().enumerate() {
             let next = cycle[(i + 1) % len];
-            // Every mode reproduces the samples themselves
+            let at = |offset: f32| cycles_to_fixed((i as f32 + offset) / len as f32);
+            // Every mode reproduces the samples themselves, by index or by phase
             assert_eq!(table.read_with::<NONE>(i as f32), *sample);
             assert_eq!(table.read_with::<LINEAR>(i as f32), *sample);
             assert_eq!(table.read_with::<CUBIC>(i as f32), *sample);
+            assert_eq!(table.read_fixed::<NONE>(at(0.0)), *sample);
+            assert_eq!(table.read_fixed::<LINEAR>(at(0.0)), *sample);
+            assert_eq!(table.read_fixed::<CUBIC>(at(0.0)), *sample);
             // No interpolation holds the sample below the read position
             assert_eq!(table.read_with::<NONE>(i as f32 + 0.75), *sample);
+            assert_eq!(table.read_fixed::<NONE>(at(0.75)), *sample);
             // Linear interpolation is the weighted average of the two neighbours
+            let want = 0.75 * sample + 0.25 * next;
             let linear = table.read_with::<LINEAR>(i as f32 + 0.25);
-            assert!((linear - (0.75 * sample + 0.25 * next)).abs() < 1e-6, "{i}: {linear}");
+            assert!((linear - want).abs() < 1e-6, "{i}: {linear}");
+            let linear = table.read_fixed::<LINEAR>(at(0.25));
+            assert!((linear - want).abs() < 1e-6, "{i}: {linear}");
             // Cubic interpolation is closer to the true sine than linear
             let want = (2.0 * PI * (i as f32 + 0.5) / len as f32).sin();
             let cubic = table.read_with::<CUBIC>(i as f32 + 0.5);
             let linear = table.read_with::<LINEAR>(i as f32 + 0.5);
             assert!((cubic - want).abs() <= (linear - want).abs() + 1e-7, "{i}: {cubic} vs {linear}");
+            assert_eq!(table.read_fixed::<CUBIC>(at(0.5)), cubic);
         }
-        // Out of range reads are clamped in every mode
+        // Out of range indices are clamped in every mode
         for index in [len as f32, 1e9, -1.0] {
             assert!(table.read_with::<NONE>(index).is_finite());
             assert!(table.read_with::<LINEAR>(index).is_finite());
             assert!(table.read_with::<CUBIC>(index).is_finite());
         }
+        // Phases always land inside the cycle, right up to the last fixed point step
+        assert_eq!(table.split_phase(u32::MAX).0, len - 1);
+        assert!(table.read_fixed::<CUBIC>(u32::MAX).is_finite());
     }
 
     #[test]
-    fn simd_lookups_match_the_scalar_reads() {
+    fn fixed_point_phases_wrap_and_convert_exactly() {
+        assert_eq!(cycles_to_fixed(0.0), 0);
+        assert_eq!(cycles_to_fixed(0.5), 1 << 31);
+        assert_eq!(cycles_to_fixed(0.25), 1 << 30);
+        assert_eq!(cycles_to_fixed(1.25), 1 << 30);
+        assert_eq!(cycles_to_fixed(-0.75), 1 << 30);
+        assert_eq!(cycles_to_fixed(-3.75), 1 << 30);
+        assert_eq!(cycles_to_fixed(1.0), 0);
+        assert!((fixed_to_cycles(cycles_to_fixed(0.3)) - 0.3).abs() < 1e-7);
+        assert!((wrap_cycles_signed(-0.3) - 0.7).abs() < 1e-6);
+        assert!((wrap_cycles_signed(2.3) - 0.3).abs() < 1e-6);
+        // An upwards delta wraps the phase around, a downwards one wraps it back
+        let phase = cycles_to_fixed(0.9).wrapping_add(cycles_to_fixed(0.2));
+        assert!((fixed_to_cycles(phase) - 0.1).abs() < 1e-7);
+        let phase = cycles_to_fixed(0.1).wrapping_add(cycles_to_fixed(-0.2));
+        assert!((fixed_to_cycles(phase) - 0.9).abs() < 1e-7);
+
+        // The 8 lane conversions match the scalar one exactly
+        let values = [0.0_f32, 0.0123, 0.5, 0.999_999_9, 1.25, -0.3, -7.125, 123.456];
+        let want: Vec<u32> = values.iter().map(|v| cycles_to_fixed(*v)).collect();
+        assert_eq!(lookup::portable::cycles_to_fixed8(f32x8::new(values)).to_array().to_vec(), want);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            use std::arch::x86_64::*;
+            let mut got = [0_u32; 8];
+            // SAFETY: AVX2 and FMA were just detected.
+            unsafe {
+                let fixed = lookup::avx2::cycles_to_fixed8(_mm256_loadu_ps(values.as_ptr()));
+                _mm256_storeu_si256(got.as_mut_ptr() as *mut __m256i, fixed);
+            }
+            assert_eq!(got.to_vec(), want);
+        }
+    }
+
+    /// A one voice at a time version of [`FramePair::render_block()`], for checking the
+    /// kernels against. The deltas ramp in fixed point like the kernels' do, so the phases
+    /// have to match exactly.
+    fn render_block_reference(
+        frames: &FramePair,
+        voice: &mut SuperVoice,
+        params: &BlockParams,
+        output: &mut BlockOutput,
+        mode: Interpolation,
+    ) {
+        let (mut delta, mut gain) = (params.delta, params.gain);
+        let factor = |i: usize| lane(params.detune_factors, i);
+        let mut deltas: Vec<u32> = (0..params.voices)
+            .map(|i| cycles_to_fixed(params.delta * factor(i)))
+            .collect();
+        let delta_steps: Vec<u32> = (0..params.voices)
+            .map(|i| cycles_to_fixed(params.delta_step * factor(i)))
+            .collect();
+        for n in 0..output.left.len() {
+            let (mut fm_delta, mut offset, mut sample_gain) = (None, 0_u32, gain);
+            if let Some(modulation) = &params.modulation {
+                let input = modulation.input[n];
+                if modulation.fm > 0.0 {
+                    fm_delta = Some(wrap_cycles_signed(delta * (1.0 + input * modulation.fm)));
+                }
+                if modulation.pm > 0.0 {
+                    offset = cycles_to_fixed(input * modulation.pm);
+                }
+                if modulation.am > 0.0 {
+                    sample_gain *= lerp(1.0, (input + 1.0) / 2.0, modulation.am);
+                }
+            }
+            let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
+            for i in 0..params.voices {
+                match fm_delta {
+                    Some(fm_delta) => deltas[i] = cycles_to_fixed(fm_delta * factor(i)),
+                    None => deltas[i] = deltas[i].wrapping_add(delta_steps[i]),
+                }
+                let phase = lane_u32_mut(&mut voice.voice_phases, i);
+                // The step is added after this sample's delta is used
+                let step = if fm_delta.is_none() { delta_steps[i] } else { 0 };
+                *phase = phase.wrapping_add(deltas[i].wrapping_sub(step));
+                let value = read_fixed_mode(frames, phase.wrapping_add(offset), mode);
+                mono += value * lane(params.mask, i);
+                left += value * lane(params.pan_left, i);
+                right += value * lane(params.pan_right, i);
+            }
+            if let Some(right_out) = output.right.as_deref_mut() {
+                output.left[n] += left * sample_gain;
+                right_out[n] += right * sample_gain;
+            } else {
+                output.left[n] += mono * sample_gain;
+            }
+            if let Some((mono_out, scale)) = &mut output.mono {
+                mono_out[n] = mono * *scale;
+            }
+            delta += params.delta_step;
+            gain += params.gain_step;
+        }
+    }
+
+    /// The outputs of rendering a few blocks: left, right, mono, and the final phases.
+    type Rendered = (Vec<f32>, Vec<f32>, Vec<f32>, SuperVoice);
+
+    #[test]
+    fn block_kernels_match_the_reference() {
         let len = 256;
         let sine = Wavetable::new(
             (0..len)
@@ -1759,15 +1988,9 @@ mod tests {
         );
         let saw = Wavetable::new((0..len).map(|i| i as f32 / len as f32 * 2.0 - 1.0).collect());
         let rng = fastrand::Rng::with_seed(42);
-
-        let mut osc = OscillatorParams {
-            voice_count: 13,
-            voices_detune: 0.3,
-            ..Default::default()
-        };
-        osc.update_detune_factors();
-        osc.update_pan_gains(0.8);
-        let voices = osc.unison_voices();
+        let modulator: Vec<f32> = (0..80).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        // Blocks of different lengths, to check that a short block works too
+        let blocks = [(0, 32), (32, 49), (49, 80)];
 
         let mut levels = vec![SimdLevel::Portable];
         #[cfg(target_arch = "x86_64")]
@@ -1776,75 +1999,93 @@ mod tests {
             levels.push(SimdLevel::Avx2Gather);
         }
 
-        for (mix, mode) in MODES.iter().flat_map(|mode| [(0.0, *mode), (0.3, *mode)]) {
-            let frames = FramePair {
-                a: &sine,
-                b: &saw,
-                mix,
-            };
-            let start = SuperVoice::new(0.1, 0.7);
-            // Reference: one voice at a time, through the scalar path
-            let mut reference = start.clone();
-            let mut expected = Vec::new();
-            for step in 0..20 {
-                let delta = 0.013 * (1.0 + step as f32 * 0.1);
-                let offset = (rng.f32() - 0.5) * 3.0;
-                let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
-                for i in 0..voices {
-                    let index = reference.advance_one(i, delta, lane(&osc.detune_factors, i), offset, len as f32);
-                    let sample = read_mode(&frames, index, mode);
-                    let (gain_left, gain_right) = osc.pan_gain(i);
-                    mono += sample;
-                    left += sample * gain_left;
-                    right += sample * gain_right;
-                }
-                expected.push((delta, offset, mono, left, right));
-            }
+        for mode in MODES {
+            for mix in [0.0, 0.3] {
+                let frames = FramePair {
+                    a: &sine,
+                    b: &saw,
+                    mix,
+                };
+                for voices in [1, 3, 8, 13, 32] {
+                    let mut osc = OscillatorParams {
+                        voice_count: voices as u8,
+                        voices_detune: 0.3,
+                        ..Default::default()
+                    };
+                    osc.update_detune_factors();
+                    osc.update_pan_gains(0.8);
+                    let start = SuperVoice::new(0.1, 0.7);
 
-            for simd in &levels {
-                let mut voice = start.clone();
-                let mut voice_panned = start.clone();
-                for (delta, offset, mono, left, right) in &expected {
-                    let got = frames.advance_and_sum(
-                        &mut voice, *delta, &osc.detune_factors, *offset, voices, &osc.voice_mask, *simd, mode,
-                    );
-                    assert!((got - mono).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got} vs {mono}");
-                    let (got_mono, got_left, got_right) = frames.advance_and_sum_panned(
-                        &mut voice_panned, *delta, &osc.detune_factors, *offset, voices,
-                        &osc.voice_mask, &osc.pan_left, &osc.pan_right, *simd, mode,
-                    );
-                    assert!((got_mono - mono).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got_mono} vs {mono}");
-                    assert!((got_left - left).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got_left} vs {left}");
-                    assert!((got_right - right).abs() < 1e-3, "{simd:?} {mode:?} mix {mix}: {got_right} vs {right}");
-                }
-                // The phases of the voices in use advanced identically
-                for i in 0..voices {
-                    let a = lane(&reference.voice_phases, i);
-                    let b = lane(&voice.voice_phases, i);
-                    assert!((a - b).abs() < 1e-5, "{simd:?} voice {i}: {a} vs {b}");
+                    for (stereo, modulated, with_mono) in
+                        [(false, false, false), (true, false, true), (false, true, true), (true, true, false)]
+                    {
+                        let render = |simd: Option<SimdLevel>| -> Rendered {
+                            let mut voice = start.clone();
+                            // The outputs start non-zero to check that the kernels add to them
+                            let mut left = vec![0.1; 80];
+                            let mut right = vec![0.2; 80];
+                            let mut mono = vec![0.0; 80];
+                            for (begin, end) in blocks {
+                                let params = BlockParams {
+                                    delta: 0.013,
+                                    delta_step: 0.0001,
+                                    gain: 0.5,
+                                    gain_step: 0.01,
+                                    modulation: modulated.then(|| Modulation {
+                                        input: &modulator[begin..end],
+                                        fm: 0.4,
+                                        pm: 0.3,
+                                        am: 0.5,
+                                    }),
+                                    voices,
+                                    detune_factors: &osc.detune_factors,
+                                    mask: &osc.voice_mask,
+                                    pan_left: &osc.pan_left,
+                                    pan_right: &osc.pan_right,
+                                };
+                                let mut output = BlockOutput {
+                                    left: &mut left[begin..end],
+                                    right: if stereo { Some(&mut right[begin..end]) } else { None },
+                                    mono: if with_mono { Some((&mut mono[begin..end], 0.75)) } else { None },
+                                };
+                                match simd {
+                                    None => render_block_reference(&frames, &mut voice, &params, &mut output, mode),
+                                    Some(simd) => frames.render_block(&mut voice, &params, &mut output, simd, mode),
+                                }
+                            }
+                            (left, right, mono, voice)
+                        };
+                        let (left, right, mono, voice) = render(None);
+                        assert!(left.iter().any(|sample| (sample - 0.1).abs() > 1e-3));
+                        let tolerance = 1e-3 * voices as f32;
+                        let mut kernel_phases: Option<Vec<u32>> = None;
+                        for simd in &levels {
+                            let (got_left, got_right, got_mono, got_voice) = render(Some(*simd));
+                            let case = format!("{simd:?} {mode:?} mix {mix} voices {voices} stereo {stereo} modulated {modulated}");
+                            for n in 0..80 {
+                                assert!((got_left[n] - left[n]).abs() < tolerance, "{case}: left {n}: {} vs {}", got_left[n], left[n]);
+                                assert!((got_right[n] - right[n]).abs() < tolerance, "{case}: right {n}: {} vs {}", got_right[n], right[n]);
+                                assert!((got_mono[n] - mono[n]).abs() < tolerance, "{case}: mono {n}: {} vs {}", got_mono[n], mono[n]);
+                            }
+                            let phases: Vec<u32> = (0..voices).map(|i| lane_u32(&got_voice.voice_phases, i)).collect();
+                            for i in 0..voices {
+                                let want = lane_u32(&voice.voice_phases, i);
+                                assert_eq!(phases[i], want, "{case}: voice {i}: {} vs {}", fixed_to_cycles(phases[i]), voice.phase_cycles(i));
+                            }
+                            // Unused voices are left alone
+                            for i in voices..MAX_UNISON {
+                                assert_eq!(lane_u32(&got_voice.voice_phases, i), lane_u32(&start.voice_phases, i), "{case}: voice {i}");
+                            }
+                            // The kernels agree with each other to the bit on the phases
+                            match &kernel_phases {
+                                Some(first) => assert_eq!(&phases, first, "{case}"),
+                                None => kernel_phases = Some(phases),
+                            }
+                        }
+                    }
                 }
             }
-
-            // Few voices take the scalar path
-            let mut few = start.clone();
-            let mut few_reference = start.clone();
-            let got = frames.advance_and_sum(
-                &mut few, 0.01, &osc.detune_factors, 0.2, 2, &osc.voice_mask, levels[0], mode,
-            );
-            let mut want = 0.0;
-            for i in 0..2 {
-                let index = few_reference.advance_one(i, 0.01, lane(&osc.detune_factors, i), 0.2, len as f32);
-                want += read_mode(&frames, index, mode);
-            }
-            assert!((got - want).abs() < 1e-4);
         }
-
-        // The modes really differ from each other in between the samples
-        let frames = FramePair { a: &saw, b: &saw, mix: 0.0 };
-        let between = 100.5;
-        let none = read_mode(&frames, between, Interpolation::None);
-        let linear = read_mode(&frames, between, Interpolation::Linear);
-        assert!((linear - none).abs() > 1e-4);
     }
 
     #[test]
