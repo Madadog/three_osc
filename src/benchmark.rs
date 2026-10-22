@@ -145,8 +145,9 @@ fn benchmark_synth() {
 #[test]
 #[ignore]
 fn benchmark_ladder() {
+    type Setup = fn(&mut LadderFilter);
     let input: Vec<f32> = (0..4096).map(|i| (i % 100) as f32 / 50.0 - 1.0).collect();
-    let variants: [(&str, fn(&mut LadderFilter)); 3] = [
+    let variants: [(&str, Setup); 3] = [
         ("ladder filter (3x oversampled, 16th order decimator)", |_| {}),
         ("ladder filter without the decimator", |filter| filter.set_decimator_order(0)),
         ("ladder filter without oversampling", |filter| filter.oversampling_factor = 1),

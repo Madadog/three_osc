@@ -222,7 +222,7 @@ impl FilterController {
         sample_rate: f32,
     ) -> f32 {
         let envelope = if let Some(release_index) = release_index {
-            let release_time = release_index as f32 / sample_rate as f32;
+            let release_time = release_index as f32 / sample_rate;
             self.cutoff_envelope
                 .sample_released(release_time, envelope_index)
         } else {

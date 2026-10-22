@@ -633,6 +633,7 @@ impl FramePair<'_> {
     /// Advances the first `voices` unison voices (see [`SuperVoice::advance()`]) and sums their
     /// samples, skipping the voices masked out by `mask`.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn advance_and_sum(
         &self,
         voice: &mut SuperVoice,
@@ -1482,8 +1483,8 @@ mod tests {
         assert_eq!(table.cycle_len(), len);
         assert_eq!(table.cycle(), &cycle[..]);
         // Samples are reproduced exactly, and in between them the cubic interpolation is close
-        for i in 0..len {
-            assert_eq!(table.read(i as f32), cycle[i]);
+        for (i, sample) in cycle.iter().enumerate() {
+            assert_eq!(table.read(i as f32), *sample);
             let between = table.read(i as f32 + 0.5);
             let expected = (2.0 * PI * (i as f32 + 0.5) / len as f32).sin();
             assert!((between - expected).abs() < 1e-3, "{i}: {between} vs {expected}");
