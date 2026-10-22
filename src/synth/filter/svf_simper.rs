@@ -32,9 +32,13 @@
 // implemented from https://cytomic.com/files/dsp/SvfLinearTrapOptimised2.pdf
 // thanks, andy!
 
-use std::f32::consts;
+use wide::f32x8;
 
-use super::{FilterType, Filter};
+use super::super::fastmath;
+use super::{Filter, FilterType};
+
+/// Number of filters [`SvfSimper::process_block_x8()`] runs in lockstep.
+pub const SVF_LANES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct SvfSimper {
@@ -59,7 +63,8 @@ pub struct SvfSimper {
 
 impl SvfSimper {
     pub fn new(cutoff: f32, resonance: f32, sample_rate: f32) -> Self {
-        let g = (consts::PI * (cutoff / sample_rate)).tan();
+        // tan(pi * cutoff / sample_rate)
+        let g = fastmath::tan_cycles(0.5 * cutoff / sample_rate);
         let k = 2f32 - (1.9f32 * resonance.clamp(0.0, 1.0));
 
         let a1 = 1.0 / (1.0 + (g * (g + k)));
@@ -96,6 +101,101 @@ impl SvfSimper {
         self.a2_step = 0.0;
         self.a3_step = 0.0;
         self.k_step = 0.0;
+    }
+
+    /// Processes a block of samples, in place, for up to 8 filters at once in lockstep: each
+    /// lane's samples go through its own filter, with the eight filters' states packed into
+    /// SIMD vectors. Each present lane produces exactly the same output as calling
+    /// [`process()`][Filter::process()] on its filter for each sample would, since the
+    /// operations are the same and in the same order. The filters must all have the same filter
+    /// type; the first present lane's is used.
+    ///
+    /// The filter's recurrence is a chain of dependent operations, so one filter on its own
+    /// leaves most of the CPU idle: this runs eight chains side by side for the same latency.
+    pub fn process_block_x8(mut lanes: [Option<(&mut SvfSimper, &mut [f32])>; SVF_LANES]) {
+        let Some(first) = lanes
+            .iter()
+            .find_map(|lane| lane.as_ref().map(|(filter, _)| &**filter))
+        else {
+            return;
+        };
+        let filter_type = first.filter_type;
+        let block_len = lanes
+            .iter()
+            .flatten()
+            .map(|(_, buffer)| buffer.len())
+            .min()
+            .unwrap_or(0);
+
+        // Gather the state of each lane. Empty lanes stay at zero and produce zeros.
+        let gather = |get: fn(&SvfSimper) -> f32| {
+            let mut values = [0.0_f32; SVF_LANES];
+            for (value, lane) in values.iter_mut().zip(lanes.iter()) {
+                if let Some((filter, _)) = lane {
+                    *value = get(filter);
+                }
+            }
+            f32x8::new(values)
+        };
+        let mut a1 = gather(|filter| filter.a1);
+        let mut a2 = gather(|filter| filter.a2);
+        let mut a3 = gather(|filter| filter.a3);
+        let mut k = gather(|filter| filter.k);
+        let a1_step = gather(|filter| filter.a1_step);
+        let a2_step = gather(|filter| filter.a2_step);
+        let a3_step = gather(|filter| filter.a3_step);
+        let k_step = gather(|filter| filter.k_step);
+        let mut ic1eq = gather(|filter| filter.ic1eq);
+        let mut ic2eq = gather(|filter| filter.ic2eq);
+        let two = f32x8::splat(2.0);
+
+        let mut input = [0.0_f32; SVF_LANES];
+        for sample in 0..block_len {
+            for (value, lane) in input.iter_mut().zip(lanes.iter()) {
+                if let Some((_, buffer)) = lane {
+                    *value = buffer[sample];
+                }
+            }
+            let input = f32x8::new(input);
+
+            // The same operations, in the same order, as `process()`
+            a1 += a1_step;
+            a2 += a2_step;
+            a3 += a3_step;
+            k += k_step;
+
+            let v3 = input - ic2eq;
+            let v1 = (a1 * ic1eq) + (a2 * v3);
+            let v2 = ic2eq + (a2 * ic1eq) + (a3 * v3);
+
+            ic1eq = (two * v1) - ic1eq;
+            ic2eq = (two * v2) - ic2eq;
+
+            let output = match filter_type {
+                FilterType::Lowpass => v2,
+                FilterType::Bandpass => v1,
+                FilterType::Highpass => input - k * v1 - v2,
+            };
+            for (value, lane) in output.to_array().iter().zip(lanes.iter_mut()) {
+                if let Some((_, buffer)) = lane {
+                    buffer[sample] = *value;
+                }
+            }
+        }
+
+        // Scatter the state back
+        let (a1, a2, a3, k) = (a1.to_array(), a2.to_array(), a3.to_array(), k.to_array());
+        let (ic1eq, ic2eq) = (ic1eq.to_array(), ic2eq.to_array());
+        for (lane, entry) in lanes.iter_mut().enumerate() {
+            if let Some((filter, _)) = entry {
+                filter.a1 = a1[lane];
+                filter.a2 = a2[lane];
+                filter.a3 = a3[lane];
+                filter.k = k[lane];
+                filter.ic1eq = ic1eq[lane];
+                filter.ic2eq = ic2eq[lane];
+            }
+        }
     }
 }
 impl Filter for SvfSimper {
@@ -149,5 +249,61 @@ impl Filter for SvfSimper {
 
     fn set_filter_type(&mut self, filter_type: FilterType) {
         self.filter_type = filter_type;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lockstep block processing produces exactly the same samples and state as processing
+    /// each filter on its own, for every filter type and any number of present lanes, while
+    /// the coefficients ramp.
+    #[test]
+    fn lockstep_matches_scalar_processing_exactly() {
+        let input: Vec<f32> = (0..256)
+            .map(|i| ((i % 97) as f32 / 48.5 - 1.0) * 0.5 + ((i % 61) as f32 / 30.5 - 1.0) * 0.3)
+            .collect();
+        for filter_type in [FilterType::Lowpass, FilterType::Bandpass, FilterType::Highpass] {
+            for lanes in [1, 3, 8] {
+                let make = |lane: usize| {
+                    let mut filter = SvfSimper::new(300.0 + 500.0 * lane as f32, 0.3, 44100.0);
+                    filter.filter_type = filter_type;
+                    filter
+                };
+                let mut scalar: Vec<SvfSimper> = (0..lanes).map(make).collect();
+                let mut lockstep: Vec<SvfSimper> = (0..lanes).map(make).collect();
+                let mut expected = vec![input.clone(); lanes];
+                let mut buffers = vec![input.clone(); lanes];
+
+                for start in (0..input.len()).step_by(32) {
+                    let end = (start + 32).min(input.len());
+                    for lane in 0..lanes {
+                        let cutoff = 400.0 + 900.0 * lane as f32 + start as f32;
+                        scalar[lane].set_params_ramped(44100.0, cutoff, 2.0, end - start);
+                        lockstep[lane].set_params_ramped(44100.0, cutoff, 2.0, end - start);
+                        for sample in &mut expected[lane][start..end] {
+                            *sample = scalar[lane].process(*sample);
+                        }
+                    }
+                    let mut entries: Vec<Option<(&mut SvfSimper, &mut [f32])>> = lockstep
+                        .iter_mut()
+                        .zip(buffers.iter_mut())
+                        .map(|(filter, buffer)| Some((filter, &mut buffer[start..end])))
+                        .collect();
+                    entries.resize_with(SVF_LANES, || None);
+                    let entries: [Option<(&mut SvfSimper, &mut [f32])>; SVF_LANES] =
+                        entries.try_into().ok().unwrap();
+                    SvfSimper::process_block_x8(entries);
+                }
+
+                for lane in 0..lanes {
+                    assert_eq!(buffers[lane], expected[lane], "{filter_type:?} lane {lane} of {lanes}");
+                    assert!(expected[lane].iter().any(|sample| sample.abs() > 1e-3));
+                    // and the state is carried over identically
+                    assert_eq!(scalar[lane].process(0.25), lockstep[lane].process(0.25));
+                }
+            }
+        }
     }
 }

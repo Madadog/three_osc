@@ -98,6 +98,16 @@ fn select_sweep(osc: &mut OscillatorParams) {
 fn benchmark_synth() {
     println!("\nwavetable lookups: {:?}", SimdLevel::detect());
     measure("default patch (1 saw, 8 notes)", |_| {});
+    measure("default patch, no filter", |plugin| {
+        plugin.synth.filter_controller.filter_model = FilterModel::None;
+    });
+    measure("3 silent oscs (control rate + SVF only)", |plugin| {
+        plugin.synth.oscillators.iter_mut().for_each(|osc| osc.amp = 0.0);
+    });
+    measure("3 silent oscs, no filter (control rate only)", |plugin| {
+        plugin.synth.oscillators.iter_mut().for_each(|osc| osc.amp = 0.0);
+        plugin.synth.filter_controller.filter_model = FilterModel::None;
+    });
     measure("3 x saw, unison 8", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(supersaw);
     });
@@ -164,6 +174,36 @@ fn benchmark_synth() {
             osc.fm = 0.01;
         });
     });
+}
+
+/// The control rate update on its own: pitch, envelopes, LFO and filter coefficients for 8
+/// voices, per block of `CONTROL_BLOCK_SAMPLES` samples.
+#[test]
+#[ignore]
+fn benchmark_control_rate() {
+    use crate::synth::CONTROL_BLOCK_SAMPLES;
+    for (name, model) in [
+        ("digital filter", FilterModel::SvfSimperFilter),
+        ("ladder filter", FilterModel::LadderFilter),
+        ("no filter", FilterModel::None),
+    ] {
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.apply_params();
+        plugin.synth.filter_controller.filter_model = model;
+        for note in CHORD {
+            plugin.synth.note_on(note, 100);
+        }
+        plugin.synth.run_control_updates_only(100);
+        let blocks = 20_000;
+        let start = Instant::now();
+        plugin.synth.run_control_updates_only(blocks);
+        let elapsed = start.elapsed();
+        let per_voice_block = elapsed.as_nanos() as f64 / (blocks * CHORD.len()) as f64;
+        println!(
+            "control rate update, {name:<16} {per_voice_block:>7.1} ns per voice per block ({:.1} ns/sample for 8 notes)",
+            per_voice_block * CHORD.len() as f64 / CONTROL_BLOCK_SAMPLES as f64
+        );
+    }
 }
 
 /// How much of the lookup cost is memory: the supersaw patch with the wavetables shrunk so that

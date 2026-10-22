@@ -1,6 +1,6 @@
 use self::ladder::tanh_pade32_f32;
 pub(crate) use self::ladder::{LadderFilter, LADDER_LANES};
-use self::svf_simper::SvfSimper;
+pub(crate) use self::svf_simper::{SvfSimper, SVF_LANES};
 
 use super::lerp;
 
@@ -267,7 +267,9 @@ impl FilterContainer {
                 *x = FilterContainer::RcFilter(filter)
             },
             (x, FilterModel::LadderFilter) => {
-                *x = FilterContainer::LadderFilter(LadderFilter::default())
+                let mut filter = LadderFilter::default();
+                filter.set_sample_rate(sample_rate as f64);
+                *x = FilterContainer::LadderFilter(filter)
             }
             (x, FilterModel::BiquadFilter) => {
                 *x = FilterContainer::BiquadFilter(BiquadFilter::with_params(

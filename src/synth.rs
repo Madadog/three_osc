@@ -8,6 +8,7 @@ use self::filter::FilterContainer;
 use self::filter::FilterController;
 #[cfg(target_arch = "x86_64")]
 use self::filter::{LadderFilter, LADDER_LANES};
+use self::filter::{SvfSimper, SVF_LANES};
 use self::notes::Notes;
 use self::oscillator::BlockOutput;
 use self::oscillator::BlockParams;
@@ -217,6 +218,7 @@ impl ThreeOsc {
             stereo,
             octave_detune: self.octave_detune,
             portamento_rate: self.portamento_rate,
+            portamento_block: (1.0 - self.portamento_rate).powi(CONTROL_BLOCK_SAMPLES as i32),
             active,
             simd: self.simd,
             interpolation: self.interpolation,
@@ -252,6 +254,39 @@ impl ThreeOsc {
             *out_r *= self.output_volume;
         }
     }
+    /// Runs only the control rate update of every voice for `blocks` blocks, for the benchmarks.
+    #[cfg(test)]
+    pub(crate) fn run_control_updates_only(&mut self, blocks: usize) {
+        self.release_voices();
+        let stereo = self.stereo_width > 0.0;
+        for osc in self.oscillators.iter_mut() {
+            osc.update_total_pitch();
+            osc.update_unison_amp();
+            osc.update_detune_factors();
+            osc.update_frames(&self.waves);
+        }
+        let active: [bool; 3] = std::array::from_fn(|i| self.oscillators[i].amp > 0.0);
+        let context = VoiceContext {
+            oscillators: &self.oscillators,
+            waves: &self.waves,
+            filter_controller: &self.filter_controller,
+            gain_envelope: &self.gain_envelope,
+            lfo_params: &self.lfo_params,
+            sample_rate: self.sample_rate as f32,
+            stereo,
+            octave_detune: self.octave_detune,
+            portamento_rate: self.portamento_rate,
+            portamento_block: (1.0 - self.portamento_rate).powi(CONTROL_BLOCK_SAMPLES as i32),
+            active,
+            simd: self.simd,
+            interpolation: self.interpolation,
+        };
+        for _ in 0..blocks {
+            for voice in self.voices.iter_mut() {
+                voice.update_controls(&context, CONTROL_BLOCK_SAMPLES);
+            }
+        }
+    }
     pub fn pitch_bend(&mut self, bend: u16) {
         let bend = (bend as i32 - 8192) as f32 / 8192.0 * self.bend_range;
         for osc in self.oscillators.iter_mut() {
@@ -279,6 +314,8 @@ struct VoiceContext<'a> {
     stereo: bool,
     octave_detune: f32,
     portamento_rate: f32,
+    /// The portamento rate applied over a whole control rate block.
+    portamento_block: f32,
     /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
     /// modulate anything are skipped.
     active: [bool; 3],
@@ -314,6 +351,8 @@ pub struct Voice {
     osc_gain_step: [f32; 3],
     /// Scales each oscillator's output before it modulates the oscillator before it.
     osc_mod_scale: [f32; 3],
+    /// Whether each oscillator's ramps were set up in the previous block.
+    osc_ready: [bool; 3],
     /// The voice's gain: amplitude envelope times velocity.
     gain: f32,
     gain_step: f32,
@@ -350,6 +389,7 @@ impl Voice {
             osc_gain: [0.0; 3],
             osc_gain_step: [0.0; 3],
             osc_mod_scale: [1.0; 3],
+            osc_ready: [false; 3],
             gain: 0.0,
             gain_step: 0.0,
             drive: 1.0,
@@ -365,7 +405,7 @@ impl Voice {
     /// The voice's base phase delta, in cycles per sample.
     pub fn delta(&self, sample_rate: f32) -> f32 {
         440.0
-            * 2.0_f32.powf(
+            * fastmath::exp2(
                 (((self.id as i16 - 69) as f32 + self.semitone_detune) * self.pitch_multiply)
                     / 12.0,
             )
@@ -394,7 +434,11 @@ impl Voice {
         let first_block = block_start == 0;
 
         // Portamento, applied for the whole block at once
-        self.semitone_detune *= (1.0 - context.portamento_rate).powi(block_len as i32);
+        self.semitone_detune *= if block_len == CONTROL_BLOCK_SAMPLES {
+            context.portamento_block
+        } else {
+            (1.0 - context.portamento_rate).powi(block_len as i32)
+        };
         self.pitch_multiply = context.octave_detune;
         let delta = self.delta(sample_rate);
 
@@ -405,12 +449,23 @@ impl Voice {
         let lfo = lfo_params.wave.generate(lfo_phase);
         let lfo_unipolar = (lfo + 1.0) / 2.0;
 
-        let keytrack_freq = 2.0_f32.powf(
+        let keytrack_freq = fastmath::exp2(
             (self.id as f32 - 69.0 + self.semitone_detune) / 12.0
                 * context.filter_controller.keytrack,
         );
 
         for (i, osc) in context.oscillators.iter().enumerate() {
+            if !context.active[i] {
+                // Silent and not modulating anything: nothing of it is rendered this block, and
+                // its ramps start afresh if it becomes active.
+                self.osc_ready[i] = false;
+                continue;
+            }
+            // A new voice, or an oscillator that was switched on, starts from its target values
+            // instead of ramping towards them.
+            let first_block = first_block || !self.osc_ready[i];
+            self.osc_ready[i] = true;
+
             // The LFO modulates either all oscillators or only the target. The modulation
             // amount is modulated on the target's modulator, which is the oscillator after it.
             let targeted = lfo_params.target_osc.is_none_or(|target| target == i);
@@ -584,48 +639,109 @@ impl Voice {
         out_right: &mut [f32],
     ) {
         let block_len = block_len.min(out_left.len()).min(out_right.len());
-        for sample in 0..block_len {
-            out_left[sample] += self.pre_filter[sample] * self.gain;
-            out_right[sample] += if stereo {
-                self.pre_filter_right[sample] * self.gain
-            } else {
-                self.pre_filter[sample] * self.gain
-            };
-            self.gain += self.gain_step;
+        // The gain of each sample is computed from its index rather than accumulated, so the
+        // samples don't depend on each other and the loop vectorises.
+        let (gain, step) = (self.gain, self.gain_step);
+        let left = &self.pre_filter[..block_len];
+        let out_left = &mut out_left[..block_len];
+        let out_right = &mut out_right[..block_len];
+        if stereo {
+            let right = &self.pre_filter_right[..block_len];
+            for (n, (((out_l, out_r), left), right)) in
+                izip!(out_left, out_right).zip(left).zip(right).enumerate()
+            {
+                let gain = gain + step * n as f32;
+                *out_l += left * gain;
+                *out_r += right * gain;
+            }
+        } else {
+            for (n, ((out_l, out_r), left)) in izip!(out_left, out_right).zip(left).enumerate() {
+                let sample = left * (gain + step * n as f32);
+                *out_l += sample;
+                *out_r += sample;
+            }
         }
+        self.gain = gain + step * block_len as f32;
     }
 }
 
-/// Runs every voice's filter over the current block. Ladder filters are processed several
-/// voices at a time when the CPU allows it.
+/// Runs every voice's filter over the current block. The Digital (SVF) and Ladder filters are
+/// processed several voices at a time, in lockstep.
 fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: SimdLevel) {
-    #[cfg(target_arch = "x86_64")]
-    if simd.has_avx() {
-        for chunk in voices.chunks_mut(LADDER_LANES) {
-            filter_chunk_lockstep(chunk, block_len, stereo);
+    // Every voice is configured from the same controller before being filtered, so they all
+    // use the same filter model and the first voice's picks the lockstep kernel. Any voice that
+    // doesn't match it is filtered one sample at a time.
+    match voices.first().map(|voice| &voice.filter) {
+        Some(FilterContainer::SvfSimperFilter(_)) => {
+            for chunk in voices.chunks_mut(SVF_LANES) {
+                filter_chunk_lockstep::<SvfSimper, SVF_LANES>(
+                    chunk,
+                    block_len,
+                    stereo,
+                    |filter| match filter {
+                        FilterContainer::SvfSimperFilter(svf) => Ok(svf),
+                        other => Err(other),
+                    },
+                    SvfSimper::process_block_x8,
+                );
+            }
         }
-        return;
-    }
-    let _ = simd;
-    for voice in voices {
-        voice.filter_block(block_len, stereo);
+        #[cfg(target_arch = "x86_64")]
+        Some(FilterContainer::LadderFilter(_)) if simd.has_avx() => {
+            for chunk in voices.chunks_mut(LADDER_LANES) {
+                filter_chunk_lockstep::<LadderFilter, LADDER_LANES>(
+                    chunk,
+                    block_len,
+                    stereo,
+                    |filter| {
+                        let lockstep = matches!(
+                            filter,
+                            FilterContainer::LadderFilter(ladder) if ladder.supports_lockstep()
+                        );
+                        if !lockstep {
+                            return Err(filter);
+                        }
+                        match filter {
+                            FilterContainer::LadderFilter(ladder) => Ok(ladder),
+                            other => Err(other),
+                        }
+                    },
+                    // SAFETY: this path is only taken when the CPU supports AVX.
+                    |lanes| unsafe { LadderFilter::process_block_x4(lanes) },
+                );
+            }
+        }
+        _ => {
+            let _ = simd;
+            for voice in voices {
+                voice.filter_block(block_len, stereo);
+            }
+        }
     }
 }
 
 /// Runs a filter over a block of samples, in place.
 fn filter_samples(filter: &mut FilterContainer, samples: &mut [f32]) {
+    if matches!(filter, FilterContainer::None) {
+        return;
+    }
     for sample in samples {
         *sample = filter.process(*sample);
     }
 }
 
-/// Filters up to [`LADDER_LANES`] voices, running their ladder filters in lockstep. Voices with
-/// other filters are processed one at a time.
-#[cfg(target_arch = "x86_64")]
-fn filter_chunk_lockstep(chunk: &mut [Voice], block_len: usize, stereo: bool) {
-    const NONE: Option<(&mut LadderFilter, &mut [f32])> = None;
-    let mut left = [NONE; LADDER_LANES];
-    let mut right = [NONE; LADDER_LANES];
+/// Filters a chunk of up to `N` voices: the filters that `select` picks out run in lockstep
+/// through `process`, the rest one sample at a time. In stereo the right channel's filters form
+/// a second set of lanes.
+fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
+    chunk: &'a mut [Voice],
+    block_len: usize,
+    stereo: bool,
+    select: impl Fn(&mut FilterContainer) -> Result<&mut F, &mut FilterContainer>,
+    process: impl Fn([Option<(&mut F, &mut [f32])>; N]),
+) {
+    let mut left: [Option<(&'a mut F, &'a mut [f32])>; N] = std::array::from_fn(|_| None);
+    let mut right: [Option<(&'a mut F, &'a mut [f32])>; N] = std::array::from_fn(|_| None);
     for (lane, voice) in chunk.iter_mut().enumerate() {
         let Voice {
             filter,
@@ -634,37 +750,31 @@ fn filter_chunk_lockstep(chunk: &mut [Voice], block_len: usize, stereo: bool) {
             pre_filter_right,
             ..
         } = voice;
-        let lockstep = |filter: &FilterContainer| {
-            matches!(filter, FilterContainer::LadderFilter(ladder) if ladder.supports_lockstep())
+        let assign = |filter: &'a mut FilterContainer,
+                          buffer: &'a mut [f32],
+                          lanes: &mut [Option<(&'a mut F, &'a mut [f32])>; N]| {
+            match select(filter) {
+                Ok(filter) => lanes[lane] = Some((filter, buffer)),
+                Err(filter) => filter_samples(filter, buffer),
+            }
         };
-        if lockstep(filter) && (!stereo || lockstep(filter_right)) {
-            if let FilterContainer::LadderFilter(ladder) = filter {
-                left[lane] = Some((ladder, &mut pre_filter[..block_len]));
-            }
-            if stereo {
-                if let FilterContainer::LadderFilter(ladder) = filter_right {
-                    right[lane] = Some((ladder, &mut pre_filter_right[..block_len]));
-                }
-            }
-        } else {
-            filter_samples(filter, &mut pre_filter[..block_len]);
-            if stereo {
-                filter_samples(filter_right, &mut pre_filter_right[..block_len]);
-            }
+        assign(filter, &mut pre_filter[..block_len], &mut left);
+        if stereo {
+            assign(filter_right, &mut pre_filter_right[..block_len], &mut right);
         }
     }
-    // SAFETY: `filter_voices()` only takes this path when the CPU supports AVX.
-    unsafe {
-        LadderFilter::process_block_x4(left);
-        if stereo {
-            LadderFilter::process_block_x4(right);
-        }
+    process(left);
+    if stereo {
+        process(right);
     }
 }
 
+pub mod fastmath;
 pub mod oscillator;
 
 mod envelopes {
+    use super::fastmath;
+
     #[derive(Debug, Clone)]
     pub struct AdsrEnvelope {
         pub attack_time: f32,
@@ -713,10 +823,12 @@ mod envelopes {
         /// it was started samples the envelope at index 0).
         pub fn sample_held(&self, index: f32) -> f32 {
             if index < self.attack_time {
-                (index / self.attack_time).powf(self.attack_slope)
+                fastmath::pow(index / self.attack_time, self.attack_slope)
             } else if index - self.attack_time < self.decay_time {
-                (1.0 - (index - self.attack_time) / self.decay_time).powf(self.slope)
-                    * (1.0 - self.sustain_level)
+                fastmath::pow(
+                    1.0 - (index - self.attack_time) / self.decay_time,
+                    self.slope,
+                ) * (1.0 - self.sustain_level)
                     + self.sustain_level
             } else {
                 self.sustain_level
@@ -728,7 +840,8 @@ mod envelopes {
                 0.0
             } else {
                 let level = self.sample_held(release_index);
-                (1.0 - (index - release_index) / self.release_time).powf(self.slope) * level
+                fastmath::pow(1.0 - (index - release_index) / self.release_time, self.slope)
+                    * level
             }
         }
     }
@@ -744,8 +857,9 @@ pub struct LfoParams {
     pub target_osc: Option<usize>,
 }
 impl LfoParams {
+    /// The LFO's phase delta in cycles per sample.
     fn delta(&self, sample_rate: f32) -> f32 {
-        2.0 * PI * self.freq / sample_rate
+        self.freq / sample_rate
     }
 }
 impl Default for LfoParams {

@@ -1,12 +1,13 @@
 use std::{
     convert::TryInto,
-    f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4, PI, SQRT_2},
+    f32::consts::{FRAC_PI_4, PI, SQRT_2},
 };
 
 use itertools::izip;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use wide::{bytemuck::cast, f32x8, i32x8, u32x8};
 
+use super::fastmath;
 use super::lerp;
 
 /// Which SIMD instructions the wavetable lookups can use, detected at runtime.
@@ -165,18 +166,15 @@ pub fn wrap_cycles_signed(phase: f32) -> f32 {
     }
 }
 
-/// A single instance of a playing oscillator. Maintains phase in
-/// internal state
+/// A single instance of a playing oscillator (the LFO), with its phase in cycles.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OscVoice {
     pub phase: f32,
 }
 impl OscVoice {
-    pub fn new(phase: f32) -> Self {
-        Self { phase }
-    }
+    /// Advances the phase by `delta` cycles and returns the new phase, wrapped to `[0, 1)`.
     pub fn add_phase(&mut self, delta: f32) -> f32 {
-        self.phase = (self.phase + delta) % (2.0 * PI);
+        self.phase = wrap_cycles_signed(self.phase + delta);
         self.phase
     }
 }
@@ -429,49 +427,24 @@ pub enum OscWave {
 }
 
 impl OscWave {
-    /// Generates the waveform at the specified phase, attempting to keep waveform volumes
-    /// normalised.
-    pub fn generate_normalised(&self, phase: f32) -> f32 {
-        use OscWave::*;
-
-        match self {
-            Sine => phase.sin(),
-            Tri => {
-                if phase <= PI {
-                    (phase / PI) * 2.0 - 1.0
-                } else {
-                    ((-phase + 2.0 * PI) / PI) * 2.0 - 1.0
-                }
-            }
-            Saw => (phase - PI) / (2.0 * PI),
-            Exp => phase.sin().abs() - (0.5 + 0.5 / PI),
-            Square => {
-                if phase <= PI {
-                    FRAC_1_SQRT_2
-                } else {
-                    -FRAC_1_SQRT_2
-                }
-            }
-        }
-    }
-    /// Generates the waveform at the specified phase with all values
-    /// ranging from -1 and +1 peak to peak.
+    /// Generates the waveform at the given phase in cycles (`[0, 1)`), with all values ranging
+    /// from -1 to +1 peak to peak.
     pub fn generate(&self, phase: f32) -> f32 {
         use OscWave::*;
 
         match self {
-            Sine => phase.sin(),
+            Sine => fastmath::sin_cycles(phase),
             Tri => {
-                if phase <= PI {
-                    (phase / PI) * 2.0 - 1.0
+                if phase <= 0.5 {
+                    phase * 4.0 - 1.0
                 } else {
-                    ((-phase + 2.0 * PI) / PI) * 2.0 - 1.0
+                    3.0 - phase * 4.0
                 }
             }
-            Saw => (phase - PI) / (2.0 * PI),
-            Exp => phase.sin().abs() * 2.0 - 1.0,
+            Saw => phase * 2.0 - 1.0,
+            Exp => fastmath::sin_cycles(phase).abs() * 2.0 - 1.0,
             Square => {
-                if phase <= PI {
+                if phase <= 0.5 {
                     1.0
                 } else {
                     -1.0
@@ -1480,7 +1453,15 @@ impl WavetableNotes {
     /// of `delta` cycles per sample, i.e. `index` from `440.0 * 2.0_f32.powf(index / 12.0) =
     /// delta * sample_rate`, rounded up.
     pub fn cycles_to_note(delta: f32, sample_rate: f32) -> usize {
-        (((sample_rate * delta / 440.0).log2() * 12.0 + 69.0).ceil() as usize).clamp(0, 137)
+        let note = fastmath::log2(sample_rate * delta / 440.0) * 12.0 + 69.0;
+        // Rounded up, without the `ceil()` library call: `as` truncates, and saturates at 0.
+        let truncated = note as usize;
+        let note = if (truncated as f32) < note {
+            truncated + 1
+        } else {
+            truncated
+        };
+        note.min(137)
     }
     /// Generates a bandlimited wavetable for each midi note using fast fourier transforms, with constant wavetable length
     pub fn from_additive_osc_ifft(
