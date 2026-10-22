@@ -843,7 +843,14 @@ fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: Sim
                         FilterContainer::SvfSimperFilter(svf) => Ok(svf),
                         other => Err(other),
                     },
-                    SvfSimper::process_block_x8,
+                    |lanes| {
+                        #[cfg(target_arch = "x86_64")]
+                        if simd.has_avx() {
+                            // SAFETY: the CPU supports AVX.
+                            return unsafe { SvfSimper::process_block_x8_avx(lanes) };
+                        }
+                        SvfSimper::process_block_x8(lanes)
+                    },
                 );
             }
         }

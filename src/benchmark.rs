@@ -434,6 +434,59 @@ fn benchmark_ladder() {
     }
 }
 
+/// The digital (SVF) filter on its own, and eight in lockstep like the synth runs them.
+#[test]
+#[ignore]
+fn benchmark_svf() {
+    use crate::synth::filter::{SvfSimper, SVF_LANES};
+    let input: Vec<f32> = (0..4096).map(|i| (i % 100) as f32 / 50.0 - 1.0).collect();
+    let iterations = 400;
+    println!();
+
+    // The coefficients are left alone: setting them belongs to the control rate update
+    let mut filter = SvfSimper::new(2000.0, 0.3, SAMPLE_RATE as f32);
+    let mut sink = 0.0;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        for sample in &input {
+            sink += filter.process(*sample);
+        }
+    }
+    let ns_per_sample = start.elapsed().as_nanos() as f64 / (iterations * input.len()) as f64;
+    println!("{:<52} {ns_per_sample:>7.2} ns/sample", "digital filter");
+    assert!(sink.is_finite());
+
+    // In blocks of 32 samples, with every lane present
+    type Kernel = fn([Option<(&mut SvfSimper, &mut [f32])>; SVF_LANES]);
+    let mut kernels: Vec<(&str, Kernel)> =
+        vec![("digital filter, 8 in lockstep (per filter)", SvfSimper::process_block_x8)];
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx") {
+        // SAFETY: AVX was just detected.
+        kernels.push(("digital filter, 8 in lockstep, AVX (per filter)", |lanes| unsafe {
+            SvfSimper::process_block_x8_avx(lanes)
+        }));
+    }
+    for (name, kernel) in kernels {
+        let mut filters: Vec<SvfSimper> =
+            (0..SVF_LANES).map(|_| SvfSimper::new(2000.0, 0.3, SAMPLE_RATE as f32)).collect();
+        let mut buffers: Vec<Vec<f32>> = vec![input.clone(); SVF_LANES];
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for block in (0..input.len()).step_by(32) {
+                let mut pairs = filters.iter_mut().zip(buffers.iter_mut());
+                kernel(std::array::from_fn(|_| {
+                    pairs.next().map(|(filter, buffer)| (filter, &mut buffer[block..block + 32]))
+                }));
+            }
+        }
+        let ns_per_voice_sample =
+            start.elapsed().as_nanos() as f64 / (iterations * input.len() * SVF_LANES) as f64;
+        println!("{name:<52} {ns_per_voice_sample:>7.2} ns/sample");
+        assert!(buffers.iter().flatten().all(|sample| sample.is_finite()));
+    }
+}
+
 #[test]
 #[ignore]
 fn benchmark_wavetable_generation() {
