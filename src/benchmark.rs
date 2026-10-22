@@ -309,6 +309,55 @@ fn benchmark_lookup_kernel() {
             );
         }
     }
+
+    // The cost per voice at different unison voice counts (cubic, mono), where the kernels
+    // switch from running their vectors across time to running them across voices
+    println!();
+    let mut levels = vec![SimdLevel::Portable];
+    #[cfg(target_arch = "x86_64")]
+    if SimdLevel::detect() != SimdLevel::Portable {
+        levels.push(SimdLevel::Avx2);
+        levels.push(SimdLevel::Avx2Gather);
+    }
+    for (simd, voices) in levels
+        .into_iter()
+        .flat_map(|simd| [1_usize, 2, 3, 4, 7, 8, 16].map(|voices| (simd, voices)))
+    {
+        let mut osc = OscillatorParams::default();
+        osc.voice_count = voices as u8;
+        osc.voices_detune = 0.215;
+        osc.update_detune_factors();
+        osc.update_pan_gains(1.0);
+        let params = BlockParams {
+            delta: 0.0123,
+            delta_step: 0.0,
+            gain: 1.0,
+            gain_step: 0.0,
+            modulation: None,
+            voices,
+            detune_factors: &osc.detune_factors,
+            mask: &osc.voice_mask,
+            pan_left: &osc.pan_left,
+            pan_right: &osc.pan_right,
+        };
+        let mut voice = SuperVoice::new(0.0, 1.0);
+        let mut left = [0.0_f32; BLOCK];
+        let start = Instant::now();
+        for _ in 0..BLOCKS {
+            let mut output = BlockOutput {
+                left: &mut left,
+                right: None,
+                mono: None,
+            };
+            frames.render_block(&mut voice, &params, &mut output, simd, Interpolation::Cubic);
+        }
+        let ns = start.elapsed().as_nanos() as f64 / (BLOCKS * BLOCK) as f64;
+        println!(
+            "{simd:<12?} cubic, {voices:>2} unison voices: {ns:>6.2} ns/sample, {:>5.2} ns per voice",
+            ns / voices as f64
+        );
+        assert!(left.iter().all(|sample| sample.is_finite()));
+    }
 }
 
 /// The ladder filter on its own, and without its two oversampling related costs.

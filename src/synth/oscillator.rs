@@ -126,9 +126,11 @@ const NONE: u8 = 0;
 const LINEAR: u8 = 1;
 const CUBIC: u8 = 2;
 
-/// Up to this many unison voices are read one at a time instead of in SIMD vectors, since
-/// filling a vector for one or two voices costs more than it saves.
-const SCALAR_VOICE_LIMIT: usize = 3;
+/// Below this many unison voices, the oscillator kernels run their vectors across time (8
+/// consecutive samples of one voice) rather than across voices (one sample of 8 voices): for
+/// a few voices that saves summing the lanes of a vector at every sample, and from about 8
+/// voices on the two cost the same.
+const TIMEWISE_VOICE_LIMIT: usize = 8;
 
 /// Maximum number of unison voices per oscillator.
 pub const MAX_UNISON: usize = 32;
@@ -580,6 +582,7 @@ impl Wavetable {
         self.table.len() - TABLE_PADDING_BEFORE - TABLE_PADDING_AFTER
     }
     /// The cycle's samples, without the padding.
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn cycle(&self) -> &[f32] {
         &self.table[TABLE_PADDING_BEFORE..TABLE_PADDING_BEFORE + self.cycle_len()]
     }
@@ -602,6 +605,7 @@ impl Wavetable {
     /// Splits a fixed point phase into the index of the sample below it and the fraction of a
     /// sample above that.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn split_phase(&self, phase: u32) -> (usize, f32) {
         (
             (phase >> self.index_shift) as usize,
@@ -611,6 +615,7 @@ impl Wavetable {
     /// Reads the table at a fixed point phase with the given interpolation mode (an
     /// [`Interpolation`] discriminant).
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn read_fixed<const INTERP: u8>(&self, phase: u32) -> f32 {
         let (floor, frac) = self.split_phase(phase);
         self.read_taps::<INTERP>(floor, frac)
@@ -618,12 +623,14 @@ impl Wavetable {
     /// Reads the table at a fractional sample index in `[0, cycle_len)` with cubic
     /// interpolation. Out of range indices are clamped.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn read(&self, index: f32) -> f32 {
         self.read_with::<CUBIC>(index)
     }
     /// Reads the table at a fractional sample index in `[0, cycle_len)` with the given
     /// interpolation mode (an [`Interpolation`] discriminant). Out of range indices are clamped.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn read_with<const INTERP: u8>(&self, index: f32) -> f32 {
         let floor = (index as usize).min(self.cycle_len() - 1);
         self.read_taps::<INTERP>(floor, index - floor as f32)
@@ -631,6 +638,7 @@ impl Wavetable {
     /// Interpolates `frac` samples past sample `floor` of the cycle. The table is padded, so
     /// the 4 taps around any sample of the cycle are inside it.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     fn read_taps<const INTERP: u8>(&self, floor: usize, frac: f32) -> f32 {
         let taps = &self.table[floor..floor + 4];
         match INTERP {
@@ -641,6 +649,7 @@ impl Wavetable {
     }
     /// Generates a sample at the given phase in cycles, with cubic interpolation.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn generate(&self, phase: f32) -> f32 {
         self.read_fixed::<CUBIC>(cycles_to_fixed(phase))
     }
@@ -661,6 +670,7 @@ impl Wavetable {
 /// 4-point, 3rd-order Hermite (Catmull-Rom) interpolation between `y1` and `y2`, `t` samples
 /// past `y1`.
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
 pub fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
     let c1 = 0.5 * (y2 - y0);
     let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
@@ -733,18 +743,21 @@ pub struct BlockOutput<'a> {
 impl FramePair<'_> {
     /// Samples per cycle.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn cycle_len(&self) -> usize {
         self.a.cycle_len()
     }
     /// Reads the frames at a fractional sample index in `[0, cycle_len)` with cubic
     /// interpolation.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn read(&self, index: f32) -> f32 {
         self.read_with::<CUBIC>(index)
     }
     /// Reads the frames at a fractional sample index in `[0, cycle_len)` with the given
     /// interpolation mode (an [`Interpolation`] discriminant).
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn read_with<const INTERP: u8>(&self, index: f32) -> f32 {
         let a = self.a.read_with::<INTERP>(index);
         if self.mix > 0.0 {
@@ -755,6 +768,7 @@ impl FramePair<'_> {
     }
     /// Reads the frames at a fixed point phase with the given interpolation mode.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // only the reference reads in the tests use it
     pub fn read_fixed<const INTERP: u8>(&self, phase: u32) -> f32 {
         let a = self.a.read_fixed::<INTERP>(phase);
         if self.mix > 0.0 {
@@ -800,8 +814,22 @@ impl FramePair<'_> {
         output: &mut BlockOutput,
         simd: SimdLevel,
     ) {
-        if params.voices <= SCALAR_VOICE_LIMIT {
-            return lookup::scalar::render_block::<INTERP>(self, voice, params, output);
+        if params.voices < TIMEWISE_VOICE_LIMIT {
+            return match simd {
+                SimdLevel::Portable => {
+                    lookup::portable::render_block_timewise::<INTERP>(self, voice, params, output)
+                }
+                // SAFETY: the AVX2 levels are only produced by `SimdLevel::detect()` when the
+                // CPU supports AVX2 and FMA.
+                #[cfg(target_arch = "x86_64")]
+                SimdLevel::Avx2 => unsafe {
+                    lookup::avx2::render_block_timewise::<false, INTERP>(self, voice, params, output)
+                },
+                #[cfg(target_arch = "x86_64")]
+                SimdLevel::Avx2Gather => unsafe {
+                    lookup::avx2::render_block_timewise::<true, INTERP>(self, voice, params, output)
+                },
+            };
         }
         match simd {
             SimdLevel::Portable => {
@@ -921,61 +949,6 @@ mod lookup {
         }
     }
 
-    /// Up to [`SCALAR_VOICE_LIMIT`] voices, one at a time.
-    pub mod scalar {
-        use super::*;
-
-        pub fn render_block<const INTERP: u8>(
-            frames: &FramePair,
-            voice: &mut SuperVoice,
-            params: &BlockParams,
-            output: &mut BlockOutput,
-        ) {
-            let voices = params.voices.min(SCALAR_VOICE_LIMIT);
-            let mut phases = [0_u32; SCALAR_VOICE_LIMIT];
-            let mut deltas = [0_u32; SCALAR_VOICE_LIMIT];
-            let mut delta_steps = [0_u32; SCALAR_VOICE_LIMIT];
-            for i in 0..voices {
-                let factor = lane(params.detune_factors, i);
-                phases[i] = lane_u32(&voice.voice_phases, i);
-                deltas[i] = cycles_to_fixed(params.delta * factor);
-                delta_steps[i] = cycles_to_fixed(params.delta_step * factor);
-            }
-            let stereo = output.right.is_some();
-            let needs_mono = !stereo || output.mono.is_some();
-
-            let mut controls = Controls::new(params);
-            for n in 0..output.left.len() {
-                let sample = controls.next(n);
-                if let Some(delta) = sample.fm_delta {
-                    for (i, voice_delta) in deltas.iter_mut().enumerate().take(voices) {
-                        *voice_delta = cycles_to_fixed(delta * lane(params.detune_factors, i));
-                    }
-                }
-                let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
-                for i in 0..voices {
-                    phases[i] = phases[i].wrapping_add(deltas[i]);
-                    if sample.fm_delta.is_none() {
-                        deltas[i] = deltas[i].wrapping_add(delta_steps[i]);
-                    }
-                    let value =
-                        frames.read_fixed::<INTERP>(phases[i].wrapping_add(sample.phase_offset));
-                    if needs_mono {
-                        mono += value * lane(params.mask, i);
-                    }
-                    if stereo {
-                        left += value * lane(params.pan_left, i);
-                        right += value * lane(params.pan_right, i);
-                    }
-                }
-                write_sample(output, n, sample.gain, || mono, || left, || right);
-            }
-            for (i, phase) in phases.iter().enumerate().take(voices) {
-                *lane_u32_mut(&mut voice.voice_phases, i) = *phase;
-            }
-        }
-    }
-
     /// The `wide` path: vector arithmetic (SSE2 or NEON), scalar table reads.
     pub mod portable {
         use super::*;
@@ -1069,6 +1042,160 @@ mod lookup {
                 a + (b - a) * f32x8::splat(frames.mix)
             } else {
                 a
+            }
+        }
+
+        /// Samples per chunk of [`render_block_timewise()`].
+        const CHUNK: usize = 32;
+        const CHUNK_VECTORS: usize = CHUNK / UNISON_LANES;
+
+        /// Renders a block with the vectors running across time rather than across voices,
+        /// for a few voices: the portable version of the AVX2
+        /// [`render_block_timewise()`][super::avx2::render_block_timewise()], see there.
+        pub fn render_block_timewise<const INTERP: u8>(
+            frames: &FramePair,
+            voice: &mut SuperVoice,
+            params: &BlockParams,
+            output: &mut BlockOutput,
+        ) {
+            let voices = params.voices.min(MAX_UNISON);
+            let stereo = output.right.is_some();
+            let needs_mono = !stereo || output.mono.is_some();
+            let fm = params.modulation.as_ref().is_some_and(|modulation| modulation.fm > 0.0);
+            let len = output.left.len();
+
+            let mut phases = [0_u32; MAX_UNISON];
+            let mut deltas = [0_u32; MAX_UNISON];
+            let mut delta_steps = [0_u32; MAX_UNISON];
+            for i in 0..voices {
+                let factor = lane(params.detune_factors, i);
+                phases[i] = lane_u32(&voice.voice_phases, i);
+                deltas[i] = cycles_to_fixed(params.delta * factor);
+                delta_steps[i] = cycles_to_fixed(params.delta_step * factor);
+            }
+            // `n + 1` and `n (n + 1) / 2` for the samples of a chunk
+            let counts: [u32x8; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                u32x8::new(std::array::from_fn(|lane| (vector * UNISON_LANES + lane + 1) as u32))
+            });
+            let triangles: [u32x8; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                u32x8::new(std::array::from_fn(|lane| {
+                    let n = (vector * UNISON_LANES + lane) as u32;
+                    n * (n + 1) / 2
+                }))
+            });
+
+            let mut controls = Controls::new(params);
+            let mut start = 0;
+            while start < len {
+                let end = (start + CHUNK).min(len);
+                let chunk_len = end - start;
+                let vectors = chunk_len.div_ceil(UNISON_LANES);
+
+                let mut gains = [0.0_f32; CHUNK];
+                let mut offsets = [0_u32; CHUNK];
+                let mut fm_deltas = [0.0_f32; CHUNK];
+                if params.modulation.is_some() {
+                    for n in 0..chunk_len {
+                        let sample = controls.next(start + n);
+                        gains[n] = sample.gain;
+                        offsets[n] = sample.phase_offset;
+                        if let Some(delta) = sample.fm_delta {
+                            fm_deltas[n] = delta;
+                        }
+                    }
+                } else {
+                    for (n, gain) in gains.iter_mut().enumerate() {
+                        *gain = params.gain + (start + n) as f32 * params.gain_step;
+                    }
+                }
+                let offsets: [u32x8; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                    u32x8::new(offsets[vector * UNISON_LANES..][..UNISON_LANES].try_into().unwrap())
+                });
+
+                let mut mono = [f32x8::ZERO; CHUNK_VECTORS];
+                let mut left = [f32x8::ZERO; CHUNK_VECTORS];
+                let mut right = [f32x8::ZERO; CHUNK_VECTORS];
+                for i in 0..voices {
+                    let mut voice_phases = [u32x8::ZERO; CHUNK_VECTORS];
+                    if fm {
+                        let factor = lane(params.detune_factors, i);
+                        let mut stepped = [0_u32; CHUNK];
+                        let (mut phase, mut delta) = (phases[i], deltas[i]);
+                        for (phase_out, &fm_delta) in stepped.iter_mut().zip(&fm_deltas).take(chunk_len) {
+                            delta = cycles_to_fixed(fm_delta * factor);
+                            phase = phase.wrapping_add(delta);
+                            *phase_out = phase;
+                        }
+                        (phases[i], deltas[i]) = (phase, delta);
+                        for (vector, phases_out) in voice_phases.iter_mut().enumerate().take(vectors) {
+                            *phases_out = u32x8::new(
+                                stepped[vector * UNISON_LANES..][..UNISON_LANES].try_into().unwrap(),
+                            );
+                        }
+                    } else {
+                        let (phase, delta, step) = (phases[i], deltas[i], delta_steps[i]);
+                        let (phase_v, delta_v, step_v) =
+                            (u32x8::splat(phase), u32x8::splat(delta), u32x8::splat(step));
+                        for (vector, phases_out) in voice_phases.iter_mut().enumerate().take(vectors) {
+                            *phases_out =
+                                phase_v + (counts[vector] * delta_v + triangles[vector] * step_v);
+                        }
+                        let l = chunk_len as u32;
+                        phases[i] = phase
+                            .wrapping_add(l.wrapping_mul(delta))
+                            .wrapping_add((l * (l - 1) / 2).wrapping_mul(step));
+                        deltas[i] = delta.wrapping_add(l.wrapping_mul(step));
+                    }
+
+                    let mask = f32x8::splat(lane(params.mask, i));
+                    let pan_left = f32x8::splat(lane(params.pan_left, i));
+                    let pan_right = f32x8::splat(lane(params.pan_right, i));
+                    for vector in 0..vectors {
+                        let samples =
+                            read_frames8::<INTERP>(frames, voice_phases[vector] + offsets[vector]);
+                        if needs_mono {
+                            mono[vector] += samples * mask;
+                        }
+                        if stereo {
+                            left[vector] += samples * pan_left;
+                            right[vector] += samples * pan_right;
+                        }
+                    }
+                }
+
+                let unpack = |vectors: &[f32x8; CHUNK_VECTORS]| {
+                    let mut values = [0.0_f32; CHUNK];
+                    for (vector, value) in vectors.iter().enumerate() {
+                        values[vector * UNISON_LANES..][..UNISON_LANES]
+                            .copy_from_slice(value.as_array());
+                    }
+                    values
+                };
+                if stereo {
+                    let (left, right) = (unpack(&left), unpack(&right));
+                    let right_out = output.right.as_deref_mut().unwrap();
+                    for n in 0..chunk_len {
+                        output.left[start + n] += left[n] * gains[n];
+                        right_out[start + n] += right[n] * gains[n];
+                    }
+                }
+                if needs_mono {
+                    let mono = unpack(&mono);
+                    if !stereo {
+                        for n in 0..chunk_len {
+                            output.left[start + n] += mono[n] * gains[n];
+                        }
+                    }
+                    if let Some((mono_out, scale)) = &mut output.mono {
+                        for n in 0..chunk_len {
+                            mono_out[start + n] = mono[n] * *scale;
+                        }
+                    }
+                }
+                start = end;
+            }
+            for (i, phase) in phases.iter().enumerate().take(voices) {
+                *lane_u32_mut(&mut voice.voice_phases, i) = *phase;
             }
         }
 
@@ -1337,6 +1464,192 @@ mod lookup {
                 _mm256_fmadd_ps(_mm256_sub_ps(b, a), _mm256_set1_ps(mix), a)
             } else {
                 a
+            }
+        }
+
+        /// Samples per chunk of [`render_block_timewise()`].
+        const CHUNK: usize = 32;
+        const CHUNK_VECTORS: usize = CHUNK / UNISON_LANES;
+
+        /// Renders a block like [`render_block()`], but with the vectors running across time
+        /// rather than across voices: each vector holds 8 consecutive samples of one voice.
+        /// That needs no sum across the lanes of a vector for every sample, and no per sample
+        /// bookkeeping beyond the controls, which makes it much cheaper for a few voices.
+        ///
+        /// Without frequency modulation a voice's phases have a closed form: with the phase
+        /// `P` and delta `D` at the start of a chunk and the delta step `S`, sample `n`'s phase
+        /// is `P + (n + 1) D + n (n + 1) / 2 S`, in wrapping 32-bit arithmetic, which is
+        /// exactly what adding up the deltas one sample at a time gives. With frequency
+        /// modulation every sample has its own delta, so they are added up one at a time.
+        #[target_feature(enable = "avx2,fma")]
+        pub unsafe fn render_block_timewise<const GATHER: bool, const INTERP: u8>(
+            frames: &FramePair,
+            voice: &mut SuperVoice,
+            params: &BlockParams,
+            output: &mut BlockOutput,
+        ) {
+            let table_a = Table::new(frames.a);
+            let table_b = Table::new(frames.b);
+            let voices = params.voices.min(MAX_UNISON);
+            let stereo = output.right.is_some();
+            let needs_mono = !stereo || output.mono.is_some();
+            let fm = params.modulation.as_ref().is_some_and(|modulation| modulation.fm > 0.0);
+            let len = output.left.len();
+
+            // Per voice phase state, as in the reference (one voice and sample at a time)
+            let mut phases = [0_u32; MAX_UNISON];
+            let mut deltas = [0_u32; MAX_UNISON];
+            let mut delta_steps = [0_u32; MAX_UNISON];
+            for i in 0..voices {
+                let factor = lane(params.detune_factors, i);
+                phases[i] = lane_u32(&voice.voice_phases, i);
+                deltas[i] = cycles_to_fixed(params.delta * factor);
+                delta_steps[i] = cycles_to_fixed(params.delta_step * factor);
+            }
+            // `n + 1` and `n (n + 1) / 2` for the samples of a chunk
+            let counts: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                let n = |lane: i32| vector as i32 * UNISON_LANES as i32 + lane;
+                _mm256_setr_epi32(n(1), n(2), n(3), n(4), n(5), n(6), n(7), n(8))
+            });
+            let triangles: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                let t = |lane: i32| {
+                    let n = vector as i32 * UNISON_LANES as i32 + lane;
+                    n * (n + 1) / 2
+                };
+                _mm256_setr_epi32(t(0), t(1), t(2), t(3), t(4), t(5), t(6), t(7))
+            });
+
+            let mut controls = Controls::new(params);
+            let mut start = 0;
+            while start < len {
+                let end = (start + CHUNK).min(len);
+                let chunk_len = end - start;
+                let vectors = chunk_len.div_ceil(UNISON_LANES);
+
+                // The controls of each sample of the chunk. Without modulation there is only
+                // the gain ramp, which is worked out directly rather than added up one sample
+                // at a time (a chain of dependent additions, the slowest part for one voice).
+                let mut gains = [0.0_f32; CHUNK];
+                let mut offsets = [0_u32; CHUNK];
+                let mut fm_deltas = [0.0_f32; CHUNK];
+                if params.modulation.is_some() {
+                    for n in 0..chunk_len {
+                        let sample = controls.next(start + n);
+                        gains[n] = sample.gain;
+                        offsets[n] = sample.phase_offset;
+                        if let Some(delta) = sample.fm_delta {
+                            fm_deltas[n] = delta;
+                        }
+                    }
+                } else {
+                    for (n, gain) in gains.iter_mut().enumerate() {
+                        *gain = params.gain + (start + n) as f32 * params.gain_step;
+                    }
+                }
+                let offsets: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                    _mm256_loadu_si256(offsets.as_ptr().add(vector * UNISON_LANES) as *const __m256i)
+                });
+
+                let mut mono = [_mm256_setzero_ps(); CHUNK_VECTORS];
+                let mut left = [_mm256_setzero_ps(); CHUNK_VECTORS];
+                let mut right = [_mm256_setzero_ps(); CHUNK_VECTORS];
+                for i in 0..voices {
+                    // The phases of the voice at each sample of the chunk
+                    let mut voice_phases = [_mm256_setzero_si256(); CHUNK_VECTORS];
+                    if fm {
+                        let factor = lane(params.detune_factors, i);
+                        let mut stepped = [0_u32; CHUNK];
+                        let (mut phase, mut delta) = (phases[i], deltas[i]);
+                        for (phase_out, &fm_delta) in stepped.iter_mut().zip(&fm_deltas).take(chunk_len) {
+                            delta = cycles_to_fixed(fm_delta * factor);
+                            phase = phase.wrapping_add(delta);
+                            *phase_out = phase;
+                        }
+                        (phases[i], deltas[i]) = (phase, delta);
+                        for (vector, phases_out) in voice_phases.iter_mut().enumerate().take(vectors) {
+                            *phases_out = _mm256_loadu_si256(
+                                stepped.as_ptr().add(vector * UNISON_LANES) as *const __m256i,
+                            );
+                        }
+                    } else {
+                        let (phase, delta, step) = (phases[i], deltas[i], delta_steps[i]);
+                        let (phase_v, delta_v, step_v) = (
+                            _mm256_set1_epi32(phase as i32),
+                            _mm256_set1_epi32(delta as i32),
+                            _mm256_set1_epi32(step as i32),
+                        );
+                        for (vector, phases_out) in voice_phases.iter_mut().enumerate().take(vectors) {
+                            *phases_out = _mm256_add_epi32(
+                                phase_v,
+                                _mm256_add_epi32(
+                                    _mm256_mullo_epi32(counts[vector], delta_v),
+                                    _mm256_mullo_epi32(triangles[vector], step_v),
+                                ),
+                            );
+                        }
+                        // Where the chunk leaves the phase and the delta
+                        let l = chunk_len as u32;
+                        phases[i] = phase
+                            .wrapping_add(l.wrapping_mul(delta))
+                            .wrapping_add((l * (l - 1) / 2).wrapping_mul(step));
+                        deltas[i] = delta.wrapping_add(l.wrapping_mul(step));
+                    }
+
+                    let mask = _mm256_set1_ps(lane(params.mask, i));
+                    let (pan_left, pan_right) = (
+                        _mm256_set1_ps(lane(params.pan_left, i)),
+                        _mm256_set1_ps(lane(params.pan_right, i)),
+                    );
+                    for vector in 0..vectors {
+                        let samples = read_frames8::<GATHER, INTERP>(
+                            &table_a,
+                            &table_b,
+                            frames.mix,
+                            _mm256_add_epi32(voice_phases[vector], offsets[vector]),
+                        );
+                        if needs_mono {
+                            mono[vector] = _mm256_fmadd_ps(samples, mask, mono[vector]);
+                        }
+                        if stereo {
+                            left[vector] = _mm256_fmadd_ps(samples, pan_left, left[vector]);
+                            right[vector] = _mm256_fmadd_ps(samples, pan_right, right[vector]);
+                        }
+                    }
+                }
+
+                // Add the chunk to the outputs
+                let unpack = |vectors: &[__m256; CHUNK_VECTORS]| {
+                    let mut values = [0.0_f32; CHUNK];
+                    for (vector, value) in vectors.iter().enumerate() {
+                        _mm256_storeu_ps(values.as_mut_ptr().add(vector * UNISON_LANES), *value);
+                    }
+                    values
+                };
+                if stereo {
+                    let (left, right) = (unpack(&left), unpack(&right));
+                    let right_out = output.right.as_deref_mut().unwrap();
+                    for n in 0..chunk_len {
+                        output.left[start + n] += left[n] * gains[n];
+                        right_out[start + n] += right[n] * gains[n];
+                    }
+                }
+                if needs_mono {
+                    let mono = unpack(&mono);
+                    if !stereo {
+                        for n in 0..chunk_len {
+                            output.left[start + n] += mono[n] * gains[n];
+                        }
+                    }
+                    if let Some((mono_out, scale)) = &mut output.mono {
+                        for n in 0..chunk_len {
+                            mono_out[start + n] = mono[n] * *scale;
+                        }
+                    }
+                }
+                start = end;
+            }
+            for (i, phase) in phases.iter().enumerate().take(voices) {
+                *lane_u32_mut(&mut voice.voice_phases, i) = *phase;
             }
         }
 
