@@ -10,8 +10,8 @@
 use std::time::Instant;
 
 use crate::params::OscillatorWave;
-use crate::synth::filter::FilterModel;
-use crate::synth::oscillator::OscillatorParams;
+use crate::synth::filter::{Filter, FilterModel, LadderFilter};
+use crate::synth::oscillator::{OscillatorParams, SimdLevel};
 use crate::synth::ThreeOsc;
 use crate::ThreeOscPlugin;
 
@@ -88,11 +88,22 @@ fn select_sweep(osc: &mut OscillatorParams) {
 #[test]
 #[ignore]
 fn benchmark_synth() {
-    println!();
+    println!("\nwavetable lookups: {:?}", SimdLevel::detect());
     measure("default patch (1 saw, 8 notes)", |_| {});
     measure("3 x saw, unison 8", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(supersaw);
     });
+    measure("3 x saw, unison 8, portable lookups", |plugin| {
+        plugin.synth.oscillators.iter_mut().for_each(supersaw);
+        plugin.synth.simd = SimdLevel::Portable;
+    });
+    #[cfg(target_arch = "x86_64")]
+    if SimdLevel::detect() != SimdLevel::Portable {
+        measure("3 x saw, unison 8, AVX2 gather lookups", |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            plugin.synth.simd = SimdLevel::Avx2Gather;
+        });
+    }
     measure("3 x saw, unison 8, stereo width 1", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(supersaw);
         plugin.synth.stereo_width = 1.0;
@@ -113,6 +124,14 @@ fn benchmark_synth() {
         plugin.synth.oscillators.iter_mut().for_each(supersaw);
         plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
     });
+    measure("3 x saw, unison 8, ladder, scalar", |plugin| {
+        plugin.synth.oscillators.iter_mut().for_each(supersaw);
+        plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
+        plugin.synth.simd = SimdLevel::Portable;
+    });
+    measure("default patch, ladder filter", |plugin| {
+        plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
+    });
     measure("3 x saw, unison 8, PM + FM", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(|osc| {
             supersaw(osc);
@@ -120,6 +139,38 @@ fn benchmark_synth() {
             osc.fm = 0.01;
         });
     });
+}
+
+/// The ladder filter on its own, and without its two oversampling related costs.
+#[test]
+#[ignore]
+fn benchmark_ladder() {
+    let input: Vec<f32> = (0..4096).map(|i| (i % 100) as f32 / 50.0 - 1.0).collect();
+    let variants: [(&str, fn(&mut LadderFilter)); 3] = [
+        ("ladder filter (3x oversampled, 16th order decimator)", |_| {}),
+        ("ladder filter without the decimator", |filter| filter.set_decimator_order(0)),
+        ("ladder filter without oversampling", |filter| filter.oversampling_factor = 1),
+    ];
+    println!();
+    for (name, setup) in variants {
+        let mut filter = LadderFilter::default();
+        setup(&mut filter);
+        filter.set_params(SAMPLE_RATE as f32, 2000.0, 3.0);
+        let mut sink = 0.0;
+        for sample in &input {
+            sink += filter.process(*sample);
+        }
+        let iterations = 200;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for sample in &input {
+                sink += filter.process(*sample);
+            }
+        }
+        let ns_per_sample = start.elapsed().as_nanos() as f64 / (iterations * input.len()) as f64;
+        println!("{name:<52} {ns_per_sample:>7.1} ns/sample");
+        assert!(sink.is_finite());
+    }
 }
 
 #[test]

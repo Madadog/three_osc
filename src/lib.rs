@@ -486,6 +486,13 @@ mod tests {
             let len = rng.usize(1..=2048);
             // Switch between the mono and stereo paths, and vary the width, between blocks.
             plugin.synth.stereo_width = if rng.bool() { rng.f32() } else { 0.0 };
+            // Every filter model, including the ladder's lockstep processing of partial groups
+            plugin.synth.filter_controller.filter_model = match rng.usize(0..4) {
+                0 => synth::filter::FilterModel::None,
+                1 => synth::filter::FilterModel::RcFilter,
+                2 => synth::filter::FilterModel::LadderFilter,
+                _ => synth::filter::FilterModel::SvfSimperFilter,
+            };
             let mut events = Vec::new();
             for _ in 0..rng.usize(0..8) {
                 // Timings at the end of the buffer are allowed, they are applied afterwards.

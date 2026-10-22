@@ -1,4 +1,5 @@
-use self::ladder::{tanh_pade32_f32, LadderFilter};
+use self::ladder::tanh_pade32_f32;
+pub(crate) use self::ladder::{LadderFilter, LADDER_LANES};
 use self::svf_simper::SvfSimper;
 
 use super::lerp;

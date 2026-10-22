@@ -1,22 +1,23 @@
 use std::f32::consts::PI;
 
 use itertools::izip;
-use wide::f32x8;
 
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
 use self::filter::FilterContainer;
 use self::filter::FilterController;
+#[cfg(target_arch = "x86_64")]
+use self::filter::{LadderFilter, LADDER_LANES};
 use self::notes::Notes;
 use self::oscillator::wrap_cycles_signed;
 use self::oscillator::FramePair;
 use self::oscillator::OscVoice;
 use self::oscillator::OscWave;
 use self::oscillator::OscillatorParams;
+use self::oscillator::SimdLevel;
 use self::oscillator::SuperVoice;
 use self::oscillator::WavetableNotes;
 use self::oscillator::WavetableSet;
-use self::oscillator::UNISON_VECTORS;
 
 /// Samples per control rate block. Envelopes, pitch, the LFO, keytracking and the filter
 /// coefficients are only recalculated this often; gains and pitch are ramped linearly in between
@@ -49,6 +50,8 @@ pub struct ThreeOsc {
     /// How far unison voices are spread across the stereo field, from 0 (mono: both outputs are
     /// identical) to 1 (the lowest voice fully left and the highest fully right).
     pub stereo_width: f32,
+    /// The SIMD instructions the wavetable lookups use.
+    pub simd: SimdLevel,
 }
 
 impl ThreeOsc {
@@ -74,6 +77,7 @@ impl ThreeOsc {
             portamento_offset: 0.0,
             lfo_params: Default::default(),
             stereo_width: 0.0,
+            simd: SimdLevel::detect(),
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -209,17 +213,26 @@ impl ThreeOsc {
             octave_detune: self.octave_detune,
             portamento_rate: self.portamento_rate,
             active,
+            simd: self.simd,
         };
 
-        // Write samples from all voices, one control rate block at a time
+        // Write samples from all voices, one control rate block at a time. Each block goes
+        // through three stages: the oscillators of every voice, then the filters (which can run
+        // several voices in lockstep), then the amplitude envelopes mixing into the output.
         let len = output_left.len().min(output_right.len());
         let mut start = 0;
         while start < len {
             let end = (start + CONTROL_BLOCK_SAMPLES).min(len);
+            let block_len = end - start;
             for voice in self.voices.iter_mut() {
-                voice.update_controls(&context, end - start);
-                voice.render(
-                    &context,
+                voice.update_controls(&context, block_len);
+                voice.render_oscillators(&context, block_len);
+            }
+            filter_voices(&mut self.voices, block_len, stereo, self.simd);
+            for voice in self.voices.iter_mut() {
+                voice.mix_output(
+                    block_len,
+                    stereo,
                     &mut output_left[start..end],
                     &mut output_right[start..end],
                 );
@@ -263,6 +276,7 @@ struct VoiceContext<'a> {
     /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
     /// modulate anything are skipped.
     active: [bool; 3],
+    simd: SimdLevel,
 }
 
 /// An individual note press.
@@ -298,6 +312,11 @@ pub struct Voice {
     gain_step: f32,
     /// Filter input gain.
     drive: f32,
+
+    /// The current block's samples on their way from the oscillators through the filter to the
+    /// output; `pre_filter_right` is only used in stereo.
+    pre_filter: [f32; CONTROL_BLOCK_SAMPLES],
+    pre_filter_right: [f32; CONTROL_BLOCK_SAMPLES],
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, osc: &[OscillatorParams]) -> Self {
@@ -327,6 +346,8 @@ impl Voice {
             gain: 0.0,
             gain_step: 0.0,
             drive: 1.0,
+            pre_filter: [0.0; CONTROL_BLOCK_SAMPLES],
+            pre_filter_right: [0.0; CONTROL_BLOCK_SAMPLES],
         }
     }
     pub fn release(&mut self) {
@@ -454,16 +475,15 @@ impl Voice {
             _ => controller.drive,
         };
     }
-    /// Renders one control rate block, adding this voice's output to the buffers.
-    fn render(&mut self, context: &VoiceContext, out_left: &mut [f32], out_right: &mut [f32]) {
+    /// Renders one control rate block of the oscillators into the voice's pre-filter buffers.
+    fn render_oscillators(&mut self, context: &VoiceContext, block_len: usize) {
         let stereo = context.stereo;
         let oscillators = context.oscillators;
         let frames: [FramePair; 3] =
             std::array::from_fn(|i| oscillators[i].frame_pair(context.waves, self.osc_note[i]));
-        let voice_counts: [usize; 3] = std::array::from_fn(|i| oscillators[i].voice_count.into());
-        let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
+        let voice_counts: [usize; 3] = std::array::from_fn(|i| oscillators[i].unison_voices());
 
-        for (out_l, out_r) in izip!(out_left.iter_mut(), out_right.iter_mut()) {
+        for sample in 0..block_len.min(CONTROL_BLOCK_SAMPLES) {
             let mut out = 0.0;
             // Only used when `stereo` is set, `out` is then the left channel.
             let mut out_right = 0.0;
@@ -486,26 +506,35 @@ impl Voice {
                     delta = wrap_cycles_signed(delta * (1.0 + mod_out * osc.fm * FM_DEPTH));
                 }
 
-                self.osc_voice[i].advance(
-                    delta,
-                    voice_counts[i],
-                    &osc.detune_factors,
-                    mod_out * osc.pm * PM_DEPTH_CYCLES,
-                    frames[i].cycle_len() as f32,
-                    &mut indices,
-                );
-
+                let phase_offset = mod_out * osc.pm * PM_DEPTH_CYCLES;
                 let gain = self.osc_gain[i] * lerp(1.0, (mod_out + 1.0) / 2.0, osc.am);
                 self.osc_gain[i] += self.osc_gain_step[i];
 
                 let mono = if stereo {
-                    let (mono, left, right) =
-                        frames[i].sum_panned(&indices, voice_counts[i], &osc.pan_gains);
+                    let (mono, left, right) = frames[i].advance_and_sum_panned(
+                        &mut self.osc_voice[i],
+                        delta,
+                        &osc.detune_factors,
+                        phase_offset,
+                        voice_counts[i],
+                        &osc.voice_mask,
+                        &osc.pan_left,
+                        &osc.pan_right,
+                        context.simd,
+                    );
                     out += left * gain;
                     out_right += right * gain;
                     mono
                 } else {
-                    let mono = frames[i].sum(&indices, voice_counts[i]);
+                    let mono = frames[i].advance_and_sum(
+                        &mut self.osc_voice[i],
+                        delta,
+                        &osc.detune_factors,
+                        phase_offset,
+                        voice_counts[i],
+                        &osc.voice_mask,
+                        context.simd,
+                    );
                     out += mono * gain;
                     mono
                 };
@@ -513,20 +542,103 @@ impl Voice {
                 mod_out = mono * self.osc_mod_scale[i];
             }
 
-            // Process filter
-            out = self.filter.process(out * self.drive);
+            self.pre_filter[sample] = out * self.drive;
             if stereo {
-                out_right = self.filter_right.process(out_right * self.drive);
+                self.pre_filter_right[sample] = out_right * self.drive;
             }
-
-            // Amplitude envelope and keyboard velocity scaling
-            *out_l += out * self.gain;
-            *out_r += if stereo {
-                out_right * self.gain
+        }
+    }
+    /// Runs the voice's filter(s) over the current block, one sample at a time.
+    fn filter_block(&mut self, block_len: usize, stereo: bool) {
+        filter_samples(&mut self.filter, &mut self.pre_filter[..block_len]);
+        if stereo {
+            filter_samples(&mut self.filter_right, &mut self.pre_filter_right[..block_len]);
+        }
+    }
+    /// Applies the amplitude envelope and velocity to the filtered block and adds it to the
+    /// output buffers.
+    fn mix_output(
+        &mut self,
+        block_len: usize,
+        stereo: bool,
+        out_left: &mut [f32],
+        out_right: &mut [f32],
+    ) {
+        let block_len = block_len.min(out_left.len()).min(out_right.len());
+        for sample in 0..block_len {
+            out_left[sample] += self.pre_filter[sample] * self.gain;
+            out_right[sample] += if stereo {
+                self.pre_filter_right[sample] * self.gain
             } else {
-                out * self.gain
+                self.pre_filter[sample] * self.gain
             };
             self.gain += self.gain_step;
+        }
+    }
+}
+
+/// Runs every voice's filter over the current block. Ladder filters are processed several
+/// voices at a time when the CPU allows it.
+fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: SimdLevel) {
+    #[cfg(target_arch = "x86_64")]
+    if simd.has_avx() {
+        for chunk in voices.chunks_mut(LADDER_LANES) {
+            filter_chunk_lockstep(chunk, block_len, stereo);
+        }
+        return;
+    }
+    let _ = simd;
+    for voice in voices {
+        voice.filter_block(block_len, stereo);
+    }
+}
+
+/// Runs a filter over a block of samples, in place.
+fn filter_samples(filter: &mut FilterContainer, samples: &mut [f32]) {
+    for sample in samples {
+        *sample = filter.process(*sample);
+    }
+}
+
+/// Filters up to [`LADDER_LANES`] voices, running their ladder filters in lockstep. Voices with
+/// other filters are processed one at a time.
+#[cfg(target_arch = "x86_64")]
+fn filter_chunk_lockstep(chunk: &mut [Voice], block_len: usize, stereo: bool) {
+    const NONE: Option<(&mut LadderFilter, &mut [f32])> = None;
+    let mut left = [NONE; LADDER_LANES];
+    let mut right = [NONE; LADDER_LANES];
+    for (lane, voice) in chunk.iter_mut().enumerate() {
+        let Voice {
+            filter,
+            filter_right,
+            pre_filter,
+            pre_filter_right,
+            ..
+        } = voice;
+        let lockstep = |filter: &FilterContainer| {
+            matches!(filter, FilterContainer::LadderFilter(ladder) if ladder.supports_lockstep())
+        };
+        if lockstep(filter) && (!stereo || lockstep(filter_right)) {
+            if let FilterContainer::LadderFilter(ladder) = filter {
+                left[lane] = Some((ladder, &mut pre_filter[..block_len]));
+            }
+            if stereo {
+                if let FilterContainer::LadderFilter(ladder) = filter_right {
+                    right[lane] = Some((ladder, &mut pre_filter_right[..block_len]));
+                }
+            }
+        } else {
+            filter_samples(filter, &mut pre_filter[..block_len]);
+            if stereo {
+                filter_samples(filter_right, &mut pre_filter_right[..block_len]);
+            }
+        }
+    }
+    // SAFETY: `filter_voices()` only takes this path when the CPU supports AVX.
+    unsafe {
+        LadderFilter::process_block_x4(left);
+        if stereo {
+            LadderFilter::process_block_x4(right);
         }
     }
 }

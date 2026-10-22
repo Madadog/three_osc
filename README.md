@@ -12,11 +12,11 @@ Currently a work in progress, but usable nevertheless.
 ## Features
 
 * 3 oscillators which can modulate eachother via phase, frequency, and amplitude modulation (PM, FM & AM) simultaneously
-* Choose between 3 multimode filter models (RC, Ladder, Simper SVF) with keytracking and envelope
+* Choose between 3 multimode filter models (RC, Ladder, Simper SVF) with keytracking and envelope. The ladder filter runs four voices at a time with AVX where available.
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
 * Wavetable oscillators with sine, triangle, absolute sine, saw, square and pulse waves, plus a pulse width sweep wavetable that each oscillator's position control morphs through
-* Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off)
+* Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic interpolation (AVX2 gathers where available)
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * Vibrato, tremolo and modulation control with an LFO
@@ -61,6 +61,9 @@ cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 ### Control rate
 Envelopes, pitch (including portamento and vibrato), the LFO, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFO, which can't go faster than half the control rate. Change the constant to try other sizes.
 
+### SIMD
+Unison voices are processed eight at a time: their phases advance as vectors and their wavetable reads (4-point cubic Hermite interpolation) run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. The ladder filter processes four voices in lockstep with AVX, producing exactly the same output as the one-voice-at-a-time version. Everything is detected at runtime, so one build runs on any x86-64 CPU.
+
 ### Previous LV2 version
 Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the LV2 build is gone; if you need it, check out a commit from before the nih-plug port.
 
@@ -96,7 +99,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Use audio buffering for more optimisations
 * Optimise
 * Extract DSP to internal crate
-* Sinc interpolation for wavetables instead of Lerp
+* Better wavetable interpolation (sinc or Niemitalo's optimal interpolators; currently 4-point cubic Hermite)
 * SIMD accelerate stereo paths
 * Approximate/cache expensive computations (i.e. any uses of `powf`)
 * Fix buffer size to reduce expensive modulation calculations at the expense of sample-accurate automation (make const so that you can play around with buffer lengths, see what is good)

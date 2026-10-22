@@ -90,6 +90,9 @@ pub struct LadderFilter {
 
     // IIR downsampling filter
     iir_lowpass: IirFilter,
+
+    /// Source of the tiny amount of noise added to the input to keep the filter alive.
+    rng: Rng,
 }
 
 impl Default for LadderFilter {
@@ -114,17 +117,223 @@ impl Default for LadderFilter {
                 IIR_DOWNSAMPLING_BANDWIDTH * 44100.0 / 2.0,
                 IIR_DOWNSAMPLE_ORDER,
             ),
+            rng: Rng::new(),
         }
     }
 }
+/// Number of filters [`LadderFilter::process_block_x4()`] runs in lockstep.
+pub const LADDER_LANES: usize = 4;
+
 #[allow(dead_code)]
 impl LadderFilter {
     pub fn new() -> Self {
         Self::default()
     }
+    /// A filter whose dither noise is reproducible, for tests.
+    #[cfg(test)]
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            rng: Rng::with_seed(seed),
+            ..Self::default()
+        }
+    }
+    /// Whether [`process_block_x4()`][Self::process_block_x4()] supports this filter's settings.
+    pub fn supports_lockstep(&self) -> bool {
+        matches!(
+            self.ladder_integration_method,
+            IntegrationMethod::PredictorCorrectorFullTanh
+        )
+    }
+    /// Processes a block of samples, in place, for up to 4 filters at once, in lockstep with AVX.
+    /// Each present lane produces exactly the same output as calling
+    /// [`process()`][Filter::process()] on its filter for each sample. The filters must all use
+    /// the same integration method (see [`supports_lockstep()`][Self::supports_lockstep()]),
+    /// oversampling factor and filter mode; the first present lane's settings are used.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    pub unsafe fn process_block_x4(mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
+        use std::arch::x86_64::*;
+
+        let Some(first) = lanes.iter().find_map(|lane| lane.as_ref().map(|(filter, _)| &**filter))
+        else {
+            return;
+        };
+        debug_assert!(first.supports_lockstep());
+        let oversampling_factor = first.oversampling_factor;
+        let mode = first.ladder_filter_mode;
+        let decimate = oversampling_factor > 1;
+        let biquads = first.iir_lowpass.decimator_order / 2;
+        let iir_k = first.iir_lowpass.k;
+        let iir_a1 = first.iir_lowpass.a1;
+        let iir_a2 = first.iir_lowpass.a2;
+        let block_len = lanes
+            .iter()
+            .flatten()
+            .map(|(_, buffer)| buffer.len())
+            .min()
+            .unwrap_or(0);
+
+        // Gather the state of each lane
+        let mut p0 = [0.0_f64; LADDER_LANES];
+        let mut p1 = [0.0_f64; LADDER_LANES];
+        let mut p2 = [0.0_f64; LADDER_LANES];
+        let mut p3 = [0.0_f64; LADDER_LANES];
+        let mut ut_1 = [0.0_f64; LADDER_LANES];
+        let mut dt = [0.0_f64; LADDER_LANES];
+        let mut feedback = [0.0_f64; LADDER_LANES];
+        let mut z = [[0.0_f64; LADDER_LANES]; IIR_MAX_ORDER];
+        for (lane, entry) in lanes.iter().enumerate() {
+            if let Some((filter, _)) = entry {
+                p0[lane] = filter.p0;
+                p1[lane] = filter.p1;
+                p2[lane] = filter.p2;
+                p3[lane] = filter.p3;
+                ut_1[lane] = filter.ut_1;
+                dt[lane] = filter.dt;
+                feedback[lane] = 8.0 * filter.resonance;
+                for (z, filter_z) in z.iter_mut().zip(filter.iir_lowpass.z.iter()) {
+                    z[lane] = *filter_z;
+                }
+            }
+        }
+        let load = |values: &[f64; LADDER_LANES]| _mm256_loadu_pd(values.as_ptr());
+        let (mut p0, mut p1, mut p2, mut p3) = (load(&p0), load(&p1), load(&p2), load(&p3));
+        let mut ut_1 = load(&ut_1);
+        let dt = load(&dt);
+        let feedback = load(&feedback);
+        let half_dt = _mm256_mul_pd(_mm256_set1_pd(0.5), dt);
+        let mut z: [__m256d; IIR_MAX_ORDER] = std::array::from_fn(|i| load(&z[i]));
+
+        // Padé 3/2 approximant of tanh, the same operations as `tanh_pade32()`
+        let tanh = |x: __m256d| {
+            let x = _mm256_max_pd(_mm256_min_pd(x, _mm256_set1_pd(3.0)), _mm256_set1_pd(-3.0));
+            let x2 = _mm256_mul_pd(x, x);
+            _mm256_div_pd(
+                _mm256_mul_pd(x, _mm256_add_pd(_mm256_set1_pd(15.0), x2)),
+                _mm256_add_pd(_mm256_set1_pd(15.0), _mm256_mul_pd(_mm256_set1_pd(6.0), x2)),
+            )
+        };
+
+        for sample in 0..block_len {
+            // The input, with the tiny amount of noise that keeps the filter alive
+            let mut input = [0.0_f64; LADDER_LANES];
+            for (lane, entry) in lanes.iter_mut().enumerate() {
+                if let Some((filter, buffer)) = entry {
+                    let noise = 1.0e-6 * 2.0 * (filter.rng.f64() - 0.5);
+                    input[lane] = buffer[sample] as f64 + noise;
+                }
+            }
+            let input = load(&input);
+
+            // Predictor-corrector integration with full tanh stages, see `process_sample()`
+            for _ in 0..oversampling_factor {
+                let tanh_in = tanh(_mm256_sub_pd(ut_1, _mm256_mul_pd(feedback, p3)));
+                let tanh_p0 = tanh(p0);
+                let tanh_p1 = tanh(p1);
+                let tanh_p2 = tanh(p2);
+                let tanh_p3 = tanh(p3);
+
+                let p0_prime = _mm256_add_pd(p0, _mm256_mul_pd(dt, _mm256_sub_pd(tanh_in, tanh_p0)));
+                let p1_prime = _mm256_add_pd(p1, _mm256_mul_pd(dt, _mm256_sub_pd(tanh_p0, tanh_p1)));
+                let p2_prime = _mm256_add_pd(p2, _mm256_mul_pd(dt, _mm256_sub_pd(tanh_p1, tanh_p2)));
+                let p3_prime = _mm256_add_pd(p3, _mm256_mul_pd(dt, _mm256_sub_pd(tanh_p2, tanh_p3)));
+                let tanh_p0_prime = tanh(p0_prime);
+                let tanh_p1_prime = tanh(p1_prime);
+                let tanh_p2_prime = tanh(p2_prime);
+                let tanh_p3_prime = tanh(p3_prime);
+
+                let correct = |p: __m256d, a: __m256d, b: __m256d, a_prime: __m256d, b_prime: __m256d| {
+                    _mm256_add_pd(
+                        p,
+                        _mm256_mul_pd(
+                            half_dt,
+                            _mm256_add_pd(_mm256_sub_pd(a, b), _mm256_sub_pd(a_prime, b_prime)),
+                        ),
+                    )
+                };
+                p3 = correct(p3, tanh_p2, tanh_p3, tanh_p2_prime, tanh_p3_prime);
+                p2 = correct(p2, tanh_p1, tanh_p2, tanh_p1_prime, tanh_p2_prime);
+                p1 = correct(p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
+                let tanh_new_in = tanh(_mm256_sub_pd(input, _mm256_mul_pd(feedback, p3)));
+                p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
+            }
+
+            ut_1 = input;
+
+            let mut out = match mode {
+                FilterType::Lowpass => p3,
+                FilterType::Bandpass => _mm256_sub_pd(p1, p3),
+                FilterType::Highpass => tanh(_mm256_sub_pd(
+                    _mm256_sub_pd(input, p0),
+                    _mm256_mul_pd(feedback, p3),
+                )),
+            };
+
+            if decimate {
+                // The same cascade as `IirFilter::filter()`
+                for biquad in 0..biquads {
+                    let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
+                    let biquad_in = _mm256_sub_pd(
+                        _mm256_sub_pd(
+                            _mm256_mul_pd(_mm256_set1_pd(iir_k[biquad]), out),
+                            _mm256_mul_pd(_mm256_set1_pd(iir_a1[biquad]), z0),
+                        ),
+                        _mm256_mul_pd(_mm256_set1_pd(iir_a2[biquad]), z1),
+                    );
+                    out = _mm256_add_pd(
+                        _mm256_add_pd(biquad_in, _mm256_mul_pd(_mm256_set1_pd(2.0), z0)),
+                        z1,
+                    );
+                    z[2 * biquad + 1] = z0;
+                    z[2 * biquad] = biquad_in;
+                }
+            }
+
+            let mut output = [0.0_f32; LADDER_LANES];
+            _mm_storeu_ps(
+                output.as_mut_ptr(),
+                _mm256_cvtpd_ps(_mm256_mul_pd(out, _mm256_set1_pd(1.8))),
+            );
+            for (lane, entry) in lanes.iter_mut().enumerate() {
+                if let Some((_, buffer)) = entry {
+                    buffer[sample] = output[lane];
+                }
+            }
+        }
+
+        // Scatter the state back
+        let store = |vector: __m256d| {
+            let mut values = [0.0_f64; LADDER_LANES];
+            _mm256_storeu_pd(values.as_mut_ptr(), vector);
+            values
+        };
+        let (p0, p1, p2, p3, ut_1) = (store(p0), store(p1), store(p2), store(p3), store(ut_1));
+        let z: Vec<[f64; LADDER_LANES]> = z.iter().map(|z| store(*z)).collect();
+        for (lane, entry) in lanes.iter_mut().enumerate() {
+            if let Some((filter, _)) = entry {
+                filter.p0 = p0[lane];
+                filter.p1 = p1[lane];
+                filter.p2 = p2[lane];
+                filter.p3 = p3[lane];
+                filter.ut_1 = ut_1[lane];
+                filter.out = match mode {
+                    FilterType::Lowpass => filter.p3,
+                    FilterType::Bandpass => filter.p1 - filter.p3,
+                    FilterType::Highpass => filter.out,
+                };
+                for (filter_z, z) in filter.iir_lowpass.z.iter_mut().zip(z.iter()) {
+                    *filter_z = z[lane];
+                }
+            }
+        }
+    }
     pub fn process_sample(&mut self, mut input: f64) {
         let feedback = 8.0 * self.resonance;
-        let noise = 1.0e-6 * 2.0 * (Rng::new().f64() - 0.5);
+        let noise = 1.0e-6 * 2.0 * (self.rng.f64() - 0.5);
 
         input += noise;
 
@@ -145,53 +354,49 @@ impl LadderFilter {
                 // predictor-corrector integration
                 // with full tanh stages
                 IntegrationMethod::PredictorCorrectorFullTanh => {
+                    // The stages' tanh values are shared by the predictor and the corrector,
+                    // which only needs the predicted stages' values on top of them.
+                    let tanh_in = tanh_pade32(self.ut_1 - feedback * self.p3);
+                    let tanh_p0 = tanh_pade32(self.p0);
+                    let tanh_p1 = tanh_pade32(self.p1);
+                    let tanh_p2 = tanh_pade32(self.p2);
+                    let tanh_p3 = tanh_pade32(self.p3);
+
                     // predictor
-                    let p0_prime = self.p0
-                        + self.dt
-                            * (tanh_pade32(self.ut_1 - feedback * self.p3) - tanh_pade32(self.p0));
-                    let p1_prime =
-                        self.p1 + self.dt * (tanh_pade32(self.p0) - tanh_pade32(self.p1));
-                    let p2_prime =
-                        self.p2 + self.dt * (tanh_pade32(self.p1) - tanh_pade32(self.p2));
-                    let p3_prime =
-                        self.p3 + self.dt * (tanh_pade32(self.p2) - tanh_pade32(self.p3));
+                    let p0_prime = self.p0 + self.dt * (tanh_in - tanh_p0);
+                    let p1_prime = self.p1 + self.dt * (tanh_p0 - tanh_p1);
+                    let p2_prime = self.p2 + self.dt * (tanh_p1 - tanh_p2);
+                    let p3_prime = self.p3 + self.dt * (tanh_p2 - tanh_p3);
+                    let tanh_p0_prime = tanh_pade32(p0_prime);
+                    let tanh_p1_prime = tanh_pade32(p1_prime);
+                    let tanh_p2_prime = tanh_pade32(p2_prime);
+                    let tanh_p3_prime = tanh_pade32(p3_prime);
 
                     // corrector
-                    let p3t_1 = self.p3;
                     self.p3 = self.p3
-                        + 0.5
-                            * self.dt
-                            * ((tanh_pade32(self.p2) - tanh_pade32(self.p3))
-                                + (tanh_pade32(p2_prime) - tanh_pade32(p3_prime)));
+                        + 0.5 * self.dt * ((tanh_p2 - tanh_p3) + (tanh_p2_prime - tanh_p3_prime));
                     self.p2 = self.p2
-                        + 0.5
-                            * self.dt
-                            * ((tanh_pade32(self.p1) - tanh_pade32(self.p2))
-                                + (tanh_pade32(p1_prime) - tanh_pade32(p2_prime)));
+                        + 0.5 * self.dt * ((tanh_p1 - tanh_p2) + (tanh_p1_prime - tanh_p2_prime));
                     self.p1 = self.p1
-                        + 0.5
-                            * self.dt
-                            * ((tanh_pade32(self.p0) - tanh_pade32(self.p1))
-                                + (tanh_pade32(p0_prime) - tanh_pade32(p1_prime)));
+                        + 0.5 * self.dt * ((tanh_p0 - tanh_p1) + (tanh_p0_prime - tanh_p1_prime));
                     self.p0 = self.p0
                         + 0.5
                             * self.dt
-                            * ((tanh_pade32(self.ut_1 - feedback * p3t_1) - tanh_pade32(self.p0))
-                                + (tanh_pade32(input - feedback * self.p3)
-                                    - tanh_pade32(p0_prime)));
+                            * ((tanh_in - tanh_p0)
+                                + (tanh_pade32(input - feedback * self.p3) - tanh_p0_prime));
                 }
                 // predictor-corrector integration
                 // with feedback tanh stage only
                 IntegrationMethod::PredictorCorrectorFeedbackTanh => {
+                    let tanh_in = tanh_pade32(self.ut_1 - feedback * self.p3);
+
                     // predictor
-                    let p0_prime =
-                        self.p0 + self.dt * (tanh_pade32(self.ut_1 - feedback * self.p3) - self.p0);
+                    let p0_prime = self.p0 + self.dt * (tanh_in - self.p0);
                     let p1_prime = self.p1 + self.dt * (self.p0 - self.p1);
                     let p2_prime = self.p2 + self.dt * (self.p1 - self.p2);
                     let p3_prime = self.p3 + self.dt * (self.p2 - self.p3);
 
                     // corrector
-                    let p3t_1 = self.p3;
                     self.p3 =
                         self.p3 + 0.5 * self.dt * ((self.p2 - self.p3) + (p2_prime - p3_prime));
                     self.p2 =
@@ -201,7 +406,7 @@ impl LadderFilter {
                     self.p0 = self.p0
                         + 0.5
                             * self.dt
-                            * ((tanh_pade32(self.ut_1 - feedback * p3t_1) - self.p0)
+                            * ((tanh_in - self.p0)
                                 + (tanh_pade32(input - feedback * self.p3) - p0_prime));
                 }
                 // implicit trapezoidal integration
@@ -289,6 +494,11 @@ impl LadderFilter {
     pub fn set_filtermode(&mut self, mode: FilterType) {
         self.ladder_filter_mode = mode;
     }
+    /// Sets the order of the IIR filter applied after oversampling (0 disables it).
+    pub fn set_decimator_order(&mut self, order: usize) {
+        self.decimator_order = order;
+        self.iir_lowpass.set_order(order);
+    }
     pub fn set_sample_rate(&mut self, sample_rate: f64) {
         self.sample_rate = sample_rate;
         self.iir_lowpass.sample_rate = sample_rate * self.oversampling_factor as f64;
@@ -322,12 +532,14 @@ impl Filter for LadderFilter {
     }
 }
 
+use self::iir::IIR_MAX_ORDER;
+
 mod iir {
     use std::f64::consts::PI;
 
     use itertools::izip;
 
-    const IIR_MAX_ORDER: usize = 32;
+    pub const IIR_MAX_ORDER: usize = 32;
 
     #[derive(Debug, Clone)]
     pub struct IirFilter {
@@ -337,16 +549,16 @@ mod iir {
         pub decimator_order: usize,
 
         // dsp variables
-        a1: [f64; IIR_MAX_ORDER / 2],
-        a2: [f64; IIR_MAX_ORDER / 2],
-        k: [f64; IIR_MAX_ORDER / 2],
+        pub a1: [f64; IIR_MAX_ORDER / 2],
+        pub a2: [f64; IIR_MAX_ORDER / 2],
+        pub k: [f64; IIR_MAX_ORDER / 2],
         pa_real: [f64; IIR_MAX_ORDER / 2],
         pa_imag: [f64; IIR_MAX_ORDER / 2],
         p_real: [f64; IIR_MAX_ORDER / 2],
         p_imag: [f64; IIR_MAX_ORDER / 2],
 
         // cascaded biquad buffers
-        z: [f64; IIR_MAX_ORDER],
+        pub z: [f64; IIR_MAX_ORDER],
     }
     #[allow(dead_code)]
     impl IirFilter {
@@ -376,7 +588,7 @@ mod iir {
         pub fn filter(&mut self, input: f64) -> f64 {
             let mut out = input;
 
-            for ((k, a1, a2), z) in izip!(self.k, self.a1, self.a2)
+            for ((k, a1, a2), z) in izip!(&self.k, &self.a1, &self.a2)
                 .zip(self.z.chunks_exact_mut(2))
                 .take(self.decimator_order / 2)
             {
@@ -471,6 +683,85 @@ mod iir {
                 *a1 = -2.0 * *p_real;
                 *a2 = p_real.powi(2) + p_imag.powi(2);
                 *k = (1.0 + *a1 + *a2) / 4.0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test signal: a detuned pair of saws
+    fn signal(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i % 97) as f32 / 48.5 - 1.0) * 0.5 + ((i % 61) as f32 / 30.5 - 1.0) * 0.3)
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lockstep_matches_scalar_processing_exactly() {
+        if !is_x86_feature_detected!("avx") {
+            return;
+        }
+        for (lanes, mode) in [
+            (4, FilterType::Lowpass),
+            (4, FilterType::Bandpass),
+            (4, FilterType::Highpass),
+            (2, FilterType::Lowpass),
+            (1, FilterType::Lowpass),
+        ] {
+            let input = signal(300);
+            let cutoffs = [300.0, 2500.0, 9000.0, 18000.0];
+            let resonances = [0.5, 3.0, 7.0, 9.5];
+            // (Cloning a `fastrand::Rng` forks it, so both sets are seeded explicitly.)
+            let mut scalar: Vec<LadderFilter> = (0..lanes).map(|i| LadderFilter::with_seed(i as u64)).collect();
+            let mut lockstep: Vec<LadderFilter> = (0..lanes).map(|i| LadderFilter::with_seed(i as u64)).collect();
+            for (i, filter) in scalar.iter_mut().chain(lockstep.iter_mut()).enumerate() {
+                let i = i % lanes;
+                filter.set_filter_type(mode);
+                filter.set_params(44100.0, cutoffs[i], resonances[i]);
+            }
+
+            let expected: Vec<Vec<f32>> = scalar
+                .iter_mut()
+                .map(|filter| input.iter().map(|sample| filter.process(*sample)).collect())
+                .collect();
+
+            // Process in two blocks to cover the state being carried across calls
+            let mut buffers: Vec<Vec<f32>> = (0..lanes).map(|_| input.clone()).collect();
+            for (start, end) in [(0, 128), (128, 300)] {
+                let mut entries: Vec<Option<(&mut LadderFilter, &mut [f32])>> = lockstep
+                    .iter_mut()
+                    .zip(buffers.iter_mut())
+                    .map(|(filter, buffer)| Some((filter, &mut buffer[start..end])))
+                    .collect();
+                entries.resize_with(LADDER_LANES, || None);
+                let entries: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES] =
+                    entries.try_into().ok().unwrap();
+                unsafe { LadderFilter::process_block_x4(entries) };
+            }
+
+            for lane in 0..lanes {
+                if let Some(first) = (0..input.len()).find(|&i| buffers[lane][i] != expected[lane][i]) {
+                    let max_diff = (0..input.len())
+                        .map(|i| (buffers[lane][i] - expected[lane][i]).abs())
+                        .fold(0.0_f32, f32::max);
+                    panic!(
+                        "{mode:?} lane {lane} of {lanes}: first difference at sample {first}: lockstep {} vs scalar {} (max difference {max_diff:e}, {} of {} samples differ)",
+                        buffers[lane][first],
+                        expected[lane][first],
+                        (0..input.len()).filter(|&i| buffers[lane][i] != expected[lane][i]).count(),
+                        input.len()
+                    );
+                }
+                assert_eq!(buffers[lane], expected[lane], "{mode:?} lane {lane} of {lanes}");
+                assert!(expected[lane].iter().any(|sample| sample.abs() > 1e-3));
+            }
+            // and the state is carried over identically
+            for lane in 0..lanes {
+                assert_eq!(scalar[lane].process(0.25), lockstep[lane].process(0.25));
             }
         }
     }
