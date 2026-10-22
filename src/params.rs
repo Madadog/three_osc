@@ -16,7 +16,7 @@ use nih_plug_egui::EguiState;
 
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
-use crate::synth::oscillator::{Interpolation, OscWave};
+use crate::synth::oscillator::{Interpolation, OscWave, WavePreview};
 use crate::synth::Polyphony;
 
 /// Waveforms available to the LFO.
@@ -104,6 +104,8 @@ pub struct WavetableFile {
     requested: AtomicU32,
     /// What became of the last load, for the GUI.
     status: Mutex<String>,
+    /// The frames of the loaded file, for the GUI to draw.
+    preview: Mutex<Option<Arc<WavePreview>>>,
 }
 
 impl WavetableFile {
@@ -134,6 +136,12 @@ impl WavetableFile {
     }
     pub fn set_status(&self, status: String) {
         *self.status.lock().unwrap() = status;
+    }
+    pub fn preview(&self) -> Option<Arc<WavePreview>> {
+        self.preview.lock().unwrap().clone()
+    }
+    pub fn set_preview(&self, preview: Option<Arc<WavePreview>>) {
+        *self.preview.lock().unwrap() = preview;
     }
 }
 

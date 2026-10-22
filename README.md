@@ -22,7 +22,7 @@ Currently a work in progress, but usable nevertheless.
 * A modulation matrix: three LFOs, two spare envelopes, the volume and filter envelopes, velocity, key position, mod wheel, aftertouch and a per-note random value can each modulate pitch, wavetable position, amplitude, unison detune, PM/FM/AM amounts, filter cutoff, resonance and drive, note volume and the LFO rates, through 16 routes. Drag a source's handle onto a slider in the GUI to route it.
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
 * MIDI pitch bend with an adjustable range
-* A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page. Hover a control's label for a description of what it does.
+* A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page, and displays of each oscillator's wave, the LFOs, the envelopes and the filter's frequency response. Hover a control's label (or a display) for a description of what it does.
 * Sample-accurate note timing
 
 ## Sound Demo
@@ -69,6 +69,9 @@ A file holds one or more frames, single cycles one after the other. The frame le
 The file is read and analysed on a background thread: each frame's spectrum is kept, and the bandlimited tables for every note are generated from it for the current sample rate (and regenerated when it changes), so a loaded wavetable is as alias-free as the built in ones. Until the file is loaded, or when none is set, the oscillator plays a sine.
 
 Each note's table is only as long as its harmonics need (a power of two of at least 16 samples per harmonic, from 64 up to 2048 samples), and a wavetable with many frames shares one table between neighbouring notes when it would otherwise take more than 24 MB. The built in wavetables take 26 MB.
+
+### Displays
+The displays are drawn with the synth's own code, so they show what is played. An oscillator's display is one cycle of its wavetable at the current position (rendered from the same spectra as the tables it plays, loaded files included), with a line where the wave starts when Phase Rand is below 100%; it is dimmed while the oscillator's amplitude is 0. The LFO displays show one cycle. The envelope displays draw attack, decay, a stretch of sustain and release, each stage as wide as the square root of its time, so that a 2 ms attack is still visible next to a 2 second release. The filter display is the frequency response from 20 Hz to 20 kHz, measured by running an impulse through the filter model itself at the host's sample rate (a quiet one, so the nonlinear models show their small-signal response; the drive's distortion doesn't show), with the response at the peak of the filter envelope drawn more faintly.
 
 ### Control rate
 Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate. Change the constant to try other sizes.

@@ -10,8 +10,12 @@
 //! MIDI sources) has a handle that can be dragged onto any slider that can be modulated, which
 //! fills in a free slot of the modulation matrix. The matrix itself lists every route, with its
 //! amount, and modulated sliders are marked.
+//!
+//! The oscillators, LFOs, envelopes and the filter each have a display of what they do, see
+//! [`displays`].
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -24,13 +28,17 @@ use crate::params::{
     EnvelopeParams, FilterEnvParams, FilterParams, GlobalParams, LfoParams, ModParams,
     ModSlotParams, OscParams, OscillatorWave, ThreeOscParams, WavetableFile,
 };
+use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::modulation::{ModSource, ModTarget, N_SLOTS};
+use crate::synth::oscillator::{builtin_spectra, CycleRenderer, WavePreview};
 use crate::synth::wavetable_file;
 use crate::{Task, ThreeOscPlugin};
 
+mod displays;
+
 /// The window's default size, in logical pixels.
 pub const DEFAULT_WIDTH: u32 = 1400;
-pub const DEFAULT_HEIGHT: u32 = 900;
+pub const DEFAULT_HEIGHT: u32 = 1000;
 
 const SLIDER_WIDTH: f32 = 110.0;
 const COMBO_WIDTH: f32 = 150.0;
@@ -51,7 +59,8 @@ pub fn default_state() -> Arc<EguiState> {
     EguiState::from_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
 }
 
-/// State that only the GUI needs: the listing of the wavetable folder.
+/// State that only the GUI needs: the listing of the wavetable folder, and what the displays
+/// draw.
 pub struct EditorState {
     folder: PathBuf,
     /// The `.wav` files in the folder.
@@ -59,6 +68,10 @@ pub struct EditorState {
     scanned: bool,
     /// A path typed in to load a file from anywhere else.
     custom_path: String,
+    /// The frames of the built in wavetables, in the order of the wave parameter, worked out
+    /// when the GUI first opens.
+    builtin_waves: Vec<Arc<WavePreview>>,
+    filter_response: displays::FilterResponse,
 }
 
 impl EditorState {
@@ -68,6 +81,8 @@ impl EditorState {
             files: Vec::new(),
             scanned: false,
             custom_path: String::new(),
+            builtin_waves: Vec::new(),
+            filter_response: displays::FilterResponse::new(),
         }
     }
     fn rescan(&mut self) {
@@ -76,15 +91,18 @@ impl EditorState {
     }
 }
 
-/// What the GUI needs besides the parameters: the wavetable folder listing, and a way to run
-/// wavetable loads in the background.
+/// What the GUI needs besides the parameters: its own state, a way to run wavetable loads in
+/// the background, and the sample rate the synth runs at.
 struct Gui<'a> {
     state: &'a mut EditorState,
     executor: &'a AsyncExecutor<ThreeOscPlugin>,
+    sample_rate: f32,
 }
 
+/// Creates the editor. `sample_rate` is the synth's sample rate as `f32` bits.
 pub fn create(
     params: Arc<ThreeOscParams>,
+    sample_rate: Arc<AtomicU32>,
     async_executor: AsyncExecutor<ThreeOscPlugin>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
@@ -104,6 +122,7 @@ pub fn create(
                             let mut gui = Gui {
                                 state,
                                 executor: &async_executor,
+                                sample_rate: f32::from_bits(sample_rate.load(Ordering::Relaxed)),
                             };
                             draw(ui, &params, setter, &mut gui)
                         });
@@ -115,6 +134,13 @@ pub fn create(
 fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
     if !gui.state.scanned {
         gui.state.rescan();
+    }
+    if gui.state.builtin_waves.is_empty() {
+        let mut renderer = CycleRenderer::new();
+        gui.state.builtin_waves = builtin_spectra()
+            .iter()
+            .map(|(_, spectra)| Arc::new(WavePreview::from_spectra(spectra, &mut renderer)))
+            .collect();
     }
     let matrix = Matrix {
         slots: &params.mod_slots,
@@ -161,7 +187,7 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
 
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
-            filter(ui, "Filter 1", &params.filter, &matrix, setter);
+            filter(ui, "Filter 1", &params.filter, &params.filter_env, &matrix, setter, gui);
             filter_envelope(ui, "Filter 1 Envelope", &params.filter_env, setter);
         });
         ui.vertical(|ui| {
@@ -195,7 +221,17 @@ fn oscillator(
     setter: &ParamSetter,
     gui: &mut Gui,
 ) {
-    section(ui, title, None, |ui| {
+    // The file's frames once it has loaded; until then the oscillator plays a sine
+    let preview = match osc.wave.value().wavetable_index() {
+        Some(wavetable) => gui.state.builtin_waves[wavetable].clone(),
+        None => file.preview().unwrap_or_else(|| gui.state.builtin_waves[0].clone()),
+    };
+    let start = (osc.phase_rand.value() < 100.0).then(|| osc.phase.value() / 100.0);
+    let silent = osc.amp.value() == 0.0;
+    let mut display = |ui: &mut Ui| {
+        displays::wave(ui, &preview, osc.position.value(), start, silent);
+    };
+    section(ui, title, None, Display::Above(&mut display), |ui| {
         combo(
             ui,
             &osc.wave,
@@ -302,10 +338,12 @@ fn oscillator(
 }
 
 fn lfo(ui: &mut Ui, index: usize, lfo: &LfoParams, matrix: &Matrix, setter: &ParamSetter) {
+    let wave = lfo.wave.value().to_osc_wave();
     section(
         ui,
         &format!("LFO {}", index + 1),
         Some(ModSource::lfo(index)),
+        Display::Beside(&mut |ui| displays::lfo(ui, &wave, MOD_COLOR)),
         |ui| {
             combo(ui, &lfo.wave, "The LFO's waveform.", setter);
             mod_slider(
@@ -459,8 +497,27 @@ fn midi_sources(ui: &mut Ui) {
     });
 }
 
-fn filter(ui: &mut Ui, title: &str, filter: &FilterParams, matrix: &Matrix, setter: &ParamSetter) {
-    section(ui, title, None, |ui| {
+fn filter(
+    ui: &mut Ui,
+    title: &str,
+    filter: &FilterParams,
+    filter_env: &FilterEnvParams,
+    matrix: &Matrix,
+    setter: &ParamSetter,
+    gui: &mut Gui,
+) {
+    let settings = displays::FilterSettings::new(
+        filter.model.value().to_filter_model(),
+        filter.filter_type.value().to_filter_type(),
+        filter.cutoff.value(),
+        filter.resonance.value(),
+        // As the synth applies it
+        filter_env.amount.value().powi(2),
+        gui.sample_rate,
+    );
+    let response = &mut gui.state.filter_response;
+    let mut display = |ui: &mut Ui| displays::filter(ui, settings, response);
+    section(ui, title, None, Display::Above(&mut display), |ui| {
         combo(
             ui,
             &filter.model,
@@ -517,7 +574,8 @@ fn filter(ui: &mut Ui, title: &str, filter: &FilterParams, matrix: &Matrix, sett
 }
 
 fn filter_envelope(ui: &mut Ui, title: &str, env: &FilterEnvParams, setter: &ParamSetter) {
-    section(ui, title, Some(ModSource::FilterEnv), |ui| {
+    let mut display = |ui: &mut Ui| envelope_display(ui, &env.envelope);
+    section(ui, title, Some(ModSource::FilterEnv), Display::Above(&mut display), |ui| {
         slider(
             ui,
             &env.amount,
@@ -535,7 +593,17 @@ fn envelope(
     env: &EnvelopeParams,
     setter: &ParamSetter,
 ) {
-    section(ui, title, Some(source), |ui| envelope_rows(ui, env, setter));
+    let mut display = |ui: &mut Ui| envelope_display(ui, env);
+    section(ui, title, Some(source), Display::Above(&mut display), |ui| {
+        envelope_rows(ui, env, setter)
+    });
+}
+
+/// An envelope's shape, worked out the way the synth does it.
+fn envelope_display(ui: &mut Ui, params: &EnvelopeParams) {
+    let mut envelope = AdsrEnvelope::new(0.0, 0.0, 0.0, 0.0, 0.0);
+    crate::apply_envelope_params(&mut envelope, params);
+    displays::envelope(ui, &envelope, MOD_COLOR);
 }
 
 fn envelope_rows(ui: &mut Ui, env: &EnvelopeParams, setter: &ParamSetter) {
@@ -579,7 +647,7 @@ fn envelope_rows(ui: &mut Ui, env: &EnvelopeParams, setter: &ParamSetter) {
 }
 
 fn global(ui: &mut Ui, title: &str, global: &GlobalParams, matrix: &Matrix, setter: &ParamSetter) {
-    section(ui, title, None, |ui| {
+    section(ui, title, None, Display::None, |ui| {
         combo(
             ui,
             &global.polyphony,
@@ -781,9 +849,25 @@ fn drag_handle(ui: &mut Ui, source: ModSource) {
     ));
 }
 
-/// A titled, framed group of controls laid out as a two column (label, control) grid. Sections
-/// that are modulation sources get a drag handle next to their title.
-fn section(ui: &mut Ui, title: &str, source: Option<ModSource>, add_rows: impl FnOnce(&mut Ui)) {
+/// Where a section shows the display of what its controls do.
+enum Display<'a> {
+    None,
+    /// Between the title and the controls.
+    Above(&'a mut dyn FnMut(&mut Ui)),
+    /// To the right of the controls, for sections with only a few.
+    Beside(&'a mut dyn FnMut(&mut Ui)),
+}
+
+/// A titled, framed group of controls laid out as a two column (label, control) grid, with a
+/// display of what they do. Sections that are modulation sources get a drag handle next to
+/// their title.
+fn section(
+    ui: &mut Ui,
+    title: &str,
+    source: Option<ModSource>,
+    display: Display,
+    add_rows: impl FnOnce(&mut Ui),
+) {
     // Widget IDs inside the section are scoped by its title, so the same parameter name (e.g.
     // "Wave") can appear in several sections.
     ui.push_id(title, |ui| {
@@ -797,10 +881,25 @@ fn section(ui: &mut Ui, title: &str, source: Option<ModSource>, add_rows: impl F
                     }
                 });
                 ui.separator();
-                egui::Grid::new("controls")
-                    .num_columns(2)
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| add_rows(ui));
+                let grid = |ui: &mut Ui| {
+                    egui::Grid::new("controls")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| add_rows(ui));
+                };
+                match display {
+                    Display::None => grid(ui),
+                    Display::Above(display) => {
+                        display(ui);
+                        grid(ui);
+                    }
+                    Display::Beside(display) => {
+                        ui.horizontal_top(|ui| {
+                            grid(ui);
+                            display(ui);
+                        });
+                    }
+                }
             });
         });
     });

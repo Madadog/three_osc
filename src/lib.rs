@@ -381,14 +381,17 @@ impl Plugin for ThreeOscPlugin {
                 let path = file.path();
                 let sample_rate = f32::from_bits(sample_rate.load(Ordering::Relaxed));
                 let (result, status) = if path.is_empty() {
+                    file.set_preview(None);
                     (LoadResult::Cleared, String::new())
                 } else {
                     match LoadedSpectra::load(&wavetable_file::resolve(&path)) {
                         Ok(spectra) => {
                             let frames = Arc::new(spectra.generate(sample_rate));
                             let status = spectra.describe(&frames);
+                            file.set_preview(Some(Arc::new(spectra.preview())));
                             (LoadResult::Loaded(Arc::new(spectra), frames), status)
                         }
+                        // The synth keeps playing what it had, and so does the preview
                         Err(error) => (LoadResult::Failed, format!("Error: {error}")),
                     }
                 };
@@ -416,7 +419,7 @@ impl Plugin for ThreeOscPlugin {
     }
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone(), async_executor)
+        editor::create(self.params.clone(), self.loader.sample_rate.clone(), async_executor)
     }
 
     fn initialize(

@@ -333,7 +333,7 @@ impl Filter for FilterContainer {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 /// Used to select FilterContainer without creating a filter.
 pub enum FilterModel {
@@ -344,7 +344,7 @@ pub enum FilterModel {
     SvfSimperFilter,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum FilterType {
     Lowpass,

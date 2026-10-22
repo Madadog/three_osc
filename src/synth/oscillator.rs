@@ -2027,11 +2027,7 @@ impl WavetableFrames {
     /// Resolves a position (0 to 1) to the two frames to crossfade between and the mix amount
     /// between them.
     pub fn frame_indices(&self, position: f32) -> (usize, usize, f32) {
-        let last = self.frames.len().saturating_sub(1);
-        let scaled = position.clamp(0.0, 1.0) * last as f32;
-        let a = (scaled as usize).min(last);
-        let b = (a + 1).min(last);
-        (a, b, scaled - a as f32)
+        frame_indices(self.frames.len(), position)
     }
     /// The table of a frame that is bandlimited for a MIDI note (see
     /// [`WavetableNotes::cycles_to_note()`]).
@@ -2070,48 +2066,92 @@ impl WavetableSet {
     pub fn new(sample_rate: f32, max_len: usize) -> Self {
         // One renderer is shared by all tables; it caches an FFT plan per length.
         let mut renderer = CycleRenderer::new();
-        let mut single = |name: &str, osc: AdditiveOsc| {
-            WavetableFrames::from_spectra(name, &[osc.spectrum()], sample_rate, max_len, &mut renderer)
-        };
-        let sine = single("Sine", AdditiveOsc::sine());
-        let triangle = single("Triangle", AdditiveOsc::triangle());
-        let saw = single("Saw", AdditiveOsc::saw());
-        let exponential = single("Exponential", AdditiveOsc::fake_exp());
-        let square = single("Square", AdditiveOsc::square());
-        let pulse40 = single("Pulse 40%", AdditiveOsc::pulse(0.4));
-        let pulse30 = single("Pulse 30%", AdditiveOsc::pulse(0.3));
-        let pulse20 = single("Pulse 20%", AdditiveOsc::pulse(0.2));
-        let pulse10 = single("Pulse 10%", AdditiveOsc::pulse(0.1));
-
-        // From a square wave down to a very narrow pulse
-        let sweep_spectra: Vec<Spectrum> = (0..PW_SWEEP_FRAMES)
-            .map(|frame| {
-                let duty = 0.5 * (1.0 - frame as f32 / PW_SWEEP_FRAMES as f32);
-                AdditiveOsc::<2048>::pulse(duty).spectrum()
+        let wavetables = builtin_spectra()
+            .into_iter()
+            .map(|(name, spectra)| {
+                WavetableFrames::from_spectra(name, &spectra, sample_rate, max_len, &mut renderer)
             })
             .collect();
-        let sweep =
-            WavetableFrames::from_spectra("PW Sweep", &sweep_spectra, sample_rate, max_len, &mut renderer);
-
-        Self {
-            wavetables: vec![
-                sine,
-                triangle,
-                saw,
-                exponential,
-                square,
-                pulse40,
-                pulse30,
-                pulse20,
-                pulse10,
-                sweep,
-            ],
-        }
+        Self { wavetables }
     }
     /// Total size of all wavetable sample data.
     #[allow(dead_code)] // used by the benchmarks
     pub fn memory_bytes(&self) -> usize {
         self.wavetables.iter().map(WavetableFrames::memory_bytes).sum()
+    }
+}
+
+/// The spectra of the built in wavetables' frames, with their names, in the order of the
+/// oscillators' wave parameter.
+pub fn builtin_spectra() -> Vec<(&'static str, Vec<Spectrum>)> {
+    let single = |name, osc: AdditiveOsc| (name, vec![osc.spectrum()]);
+    // From a square wave down to a very narrow pulse
+    let sweep = (0..PW_SWEEP_FRAMES)
+        .map(|frame| {
+            let duty = 0.5 * (1.0 - frame as f32 / PW_SWEEP_FRAMES as f32);
+            AdditiveOsc::<2048>::pulse(duty).spectrum()
+        })
+        .collect();
+    vec![
+        single("Sine", AdditiveOsc::sine()),
+        single("Triangle", AdditiveOsc::triangle()),
+        single("Saw", AdditiveOsc::saw()),
+        single("Exponential", AdditiveOsc::fake_exp()),
+        single("Square", AdditiveOsc::square()),
+        single("Pulse 40%", AdditiveOsc::pulse(0.4)),
+        single("Pulse 30%", AdditiveOsc::pulse(0.3)),
+        single("Pulse 20%", AdditiveOsc::pulse(0.2)),
+        single("Pulse 10%", AdditiveOsc::pulse(0.1)),
+        ("PW Sweep", sweep),
+    ]
+}
+
+/// Resolves a position (0 to 1) in a wavetable of `frames` frames to the two frames to crossfade
+/// between and the mix amount between them.
+pub fn frame_indices(frames: usize, position: f32) -> (usize, usize, f32) {
+    let last = frames.saturating_sub(1);
+    let scaled = position.clamp(0.0, 1.0) * last as f32;
+    let a = (scaled as usize).min(last);
+    let b = (a + 1).min(last);
+    (a, b, scaled - a as f32)
+}
+
+/// One cycle of each frame of a wavetable, for drawing: [`WavePreview::LEN`] samples with as
+/// many of the frame's harmonics as fit, scaled so that the loudest frame peaks at 1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WavePreview {
+    pub frames: Vec<Vec<f32>>,
+}
+
+impl WavePreview {
+    /// The samples in a frame's cycle.
+    pub const LEN: usize = 512;
+
+    pub fn from_spectra(spectra: &[Spectrum], renderer: &mut CycleRenderer) -> Self {
+        let harmonics = |spectrum: &Spectrum| spectrum.harmonics().min(Self::LEN / 2 - 1);
+        let mut frames = Vec::with_capacity(spectra.len());
+        for pair in spectra.chunks(2) {
+            let first = (&pair[0], harmonics(&pair[0]));
+            let second = pair.get(1).map(|spectrum| (spectrum, harmonics(spectrum)));
+            let (a, b) = renderer.render(Self::LEN, first, second);
+            frames.push(a);
+            frames.extend(b);
+        }
+        let peak = frames.iter().flatten().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        if peak > 0.0 {
+            frames.iter_mut().flatten().for_each(|sample| *sample /= peak);
+        }
+        Self { frames }
+    }
+    /// The cycle at a position (0 to 1) in the wavetable, crossfaded between frames like the
+    /// oscillators do.
+    pub fn cycle(&self, position: f32) -> Vec<f32> {
+        if self.frames.is_empty() {
+            return vec![0.0; Self::LEN];
+        }
+        let (a, b, mix) = frame_indices(self.frames.len(), position);
+        let (a, b) = (&self.frames[a], &self.frames[b]);
+        a.iter().zip(b).map(|(a, b)| a + (b - a) * mix).collect()
     }
 }
 
