@@ -90,6 +90,11 @@ pub struct LadderFilter {
 
     // IIR downsampling filter
     iir_lowpass: IirFilter,
+    /// Interpolates the input up to the oversampled rate: the input, zero-stuffed (and scaled
+    /// by the oversampling factor), through a lowpass with the same design as the decimator.
+    /// Without it the input would be a staircase, whose images around multiples of the sample
+    /// rate the tanh stages mix down into the audio band.
+    iir_upsampler: IirFilter,
 
     /// Source of the tiny amount of noise added to the input to keep the filter alive.
     rng: Rng,
@@ -113,6 +118,11 @@ impl Default for LadderFilter {
             ut_1: 0.0,
             out: 0.0,
             iir_lowpass: IirFilter::new_lowpass(
+                44100.0 * 3.0,
+                IIR_DOWNSAMPLING_BANDWIDTH * 44100.0 / 2.0,
+                IIR_DOWNSAMPLE_ORDER,
+            ),
+            iir_upsampler: IirFilter::new_lowpass(
                 44100.0 * 3.0,
                 IIR_DOWNSAMPLING_BANDWIDTH * 44100.0 / 2.0,
                 IIR_DOWNSAMPLE_ORDER,
@@ -195,6 +205,7 @@ impl LadderFilter {
         let mut dt = [0.0_f64; LADDER_LANES];
         let mut feedback = [0.0_f64; LADDER_LANES];
         let mut z = [[0.0_f64; LADDER_LANES]; IIR_MAX_ORDER];
+        let mut zu = [[0.0_f64; LADDER_LANES]; IIR_MAX_ORDER];
         for (lane, entry) in lanes.iter().enumerate() {
             if let Some((filter, _)) = entry {
                 p0[lane] = filter.p0;
@@ -205,6 +216,9 @@ impl LadderFilter {
                 dt[lane] = filter.dt;
                 feedback[lane] = 8.0 * filter.resonance;
                 for (z, filter_z) in z.iter_mut().zip(filter.iir_lowpass.z.iter()) {
+                    z[lane] = *filter_z;
+                }
+                for (z, filter_z) in zu.iter_mut().zip(filter.iir_upsampler.z.iter()) {
                     z[lane] = *filter_z;
                 }
             }
@@ -226,6 +240,31 @@ impl LadderFilter {
             load(&values)
         };
         let mut z: [__m256d; IIR_MAX_ORDER] = std::array::from_fn(|i| load(&z[i]));
+        let mut zu: [__m256d; IIR_MAX_ORDER] = std::array::from_fn(|i| load(&zu[i]));
+        let interpolate = first.interpolates();
+        let upsampling_gain = _mm256_set1_pd(oversampling_factor as f64);
+
+        // One sample through a resampling filter's cascade, with the same operations as
+        // `IirFilter::filter()`
+        let cascade = |z: &mut [__m256d; IIR_MAX_ORDER], mut out: __m256d| {
+            for biquad in 0..biquads {
+                let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
+                let recursive = _mm256_add_pd(
+                    _mm256_mul_pd(iir_a1[biquad], z0),
+                    _mm256_mul_pd(iir_a2[biquad], z1),
+                );
+                let feedforward = _mm256_add_pd(
+                    _mm256_mul_pd(iir_b1[biquad], z0),
+                    _mm256_mul_pd(iir_b2[biquad], z1),
+                );
+                let scaled = _mm256_mul_pd(iir_k[biquad], out);
+                let biquad_in = _mm256_sub_pd(scaled, recursive);
+                out = _mm256_add_pd(scaled, feedforward);
+                z[2 * biquad + 1] = z0;
+                z[2 * biquad] = biquad_in;
+            }
+            out
+        };
 
         // Padé 3/2 approximant of tanh, the same operations as `tanh_pade32()`
         let tanh = |x: __m256d| {
@@ -246,10 +285,23 @@ impl LadderFilter {
                     input[lane] = buffer[sample] as f64 + noise;
                 }
             }
-            let input = load(&input);
+            let input_sample = load(&input);
 
             // Predictor-corrector integration with full tanh stages, see `process_sample()`
-            for _ in 0..oversampling_factor {
+            for step in 0..oversampling_factor {
+                // The input at this oversampled step: interpolated from the zero-stuffed input,
+                // or held
+                let input = if interpolate {
+                    let stuffed = if step == 0 {
+                        _mm256_mul_pd(input_sample, upsampling_gain)
+                    } else {
+                        _mm256_setzero_pd()
+                    };
+                    cascade(&mut zu, stuffed)
+                } else {
+                    input_sample
+                };
+
                 let tanh_in = tanh(_mm256_sub_pd(ut_1, _mm256_mul_pd(feedback, p3)));
                 let tanh_p0 = tanh(p0);
                 let tanh_p1 = tanh(p1);
@@ -280,7 +332,7 @@ impl LadderFilter {
                 let tanh_new_in = tanh(_mm256_sub_pd(input, _mm256_mul_pd(feedback, p3)));
                 p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
 
-                // The input steps to its new value during the first oversampled step
+                // The input at the previous oversampled step
                 ut_1 = input;
 
                 out = match mode {
@@ -293,24 +345,8 @@ impl LadderFilter {
                 };
 
                 if decimate {
-                    // Every oversampled output goes through the decimation filter, with the
-                    // same operations as `IirFilter::filter()`
-                    for biquad in 0..biquads {
-                        let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
-                        let recursive = _mm256_add_pd(
-                            _mm256_mul_pd(iir_a1[biquad], z0),
-                            _mm256_mul_pd(iir_a2[biquad], z1),
-                        );
-                        let feedforward = _mm256_add_pd(
-                            _mm256_mul_pd(iir_b1[biquad], z0),
-                            _mm256_mul_pd(iir_b2[biquad], z1),
-                        );
-                        let scaled = _mm256_mul_pd(iir_k[biquad], out);
-                        let biquad_in = _mm256_sub_pd(scaled, recursive);
-                        out = _mm256_add_pd(scaled, feedforward);
-                        z[2 * biquad + 1] = z0;
-                        z[2 * biquad] = biquad_in;
-                    }
+                    // Every oversampled output goes through the decimation filter
+                    out = cascade(&mut z, out);
                 }
             }
 
@@ -335,6 +371,7 @@ impl LadderFilter {
         let (p0, p1, p2, p3, ut_1) = (store(p0), store(p1), store(p2), store(p3), store(ut_1));
         let out = store(out);
         let z: Vec<[f64; LADDER_LANES]> = z.iter().map(|z| store(*z)).collect();
+        let zu: Vec<[f64; LADDER_LANES]> = zu.iter().map(|z| store(*z)).collect();
         for (lane, entry) in lanes.iter_mut().enumerate() {
             if let Some((filter, _)) = entry {
                 filter.p0 = p0[lane];
@@ -346,18 +383,35 @@ impl LadderFilter {
                 for (filter_z, z) in filter.iir_lowpass.z.iter_mut().zip(z.iter()) {
                     *filter_z = z[lane];
                 }
+                for (filter_z, z) in filter.iir_upsampler.z.iter_mut().zip(zu.iter()) {
+                    *filter_z = z[lane];
+                }
             }
         }
     }
-    pub fn process_sample(&mut self, mut input: f64) {
+    pub fn process_sample(&mut self, input: f64) {
         let feedback = 8.0 * self.resonance;
         let noise = 1.0e-6 * 2.0 * (self.rng.f64() - 0.5);
-
-        input += noise;
+        let input_sample = input + noise;
+        let interpolate = self.interpolates();
+        let upsampling_gain = self.oversampling_factor as f64;
 
         // integrate filter state
         // with oversampling
-        for _ in 0..self.oversampling_factor {
+        for step in 0..self.oversampling_factor {
+            // The input at this oversampled step: interpolated from the zero-stuffed input,
+            // or held
+            let input = if interpolate {
+                let stuffed = if step == 0 {
+                    input_sample * upsampling_gain
+                } else {
+                    0.0
+                };
+                self.iir_upsampler.filter(stuffed)
+            } else {
+                input_sample
+            };
+
             match self.ladder_integration_method {
                 // semi-implicit euler integration
                 // with full tanh stages
@@ -471,8 +525,7 @@ impl LadderFilter {
                 }
             }
 
-            // As in the original, the input steps to its new value during the first
-            // oversampled step and holds for the rest.
+            // The input at the previous oversampled step
             self.ut_1 = input;
 
             self.out = match self.ladder_filter_mode {
@@ -521,12 +574,13 @@ impl LadderFilter {
         self.update_decimator();
         self.set_integration_rate();
     }
-    /// Designs the decimation filter for the current sample rate, oversampling factor and
-    /// order, if any of them changed: a lowpass running at the oversampled rate that removes
-    /// everything above 90% of the output's Nyquist frequency, so that the distortion the
-    /// filter generates above it doesn't alias when the signal is decimated. Redesigning clears
-    /// the decimator's state, so it is only done when something changed (this is called for
-    /// every control rate block).
+    /// Designs the resampling filters for the current sample rate, oversampling factor and
+    /// order, if any of them changed: lowpasses running at the oversampled rate that remove
+    /// everything above 90% of the output's Nyquist frequency. The upsampler smooths the input
+    /// into the oversampled rate, and the decimator removes the distortion the filter
+    /// generates above the output's Nyquist frequency before the signal is decimated, so that
+    /// it doesn't alias. Redesigning clears their state, so it is only done when something
+    /// changed (this is called for every control rate block).
     fn update_decimator(&mut self) {
         let rate = self.sample_rate * self.oversampling_factor as f64;
         let cutoff = IIR_DOWNSAMPLING_BANDWIDTH * self.sample_rate / 2.0;
@@ -536,7 +590,13 @@ impl LadderFilter {
             || iir.decimator_order != self.decimator_order
         {
             self.iir_lowpass.redesign(rate, cutoff, self.decimator_order);
+            self.iir_upsampler.redesign(rate, cutoff, self.decimator_order);
         }
+    }
+    /// Whether the input is interpolated to the oversampled rate (see `iir_upsampler`). It is
+    /// held at each sample instead when there is no oversampling, or no resampling filter.
+    fn interpolates(&self) -> bool {
+        self.oversampling_factor > 1 && self.iir_upsampler.decimator_order >= 2
     }
 
 }
@@ -830,6 +890,54 @@ mod tests {
         for (freq, floor) in [(5000.0, -3.0), (12000.0, -12.0), (15000.0, -18.0)] {
             let relative = response(freq) - reference;
             assert!(relative > floor, "{freq} Hz is {relative} dB below 1 kHz");
+        }
+    }
+
+    /// The power of `signal` at `freq` Hz (a single DFT bin, via the Goertzel algorithm).
+    fn power_at(signal: &[f32], freq: f64, sample_rate: f64) -> f64 {
+        let coefficient = 2.0 * (2.0 * std::f64::consts::PI * freq / sample_rate).cos();
+        let (mut s1, mut s2) = (0.0_f64, 0.0_f64);
+        for &x in signal {
+            let s0 = x as f64 + coefficient * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - coefficient * s1 * s2) / (signal.len() as f64).powi(2)
+    }
+
+    /// Driving the filter hard with a 7 kHz tone makes odd harmonics. The 5th and 7th (35 and
+    /// 49 kHz) are above the output's Nyquist frequency, and would fold back to 9.1 and 4.9 kHz
+    /// at 44.1 kHz. With the input held at each sample, its images around 44.1 kHz mixed with
+    /// the harmonics in the tanh stages and put products there at about -38 dB, which the
+    /// decimator can't remove; interpolating the input keeps them out of the audio band.
+    #[test]
+    fn interpolated_input_keeps_distortion_from_folding_back() {
+        let rate = 44100.0;
+        let len = rate as usize;
+        for lockstep in [false, true] {
+            let mut filter = LadderFilter::with_seed(1);
+            filter.set_params(rate as f32, 22000.0, 0.7);
+            let mut signal: Vec<f32> = (0..2 * len)
+                .map(|i| 1.5 * (2.0 * std::f64::consts::PI * 7000.0 * i as f64 / rate).sin() as f32)
+                .collect();
+            if lockstep && is_x86_feature_detected!("avx") {
+                for block in signal.chunks_mut(32) {
+                    let mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES] =
+                        std::array::from_fn(|_| None);
+                    lanes[0] = Some((&mut filter, block));
+                    unsafe { LadderFilter::process_block_x4(lanes) };
+                }
+            } else {
+                for sample in signal.iter_mut() {
+                    *sample = filter.process(*sample);
+                }
+            }
+            let settled = &signal[len..];
+            let tone = power_at(settled, 7000.0, rate);
+            for fold in [9100.0, 4900.0] {
+                let relative = 10.0 * (power_at(settled, fold, rate) / tone).log10();
+                assert!(relative < -100.0, "{fold} Hz at {relative} dB (lockstep {lockstep})");
+            }
         }
     }
 
