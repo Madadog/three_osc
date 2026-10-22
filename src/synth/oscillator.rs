@@ -1277,15 +1277,39 @@ mod lookup {
 
         use super::*;
 
+        /// The horizontal sums of eight vectors, as one vector: lane `i` is the sum of the
+        /// lanes of `vectors[i]`. Much cheaper than reducing the vectors one by one.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn horizontal_sum(vector: __m256) -> f32 {
-            let halves = _mm_add_ps(
-                _mm256_castps256_ps128(vector),
-                _mm256_extractf128_ps::<1>(vector),
-            );
-            let pairs = _mm_add_ps(halves, _mm_movehl_ps(halves, halves));
-            _mm_cvtss_f32(_mm_add_ss(pairs, _mm_shuffle_ps::<0x55>(pairs, pairs)))
+        unsafe fn horizontal_sums8(vectors: &[__m256; 8]) -> __m256 {
+            // Pairs of lanes, then pairs of pairs, within each 128-bit half...
+            let pairs01 = _mm256_hadd_ps(vectors[0], vectors[1]);
+            let pairs23 = _mm256_hadd_ps(vectors[2], vectors[3]);
+            let pairs45 = _mm256_hadd_ps(vectors[4], vectors[5]);
+            let pairs67 = _mm256_hadd_ps(vectors[6], vectors[7]);
+            let quads0123 = _mm256_hadd_ps(pairs01, pairs23);
+            let quads4567 = _mm256_hadd_ps(pairs45, pairs67);
+            // ...then the two halves of each vector added together
+            _mm256_add_ps(
+                _mm256_permute2f128_ps::<0x20>(quads0123, quads4567),
+                _mm256_permute2f128_ps::<0x31>(quads0123, quads4567),
+            )
+        }
+
+        /// Adds `values * gains` to `out` (at most 8 samples) sample by sample.
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn add_group(out: &mut [f32], values: __m256, gains: __m256) {
+            let scaled = _mm256_mul_ps(values, gains);
+            if out.len() == UNISON_LANES {
+                _mm256_storeu_ps(out.as_mut_ptr(), _mm256_add_ps(_mm256_loadu_ps(out.as_ptr()), scaled));
+            } else {
+                let mut values = [0.0_f32; UNISON_LANES];
+                _mm256_storeu_ps(values.as_mut_ptr(), scaled);
+                for (out, value) in out.iter_mut().zip(values) {
+                    *out += value;
+                }
+            }
         }
 
         #[inline]
@@ -1404,7 +1428,8 @@ mod lookup {
         #[inline]
         #[target_feature(enable = "avx2,fma")]
         unsafe fn taps_transpose<const INTERP: u8>(base: *const f32, floor: __m256i) -> Taps {
-            let mut offsets = [0_i32; UNISON_LANES];
+            // Unsigned, so that widening an offset to a pointer offset is free
+            let mut offsets = [0_u32; UNISON_LANES];
             _mm256_storeu_si256(offsets.as_mut_ptr() as *mut __m256i, floor);
             let row = |voice: usize| _mm_loadu_ps(base.add(offsets[voice] as usize));
             // Pair up rows so that each 128-bit half holds one row: (r0|r4), (r1|r5), ...
@@ -1707,44 +1732,70 @@ mod lookup {
             let needs_mono = !stereo || output.mono.is_some();
 
             let mut controls = Controls::new(params);
-            for n in 0..output.left.len() {
-                let sample = controls.next(n);
-                if let Some(delta) = sample.fm_delta {
-                    for (vector_deltas, factors) in deltas.iter_mut().zip(&factors).take(vectors) {
-                        *vector_deltas = voice_deltas(delta, factors);
+            let len = output.left.len();
+            let mut start = 0;
+            while start < len {
+                // Eight samples at a time: each sample's sums over the voices stay vectors
+                // until the eight are reduced together, which is much cheaper than reducing
+                // every sample on its own, and they are added to the outputs as a vector.
+                let group = UNISON_LANES.min(len - start);
+                let mut gains = [0.0_f32; UNISON_LANES];
+                let mut monos = [_mm256_setzero_ps(); UNISON_LANES];
+                let mut lefts = [_mm256_setzero_ps(); UNISON_LANES];
+                let mut rights = [_mm256_setzero_ps(); UNISON_LANES];
+                for k in 0..group {
+                    let sample = controls.next(start + k);
+                    gains[k] = sample.gain;
+                    if let Some(delta) = sample.fm_delta {
+                        for (vector_deltas, factors) in deltas.iter_mut().zip(&factors).take(vectors) {
+                            *vector_deltas = voice_deltas(delta, factors);
+                        }
+                    }
+                    let offset = _mm256_set1_epi32(sample.phase_offset as i32);
+                    let mut mono = _mm256_setzero_ps();
+                    let mut left = _mm256_setzero_ps();
+                    let mut right = _mm256_setzero_ps();
+                    for vector in 0..vectors {
+                        phases[vector] = _mm256_add_epi32(phases[vector], deltas[vector]);
+                        if sample.fm_delta.is_none() {
+                            deltas[vector] = _mm256_add_epi32(deltas[vector], delta_steps[vector]);
+                        }
+                        let samples = read_frames8::<GATHER, INTERP>(
+                            &table_a,
+                            &table_b,
+                            frames.mix,
+                            _mm256_add_epi32(phases[vector], offset),
+                        );
+                        if needs_mono {
+                            mono = _mm256_fmadd_ps(samples, load(&params.mask[vector]), mono);
+                        }
+                        if stereo {
+                            left = _mm256_fmadd_ps(samples, load(&params.pan_left[vector]), left);
+                            right = _mm256_fmadd_ps(samples, load(&params.pan_right[vector]), right);
+                        }
+                    }
+                    (monos[k], lefts[k], rights[k]) = (mono, left, right);
+                }
+
+                let end = start + group;
+                let gains = _mm256_loadu_ps(gains.as_ptr());
+                if stereo {
+                    add_group(&mut output.left[start..end], horizontal_sums8(&lefts), gains);
+                    let right_out = output.right.as_deref_mut().unwrap();
+                    add_group(&mut right_out[start..end], horizontal_sums8(&rights), gains);
+                }
+                if needs_mono {
+                    let mono = horizontal_sums8(&monos);
+                    if !stereo {
+                        add_group(&mut output.left[start..end], mono, gains);
+                    }
+                    if let Some((mono_out, scale)) = &mut output.mono {
+                        let mut values = [0.0_f32; UNISON_LANES];
+                        _mm256_storeu_ps(values.as_mut_ptr(), _mm256_mul_ps(mono, _mm256_set1_ps(*scale)));
+                        mono_out[start..end].copy_from_slice(&values[..group]);
                     }
                 }
-                let offset = _mm256_set1_epi32(sample.phase_offset as i32);
-                let mut mono = _mm256_setzero_ps();
-                let mut left = _mm256_setzero_ps();
-                let mut right = _mm256_setzero_ps();
-                for vector in 0..vectors {
-                    phases[vector] = _mm256_add_epi32(phases[vector], deltas[vector]);
-                    if sample.fm_delta.is_none() {
-                        deltas[vector] = _mm256_add_epi32(deltas[vector], delta_steps[vector]);
-                    }
-                    let samples = read_frames8::<GATHER, INTERP>(
-                        &table_a,
-                        &table_b,
-                        frames.mix,
-                        _mm256_add_epi32(phases[vector], offset),
-                    );
-                    if needs_mono {
-                        mono = _mm256_fmadd_ps(samples, load(&params.mask[vector]), mono);
-                    }
-                    if stereo {
-                        left = _mm256_fmadd_ps(samples, load(&params.pan_left[vector]), left);
-                        right = _mm256_fmadd_ps(samples, load(&params.pan_right[vector]), right);
-                    }
-                }
-                write_sample(
-                    output,
-                    n,
-                    sample.gain,
-                    || horizontal_sum(mono),
-                    || horizontal_sum(left),
-                    || horizontal_sum(right),
-                );
+                start = end;
             }
             for (vector, phase) in phases.iter().enumerate() {
                 store_u32(&mut voice.voice_phases[vector], *phase);

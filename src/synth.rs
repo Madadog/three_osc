@@ -801,7 +801,8 @@ impl Voice {
     ) {
         let block_len = block_len.min(out_left.len()).min(out_right.len());
         // The gain of each sample is computed from its index rather than accumulated, so the
-        // samples don't depend on each other and the loop vectorises.
+        // samples don't depend on each other and the loop vectorises. The index goes through an
+        // `i32`, which converts to a float in one instruction (a `usize` takes several).
         let (gain, step) = (self.gain, self.gain_step);
         let left = &self.pre_filter[..block_len];
         let out_left = &mut out_left[..block_len];
@@ -811,13 +812,13 @@ impl Voice {
             for (n, (((out_l, out_r), left), right)) in
                 izip!(out_left, out_right).zip(left).zip(right).enumerate()
             {
-                let gain = gain + step * n as f32;
+                let gain = gain + step * n as i32 as f32;
                 *out_l += left * gain;
                 *out_r += right * gain;
             }
         } else {
             for (n, ((out_l, out_r), left)) in izip!(out_left, out_right).zip(left).enumerate() {
-                let sample = left * (gain + step * n as f32);
+                let sample = left * (gain + step * n as i32 as f32);
                 *out_l += sample;
                 *out_r += sample;
             }
