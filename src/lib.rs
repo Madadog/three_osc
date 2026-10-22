@@ -15,7 +15,9 @@ mod editor;
 mod params;
 mod synth;
 
-use params::{multiplier_to_pitch_multiplier, ModParams, OscParams, ThreeOscParams};
+use params::{multiplier_to_pitch_multiplier, EnvelopeParams, ModParams, OscParams, ThreeOscParams};
+use synth::envelopes::AdsrEnvelope;
+use synth::modulation::{ModSource, ModTarget, Route};
 use synth::oscillator::OscillatorParams;
 use synth::ThreeOsc;
 
@@ -71,12 +73,7 @@ impl ThreeOscPlugin {
         synth.interpolation = global.interpolation.value().to_interpolation();
 
         // Master gain envelope
-        let vol_env = &params.vol_env;
-        synth.gain_envelope.attack_time = vol_env.attack.value();
-        synth.gain_envelope.decay_time = vol_env.decay.value();
-        synth.gain_envelope.sustain_level = vol_env.sustain.value();
-        synth.gain_envelope.release_time = vol_env.release.value();
-        synth.gain_envelope.set_slope(vol_env.slope.value());
+        apply_envelope_params(&mut synth.gain_envelope, &params.vol_env);
 
         // Filter
         let filter = &params.filter;
@@ -84,28 +81,33 @@ impl ThreeOscPlugin {
         let controller = &mut synth.filter_controller;
         controller.envelope_amount = filter_env.amount.value().powi(2);
         controller.keytrack = filter.keytrack.value();
-        controller.cutoff_envelope.attack_time = filter_env.envelope.attack.value();
-        controller.cutoff_envelope.decay_time = filter_env.envelope.decay.value();
-        controller.cutoff_envelope.sustain_level = filter_env.envelope.sustain.value();
-        controller.cutoff_envelope.release_time = filter_env.envelope.release.value();
-        controller
-            .cutoff_envelope
-            .set_slope(filter_env.envelope.slope.value());
+        apply_envelope_params(&mut controller.cutoff_envelope, &filter_env.envelope);
         controller.target_cutoff = filter.cutoff.value();
         controller.resonance = filter.resonance.value();
         controller.drive = filter.drive.value();
         controller.filter_type = filter.filter_type.value().to_filter_type();
         controller.filter_model = filter.model.value().to_filter_model();
 
-        // LFO
-        let lfo = &params.lfo;
-        synth.lfo_params.target_osc = lfo.target.value().to_osc_index();
-        synth.lfo_params.wave = lfo.wave.value().to_osc_wave();
-        synth.lfo_params.freq = lfo.freq.value();
-        synth.lfo_params.freq_mod = lfo.freq_mod.value().powi(2);
-        synth.lfo_params.amp_mod = lfo.amp_mod.value();
-        synth.lfo_params.mod_mod = lfo.mod_mod.value();
-        synth.lfo_params.filter_mod = lfo.filter_mod.value();
+        // Modulation: LFOs, envelopes and the matrix. The routes vector has room for every
+        // slot, so this doesn't allocate.
+        for (lfo, lfo_params) in synth.lfos.iter_mut().zip(params.lfos.iter()) {
+            lfo.wave = lfo_params.wave.value().to_osc_wave();
+            lfo.freq = lfo_params.rate.value();
+        }
+        for (envelope, env_params) in synth.mod_envelopes.iter_mut().zip(params.mod_envs.iter()) {
+            apply_envelope_params(envelope, &env_params.envelope);
+        }
+        synth.routes.clear();
+        for slot in params.mod_slots.iter() {
+            let route = Route {
+                source: slot.source.value(),
+                target: slot.target.value(),
+                amount: slot.amount.value(),
+            };
+            if route.source != ModSource::None && route.target != ModTarget::None && route.amount != 0.0 {
+                synth.routes.push(route);
+            }
+        }
 
         // Oscillators
         let global_pitch = global.global_pitch.value() as f32;
@@ -134,6 +136,14 @@ impl ThreeOscPlugin {
                 // The synth expects the raw 14-bit MIDI pitch bend value, with 8192 as the centre.
                 self.synth
                     .pitch_bend((value * 16383.0).round().clamp(0.0, 16383.0) as u16);
+            }
+            // Modulation wheel
+            NoteEvent::MidiCC { cc: 1, value, .. } => self.synth.mod_wheel = value.clamp(0.0, 1.0),
+            NoteEvent::MidiChannelPressure { pressure, .. } => {
+                self.synth.aftertouch = pressure.clamp(0.0, 1.0)
+            }
+            NoteEvent::PolyPressure { note, pressure, .. } => {
+                self.synth.poly_pressure(note, pressure)
             }
             _ => (),
         }
@@ -194,16 +204,26 @@ fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch
     osc.octave = params.octave.value();
     osc.pitch_multiplier = multiplier_to_pitch_multiplier(params.multiplier.value());
     osc.voice_count = params.voices.value() as u8;
-    osc.voices_detune = (params.super_detune.value() / 100.0).powi(3);
+    // The synth cubes the detune amount, after any modulation
+    osc.voices_detune = params.super_detune.value() / 100.0;
     osc.phase = params.phase.value() / 100.0;
     osc.phase_rand = params.phase_rand.value() / 100.0;
 }
 
-/// Applies the PM/FM/AM amounts for an oscillator that has a modulator after it.
+/// Applies the PM/FM/AM amounts for an oscillator that has a modulator after it. The synth
+/// squares them, after any modulation.
 fn apply_mod_params(osc: &mut OscillatorParams, params: &ModParams) {
-    osc.pm = params.pm.value().powi(2);
-    osc.fm = params.fm.value().powi(2);
-    osc.am = params.am.value().powi(2);
+    osc.pm = params.pm.value();
+    osc.fm = params.fm.value();
+    osc.am = params.am.value();
+}
+
+fn apply_envelope_params(envelope: &mut AdsrEnvelope, params: &EnvelopeParams) {
+    envelope.attack_time = params.attack.value();
+    envelope.decay_time = params.decay.value();
+    envelope.sustain_level = params.sustain.value();
+    envelope.release_time = params.release.value();
+    envelope.set_slope(params.slope.value());
 }
 
 /// Converts nih-plug's `[0, 1]` velocity to the 7-bit MIDI velocity the synth engine uses.
@@ -349,7 +369,7 @@ mod tests {
     #[test]
     fn wavetable_order_matches_the_wave_parameter() {
         let set = synth::oscillator::WavetableSet::new(44100.0, 64);
-        let names: Vec<&str> = set.wavetables.iter().map(|wavetable| wavetable.name).collect();
+        let names: Vec<&str> = set.wavetables.iter().map(|wavetable| wavetable.name.as_str()).collect();
         assert_eq!(names, params::OscillatorWave::variants());
     }
 
@@ -461,6 +481,159 @@ mod tests {
         }
     }
 
+    /// Renders a note with the default patch plus the given modulation routes, with
+    /// deterministic phases and random source.
+    fn render_with_routes(plugin: &mut ThreeOscPlugin, routes: &[Route], note: u8) -> Vec<f32> {
+        plugin.synth.reset();
+        plugin.apply_params();
+        plugin.synth.routes.clear();
+        plugin.synth.routes.extend_from_slice(routes);
+        for osc in plugin.synth.oscillators.iter_mut() {
+            osc.phase_rand = 0.0;
+        }
+        plugin.synth.note_on(note, 100);
+        let mut left = vec![0.0; 4096];
+        let mut right = vec![0.0; 4096];
+        plugin.synth.run(&mut left, &mut right);
+        assert!(left.iter().all(|sample| sample.is_finite()));
+        left
+    }
+
+    /// Modulation routes change the sound, and routes with no effect don't.
+    #[test]
+    fn modulation_routes_change_the_sound() {
+        let mut plugin = ThreeOscPlugin::default();
+        let route = |source, target, amount| Route {
+            source,
+            target,
+            amount,
+        };
+        let reference = render_with_routes(&mut plugin, &[], 60);
+
+        // A route to nothing, from nothing, or to a silent oscillator's position leaves the
+        // sound alone
+        for routes in [
+            vec![route(ModSource::Lfo1, ModTarget::None, 1.0)],
+            vec![route(ModSource::None, ModTarget::Cutoff, 1.0)],
+            vec![route(ModSource::Lfo1, ModTarget::Osc3Position, 1.0)],
+        ] {
+            assert_eq!(max_abs_diff(&render_with_routes(&mut plugin, &routes, 60), &reference), 0.0);
+        }
+        // Every kind of target on the audible oscillator changes the sound (with a negative
+        // amount, since the LFO starts with its positive half and the amplitude is already at
+        // its maximum)
+        for target in [
+            ModTarget::Pitch,
+            ModTarget::FinePitch,
+            ModTarget::Volume,
+            ModTarget::Osc1Pitch,
+            ModTarget::Osc1Amp,
+            ModTarget::Cutoff,
+        ] {
+            let modulated =
+                render_with_routes(&mut plugin, &[route(ModSource::Lfo1, target, -0.5)], 60);
+            assert!(max_abs_diff(&modulated, &reference) > 1e-3, "{target:?}");
+        }
+        // Keytracking is zero at middle C, so it changes nothing there and something elsewhere
+        let key = [route(ModSource::Key, ModTarget::Pitch, 0.5)];
+        assert_eq!(max_abs_diff(&render_with_routes(&mut plugin, &key, 60), &reference), 0.0);
+        let reference_72 = render_with_routes(&mut plugin, &[], 72);
+        assert!(max_abs_diff(&render_with_routes(&mut plugin, &key, 72), &reference_72) > 1e-3);
+        // The mod wheel and aftertouch only matter once they're moved
+        for source in [ModSource::ModWheel, ModSource::Aftertouch] {
+            let routes = [route(source, ModTarget::Cutoff, -0.8)];
+            plugin.synth.mod_wheel = 0.0;
+            plugin.synth.aftertouch = 0.0;
+            assert_eq!(max_abs_diff(&render_with_routes(&mut plugin, &routes, 60), &reference), 0.0);
+            plugin.synth.mod_wheel = 1.0;
+            plugin.synth.aftertouch = 1.0;
+            assert!(max_abs_diff(&render_with_routes(&mut plugin, &routes, 60), &reference) > 1e-3);
+        }
+        plugin.synth.mod_wheel = 0.0;
+        plugin.synth.aftertouch = 0.0;
+    }
+
+    /// A modulated amplitude makes a silent oscillator audible, and modulated PM makes a silent
+    /// modulator matter.
+    #[test]
+    fn modulation_can_switch_oscillators_on() {
+        let mut plugin = ThreeOscPlugin::default();
+        let reference = render_with_routes(&mut plugin, &[], 60);
+        let amp = Route {
+            source: ModSource::Velocity,
+            target: ModTarget::Osc2Amp,
+            amount: 1.0,
+        };
+        assert!(max_abs_diff(&render_with_routes(&mut plugin, &[amp], 60), &reference) > 1e-3);
+        let pm = Route {
+            source: ModSource::Env1,
+            target: ModTarget::Osc1Pm,
+            amount: 0.3,
+        };
+        assert!(max_abs_diff(&render_with_routes(&mut plugin, &[pm], 60), &reference) > 1e-3);
+    }
+
+    /// MIDI control events reach the modulation sources.
+    #[test]
+    fn midi_control_events_reach_the_sources() {
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.apply_params();
+        let events = [
+            NoteEvent::NoteOn {
+                timing: 0,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                velocity: 0.8,
+            },
+            NoteEvent::MidiCC {
+                timing: 1,
+                channel: 0,
+                cc: 1,
+                value: 0.75,
+            },
+            NoteEvent::MidiChannelPressure {
+                timing: 2,
+                channel: 0,
+                pressure: 0.5,
+            },
+            NoteEvent::PolyPressure {
+                timing: 3,
+                voice_id: None,
+                channel: 0,
+                note: 60,
+                pressure: 0.25,
+            },
+            // Other controllers are ignored
+            NoteEvent::MidiCC {
+                timing: 4,
+                channel: 0,
+                cc: 7,
+                value: 0.1,
+            },
+        ];
+        let mut left = vec![0.0; 64];
+        let mut right = vec![0.0; 64];
+        plugin.render(events.into_iter(), &mut left, &mut right);
+        assert_eq!(plugin.synth.mod_wheel, 0.75);
+        assert_eq!(plugin.synth.aftertouch, 0.5);
+        assert_eq!(plugin.synth.voices.len(), 1);
+    }
+
+    /// Parameter IDs must be unique for the host to tell the parameters apart.
+    #[test]
+    fn parameter_ids_are_unique() {
+        let params = ThreeOscParams::default();
+        let mut ids: Vec<String> = params.param_map().into_iter().map(|(id, _, _)| id).collect();
+        let count = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
+        assert!(ids.contains(&String::from("mod_source_16")));
+        assert!(ids.contains(&String::from("lfo_rate_3")));
+        assert!(ids.contains(&String::from("env_attack_2")));
+    }
+
     /// Renders one note with the default patch, the given number of unison voices on every
     /// oscillator, and the given stereo width.
     fn render_stereo(plugin: &mut ThreeOscPlugin, voices: u8, width: f32) -> (Vec<f32>, Vec<f32>) {
@@ -469,7 +642,7 @@ mod tests {
         plugin.synth.stereo_width = width;
         for osc in plugin.synth.oscillators.iter_mut() {
             osc.voice_count = voices;
-            osc.voices_detune = 0.05;
+            osc.voices_detune = 0.37;
             // Deterministic phases, so that different renders can be compared.
             osc.phase_rand = 0.0;
         }

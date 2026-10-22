@@ -13,6 +13,7 @@ use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 
 use crate::synth::filter::{FilterModel, FilterType};
+use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
 use crate::synth::oscillator::{Interpolation, OscWave};
 use crate::synth::Polyphony;
 
@@ -147,34 +148,6 @@ impl InterpolationParam {
 }
 
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LfoTarget {
-    #[id = "all"]
-    #[name = "All Oscs"]
-    All,
-    #[id = "osc1"]
-    #[name = "Osc. 1"]
-    Osc1,
-    #[id = "osc2"]
-    #[name = "Osc. 2"]
-    Osc2,
-    #[id = "osc3"]
-    #[name = "Osc. 3"]
-    Osc3,
-}
-
-impl LfoTarget {
-    /// The index of the targeted oscillator, or `None` when the LFO targets all oscillators.
-    pub fn to_osc_index(self) -> Option<usize> {
-        match self {
-            LfoTarget::All => None,
-            LfoTarget::Osc1 => Some(0),
-            LfoTarget::Osc2 => Some(1),
-            LfoTarget::Osc3 => Some(2),
-        }
-    }
-}
-
-#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolyphonyParam {
     #[id = "polyphonic"]
     Polyphonic,
@@ -223,8 +196,16 @@ pub struct ThreeOscParams {
     #[nested(id_prefix = "vol", group = "Volume Env.")]
     pub vol_env: EnvelopeParams,
 
-    #[nested(id_prefix = "lfo", group = "LFO 1")]
-    pub lfo: LfoParams,
+    #[nested(array, group = "LFO")]
+    pub lfos: [LfoParams; N_LFOS],
+
+    /// The envelopes that are only there to be modulation sources.
+    #[nested(array, group = "Env")]
+    pub mod_envs: [ModEnvParams; N_MOD_ENVELOPES],
+
+    /// The modulation matrix.
+    #[nested(array, group = "Mod")]
+    pub mod_slots: [ModSlotParams; N_SLOTS],
 
     #[nested(group = "Global")]
     pub global: GlobalParams,
@@ -247,7 +228,9 @@ impl Default for ThreeOscParams {
 
             vol_env: EnvelopeParams::new(0.002, 0.25, 1.0, 0.005),
 
-            lfo: LfoParams::new(),
+            lfos: std::array::from_fn(|_| LfoParams::new()),
+            mod_envs: std::array::from_fn(|_| ModEnvParams::new()),
+            mod_slots: std::array::from_fn(|_| ModSlotParams::new()),
 
             global: GlobalParams::new(),
         }
@@ -508,54 +491,98 @@ impl EnvelopeParams {
     }
 }
 
+/// A low frequency oscillator, which is a modulation source (see [`ModSlotParams`]).
 #[derive(Params)]
 pub struct LfoParams {
-    #[id = "target"]
-    pub target: EnumParam<LfoTarget>,
-    #[id = "wave"]
+    #[id = "lfo_wave"]
     pub wave: EnumParam<Wave>,
     /// LFO frequency in Hz.
-    #[id = "freq"]
-    pub freq: FloatParam,
-    /// Pitch modulation amount (vibrato).
-    #[id = "freq_mod"]
-    pub freq_mod: FloatParam,
-    /// Amplitude modulation amount (tremolo).
-    #[id = "amp_mod"]
-    pub amp_mod: FloatParam,
-    /// Modulation of the PM/FM/AM amounts the target receives.
-    #[id = "mod_mod"]
-    pub mod_mod: FloatParam,
-    /// Filter cutoff modulation amount.
-    #[id = "filter_mod"]
-    pub filter_mod: FloatParam,
+    #[id = "lfo_rate"]
+    pub rate: FloatParam,
 }
 
 impl LfoParams {
     pub fn new() -> Self {
         Self {
-            target: EnumParam::new("Target Osc.", LfoTarget::All),
             wave: EnumParam::new("Wave", Wave::Sine),
-            freq: FloatParam::new(
-                "Freq.",
+            rate: FloatParam::new(
+                "Rate",
                 5.0,
                 FloatRange::Skewed {
                     min: 0.01,
-                    max: 22000.0,
-                    factor: FloatRange::skew_factor(-3.0),
+                    max: 100.0,
+                    factor: FloatRange::skew_factor(-2.0),
                 },
             )
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            freq_mod: skewed_amount_param("-> Vibrato", 0.0),
-            amp_mod: skewed_amount_param("-> Tremolo", 0.0),
-            mod_mod: skewed_amount_param("-> Modulation", 0.0),
-            filter_mod: skewed_amount_param("-> Fil. Cutoff", 0.0),
         }
     }
 }
 
 impl Default for LfoParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An envelope that is only a modulation source.
+#[derive(Params)]
+pub struct ModEnvParams {
+    #[nested(id_prefix = "env")]
+    pub envelope: EnvelopeParams,
+}
+
+impl ModEnvParams {
+    pub fn new() -> Self {
+        Self {
+            envelope: EnvelopeParams::new(0.0, 0.5, 0.0, 0.1),
+        }
+    }
+}
+
+impl Default for ModEnvParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One route of the modulation matrix: a source, a target, and how much of the source is
+/// applied to the target (see [`crate::synth::modulation`]).
+#[derive(Params)]
+pub struct ModSlotParams {
+    #[id = "mod_source"]
+    pub source: EnumParam<ModSource>,
+    #[id = "mod_target"]
+    pub target: EnumParam<ModTarget>,
+    /// From -100% to 100%, with finer control around zero.
+    #[id = "mod_amount"]
+    pub amount: FloatParam,
+}
+
+impl ModSlotParams {
+    pub fn new() -> Self {
+        Self {
+            source: EnumParam::new("Source", ModSource::None),
+            target: EnumParam::new("Target", ModTarget::None),
+            amount: FloatParam::new(
+                "Amount",
+                0.0,
+                FloatRange::SymmetricalSkewed {
+                    min: -1.0,
+                    max: 1.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                    center: 0.0,
+                },
+            )
+            .with_unit(" %")
+            .with_value_to_string(v2s_signed_percentage())
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+        }
+    }
+}
+
+impl Default for ModSlotParams {
     fn default() -> Self {
         Self::new()
     }
@@ -657,20 +684,10 @@ fn amount_param(name: impl Into<String>, default: f32) -> FloatParam {
         .with_string_to_value(formatters::s2v_f32_percentage())
 }
 
-/// A `0.0..=1.0` parameter displayed as a percentage, with more resolution for small values.
-fn skewed_amount_param(name: impl Into<String>, default: f32) -> FloatParam {
-    FloatParam::new(
-        name,
-        default,
-        FloatRange::Skewed {
-            min: 0.0,
-            max: 1.0,
-            factor: FloatRange::skew_factor(-1.5),
-        },
-    )
-    .with_unit(" %")
-    .with_value_to_string(formatters::v2s_f32_percentage(1))
-    .with_string_to_value(formatters::s2v_f32_percentage())
+/// Formats a `-1.0..=1.0` value as a whole percentage, without a negative zero (which would
+/// not round trip through the string conversions).
+fn v2s_signed_percentage() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
+    Arc::new(|value| format!("{:.0}", (value * 100.0).round() + 0.0))
 }
 
 /// An envelope time parameter in seconds, up to 15 seconds, with more resolution for short times.
@@ -779,6 +796,16 @@ mod tests {
         assert_eq!(multiplier_to_pitch_multiplier(1), 2.0);
         assert_eq!(multiplier_to_pitch_multiplier(-1), 0.5);
         assert_eq!(multiplier_to_pitch_multiplier(-3), 0.25);
+    }
+
+    #[test]
+    fn signed_percentage_has_no_negative_zero() {
+        let to_string = v2s_signed_percentage();
+        assert_eq!(to_string(-0.004), "0");
+        assert_eq!(to_string(-0.5), "-50");
+        assert_eq!(to_string(0.996), "100");
+        let from_string = formatters::s2v_f32_percentage();
+        assert_eq!(from_string("-50 %"), Some(-0.5));
     }
 
     #[test]

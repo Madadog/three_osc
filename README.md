@@ -19,7 +19,7 @@ Currently a work in progress, but usable nevertheless.
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic, linear or no interpolation (a global control, for trading quality against CPU)
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
-* Vibrato, tremolo and modulation control with an LFO
+* A modulation matrix: three LFOs, two spare envelopes, the volume and filter envelopes, velocity, key position, mod wheel, aftertouch and a per-note random value can each modulate pitch, wavetable position, amplitude, unison detune, PM/FM/AM amounts, filter cutoff, resonance and drive, note volume and the LFO rates, through 16 routes. Drag a source's handle onto a slider in the GUI to route it.
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
 * MIDI pitch bend with an adjustable range
 * A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page. Hover a control's label for a description of what it does.
@@ -58,8 +58,13 @@ Rough throughput numbers for the synth engine (time per sample for a few patches
 cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 ```
 
+### Modulation
+Every modulation route goes from a source to a target with an amount from -100% to 100%. At 100% a source's full swing moves a slider target across its whole length, a pitch target by an octave (the Fine Pitch target by a semitone), the filter cutoff by 10 octaves, the resonance by 10 times, the drive by 32 times and an LFO's rate by 4 octaves; a target's routes add up and the result is clamped to the control's range. The LFOs and the random value are bipolar (-1 to 1), the envelopes and MIDI sources go from 0 to 1. Each note runs its own copies of the LFOs and envelopes, so the routes are evaluated per voice at the control rate (see below). In the GUI, drag the handle next to a source's title (or in the "More Sources" box) onto any slider with a drop highlight to fill in a free row of the matrix; modulated sliders show an orange marker that lists their routes.
+
 ### Control rate
-Envelopes, pitch (including portamento and vibrato), the LFO, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFO, which can't go faster than half the control rate. Change the constant to try other sizes.
+Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate. Change the constant to try other sizes.
+
+The control rate code uses polynomial approximations of `2^x`, `log2`, `x^y`, `sin` and `tan` (in `src/synth/fastmath.rs`), accurate to around single precision, instead of the standard library's functions, which cost more than rendering the block's samples.
 
 ### Interpolation
 The global Interpolation control picks how the wavetables are read in between their samples: Cubic (4-point Hermite, the default and cleanest), Linear, or None (the sample below the read position, which steps audibly on all but the lowest notes). Each mode has its own specialised lookup kernels, so there is no per-sample cost to the choice. On an 8 note, 3 x 8 voice supersaw, Linear is about 20% cheaper than Cubic and None about 30% cheaper.
@@ -67,7 +72,7 @@ The global Interpolation control picks how the wavetables are read in between th
 ### Oscillator kernels and SIMD
 Each oscillator renders a whole control rate block in one kernel call: the unison voices' phases advance as vectors, every sample reads and interpolates the wavetable at each voice and sums the voices into the block, and a modulated oscillator reads its modulator's block sample for sample (the oscillators are rendered from the last to the first, so the modulation is still instantaneous). Phases are 32-bit fixed point: one cycle is 2^32, so they wrap for free and pitch resolves to 2^-32 cycles per sample, and a phase splits into a table index and a fraction with a shift and a mask (wavetable cycles are powers of two long).
 
-The reads run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. There are two AVX2 variants, one reading each voice's taps with a 128-bit load and transposing them, the other using gather instructions; which is faster depends on the CPU (gathers are slow on the Intel generations with the "Downfall" mitigation, Skylake to Tiger Lake), so the two are timed against each other when the synth starts. The ladder filter processes four voices in lockstep with AVX, producing exactly the same output as the one-voice-at-a-time version. Everything is detected at runtime, so one build runs on any x86-64 CPU.
+The reads run with AVX2 and FMA where the CPU has them, falling back to a portable path otherwise. There are two AVX2 variants, one reading each voice's taps with a 128-bit load and transposing them, the other using gather instructions; which is faster depends on the CPU (gathers are slow on the Intel generations with the "Downfall" mitigation, Skylake to Tiger Lake), so the two are timed against each other when the synth starts. The filters run several voices in lockstep: the Digital filter eight at a time in portable SIMD vectors and the ladder four at a time with AVX, both producing exactly the same output as the one-voice-at-a-time versions (a filter's recurrence is a chain of dependent operations, so one voice on its own leaves most of the CPU idle). Everything is detected at runtime, so one build runs on any x86-64 CPU.
 
 The lookups are not memory bound: shrinking the tables 8 times or tripling the number of notes changes the cost per voice by a few percent, so a 16-bit table format would buy little.
 
@@ -107,7 +112,6 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Optimise
 * Extract DSP to internal crate
 * Better wavetable interpolation (sinc or Niemitalo's optimal interpolators; currently 4-point cubic Hermite at best)
-* Approximate/cache expensive computations (i.e. any uses of `powf`)
 * Fix buffer size to reduce expensive modulation calculations at the expense of sample-accurate automation (make const so that you can play around with buffer lengths, see what is good)
 * Come up with better name for "Initial Pitch Slide" control
 * Improve the UI

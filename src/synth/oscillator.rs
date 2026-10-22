@@ -232,6 +232,7 @@ pub struct OscillatorParams {
     total_multiplier: f32,
 
     pub voice_count: u8,
+    /// Unison detune amount from 0 to 1, see `update_detune_factors()`.
     pub voices_detune: f32,
     /// Amp to keep volume roughly equal across different voice counts
     pub unison_amp: f32,
@@ -246,13 +247,11 @@ pub struct OscillatorParams {
 
     /// Index of the wavetable (in the synth's [`WavetableSet`]) this oscillator plays.
     pub wavetable: usize,
+    /// Play the wavetable loaded from a file for this oscillator instead.
+    pub use_file: bool,
     /// Position within the wavetable, from 0 to 1. Morphs between the frames of wavetables that
     /// have more than one.
     pub position: f32,
-    /// The frames to crossfade between for the current position, see `update_frames()`.
-    frame_a: usize,
-    frame_b: usize,
-    frame_mix: f32,
 
     /// Starting phase, in cycles.
     pub phase: f32,
@@ -298,14 +297,23 @@ impl OscillatorParams {
     /// 1, the others spread out above and below it by the unison detune) and the voice mask.
     pub fn update_detune_factors(&mut self) {
         let voice_count = self.unison_voices();
-        let mut factors = [1.0_f32; MAX_UNISON];
         let mut mask = [0.0_f32; MAX_UNISON];
-        for i in 0..voice_count {
-            factors[i] = 1.0 + unison_detune_index(i) as f32 * self.voices_detune / voice_count as f32;
-            mask[i] = 1.0;
+        for mask in mask.iter_mut().take(voice_count) {
+            *mask = 1.0;
         }
-        self.detune_factors = to_vectors(&factors);
+        self.detune_factors = self.detune_factors_for(self.voices_detune);
         self.voice_mask = to_vectors(&mask);
+    }
+    /// The unison voices' phase delta factors for a unison detune amount from 0 to 1. The amount
+    /// is cubed, for finer control over small detunes, and spread over the voices in use.
+    pub fn detune_factors_for(&self, detune: f32) -> [f32x8; UNISON_VECTORS] {
+        let voice_count = self.unison_voices();
+        let spread = detune.powi(3) / voice_count as f32;
+        let mut factors = [1.0_f32; MAX_UNISON];
+        for (i, factor) in factors.iter_mut().enumerate().take(voice_count) {
+            *factor = 1.0 + unison_detune_index(i) as f32 * spread;
+        }
+        to_vectors(&factors)
     }
     /// The `(left, right)` gain of a unison voice.
     pub fn pan_gain(&self, voice: usize) -> (f32, f32) {
@@ -314,23 +322,9 @@ impl OscillatorParams {
             self.pan_right[voice / UNISON_LANES].as_array()[voice % UNISON_LANES],
         )
     }
-    /// Resolves the wavetable position to the two frames to crossfade between. Must be called
-    /// before `frame_pair()` whenever the wavetable or position changed.
-    pub fn update_frames(&mut self, set: &WavetableSet) {
+    /// Keeps the wavetable index within the set.
+    pub fn clamp_wavetable(&mut self, set: &WavetableSet) {
         self.wavetable = self.wavetable.min(set.wavetables.len() - 1);
-        (self.frame_a, self.frame_b, self.frame_mix) =
-            set.wavetables[self.wavetable].frame_indices(self.position);
-    }
-    /// The wavetable frames to generate a voice from, bandlimited for the given MIDI note (see
-    /// [`WavetableNotes::cycles_to_note()`]).
-    #[inline]
-    pub fn frame_pair<'a>(&self, set: &'a WavetableSet, note: usize) -> FramePair<'a> {
-        let frames = &set.wavetables[self.wavetable].frames;
-        FramePair {
-            a: &frames[self.frame_a].tables[note],
-            b: &frames[self.frame_b].tables[note],
-            mix: self.frame_mix,
-        }
     }
     /// Updates the left and right gain of each unison voice for the given stereo width, where 0
     /// is mono and 1 spreads the voices across the whole stereo field.
@@ -395,17 +389,15 @@ impl Default for OscillatorParams {
             pitch_multiplier: 1.0,
             total_multiplier: 1.0,
             voice_count: 1,
-            voices_detune: 0.1,
+            voices_detune: 0.21,
             unison_amp: 1.0,
             pan_left: [f32x8::splat(1.0); UNISON_VECTORS],
             pan_right: [f32x8::splat(1.0); UNISON_VECTORS],
             voice_mask: [f32x8::splat(1.0); UNISON_VECTORS],
             detune_factors: [f32x8::splat(1.0); UNISON_VECTORS],
             wavetable: 0,
+            use_file: false,
             position: 0.0,
-            frame_a: 0,
-            frame_b: 0,
-            frame_mix: 0.0,
             phase: 0.0,
             phase_rand: 1.0,
             pitch_bend: 0.0,
@@ -652,14 +644,16 @@ impl Wavetable {
     pub fn generate(&self, phase: f32) -> f32 {
         self.read_fixed::<CUBIC>(cycles_to_fixed(phase))
     }
-    pub fn from_additive_osc_ifft(
-        osc: &AdditiveOsc,
+    /// One cycle of the first `harmonics` partials of a spectrum, `len` samples long. `fft`
+    /// must be an inverse FFT plan of length `len`.
+    pub fn from_spectrum(
+        spectrum: &Spectrum,
         len: usize,
         harmonics: usize,
         fft: &dyn Fft<f32>,
     ) -> Self {
         let mut table: Vec<f32> = vec![0.0; len];
-        osc.generate_ifft(&mut table, harmonics, fft);
+        spectrum.render_ifft(&mut table, harmonics, fft);
         Self::new(table)
     }
 }
@@ -1417,30 +1411,28 @@ mod lookup {
     }
 }
 
-/// Wave generator with a unique wavetable for each midi note index (extended to the 44.1 kHz
-/// Nyquist frequency, so 138 notes).
+/// Wave generator with a bandlimited wavetable for each midi note index (extended to the 44.1 kHz
+/// Nyquist frequency, so 138 notes), or for each group of notes (see [`NoteLevels`]).
 ///
 /// Wavetables can be trivially bandlimited by generating each table with additive synthesis
 /// with harmonics up to the Nyquist frequency. The table can then be sampled for cheap,
 /// alias-free synthesis.
 ///
 /// ... At least, in theory. If we had a perfect sampling function (which consists of summing
-/// sines again), this would be the case but we are instead using linear interpolation, which creates
-/// discontinuous straight lines which cause aliasing. Currently we suppress these artifacts by
-/// oversampling the wavetables (initialising them several times larger than they need to be).
-/// This reduces the amplitude of the artifacts and makes them more harmonically distant from
-/// the source. 8 times oversampling seems to provide reasonable artifact suppression (-60 dB or
-/// lower compared to the fundamental).
+/// sines again), this would be the case but we are instead using (at best) cubic interpolation,
+/// which deviates from the bandlimited signal in between the samples and so aliases a little.
+/// The artifacts are suppressed by oversampling the wavetables (making them several times
+/// longer than the harmonics need), which reduces their amplitude and makes them more
+/// harmonically distant from the source: each table is at least 8 times longer than twice its
+/// highest harmonic (see [`table_len_for()`]), up to a maximum length that caps the lowest notes.
 ///
 /// Of course, all this is made sort of irrelevant by the fact that you can just use additive
 /// synthesis while rendering since you have unlimited time to generate the sound, thus providing
 /// completely alias-free oscillators. But it was fun to implement, and it's fun to perform in
-/// realtime because of how cheap it is to sample + lerp.
-///
-/// The artifacts could be reduced further by using better interpolation (with a derivative closer
-/// to that of the original signal).
+/// realtime because of how cheap it is to sample + interpolate.
 pub struct WavetableNotes {
-    pub tables: [Wavetable; 138],
+    /// One table per level of the frames' [`NoteLevels`].
+    pub tables: Vec<Wavetable>,
 }
 
 impl WavetableNotes {
@@ -1463,36 +1455,117 @@ impl WavetableNotes {
         };
         note.min(137)
     }
-    /// Generates a bandlimited wavetable for each midi note using fast fourier transforms, with constant wavetable length
-    pub fn from_additive_osc_ifft(
-        osc: &AdditiveOsc,
-        sample_rate: f32,
-        table_length: usize,
-        fft: &dyn Fft<f32>,
-    ) -> Self {
-        let tables: Vec<Wavetable> = (0..=137)
-            .into_iter()
-            .map(|x| {
-                if x == 137 {
-                    // highest note has no harmonics, so notes above nyquist are silent
-                    0
-                } else {
-                    // Number of harmonics required for note
-                    (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((x - 69) as f32 / 12.0))).floor()
-                        as usize
-                }
-            })
-            .map(|harmonics| {
-                // clamp to nyquist
-                let harmonics = harmonics.min(table_length / 2);
-                Wavetable::from_additive_osc_ifft(osc, table_length, harmonics, fft)
-            })
-            .collect();
-        Self {
-            tables: tables.try_into().unwrap(),
+    /// The number of harmonics a note can have below the Nyquist frequency.
+    pub fn harmonics_for_note(note: usize, sample_rate: f32) -> usize {
+        if note >= NoteLevels::NOTES - 1 {
+            // The highest note has no harmonics, so notes above the Nyquist frequency are silent
+            0
+        } else {
+            (sample_rate / (2.0 * 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0))).floor()
+                as usize
         }
     }
+    /// Generates a bandlimited wavetable for each level of `levels` from a spectrum, each at
+    /// most `max_len` samples long (see [`table_len_for()`]).
+    pub fn from_spectrum(
+        spectrum: &Spectrum,
+        sample_rate: f32,
+        levels: &NoteLevels,
+        max_len: usize,
+        planner: &mut FftPlanner<f32>,
+    ) -> Self {
+        let tables = (0..levels.count())
+            .map(|level| {
+                let harmonics = WavetableNotes::harmonics_for_note(levels.top_note(level), sample_rate)
+                    .min(spectrum.harmonics());
+                let len = table_len_for(harmonics, max_len);
+                let fft = planner.plan_fft_inverse(len);
+                Wavetable::from_spectrum(spectrum, len, harmonics.min(len / 2), &*fft)
+            })
+            .collect();
+        Self { tables }
+    }
 }
+
+/// The smallest table a note gets, so that the top notes with only a few harmonics still have
+/// something to interpolate.
+pub const MIN_TABLE_LEN: usize = 64;
+
+/// The length of a table that holds `harmonics` harmonics: a power of two at least 8 times the
+/// 2 samples per cycle the highest harmonic strictly needs (so the interpolation has little to
+/// do), between [`MIN_TABLE_LEN`] and `max_len`.
+pub fn table_len_for(harmonics: usize, max_len: usize) -> usize {
+    (harmonics * 16)
+        .next_power_of_two()
+        .clamp(MIN_TABLE_LEN, max_len.max(MIN_TABLE_LEN))
+}
+
+/// How the notes of a wavetable share bandlimited tables: notes are grouped into levels of
+/// `step` semitones, and each level's table is bandlimited for the highest note of the group.
+/// A step of 1 gives every note its own table, so the harmonics of every note extend to the
+/// Nyquist frequency; larger steps trade the top of the spectrum of the lower notes of each group
+/// (less than a step's worth of octave, so the highest harmonics) for memory, which matters for
+/// wavetables with many frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteLevels {
+    step: usize,
+}
+
+impl NoteLevels {
+    /// The MIDI notes covered: 0 to 137, which reaches the 44.1 kHz Nyquist frequency.
+    pub const NOTES: usize = 138;
+    /// The steps to choose from when fitting a wavetable into a memory budget.
+    pub const STEPS: [usize; 6] = [1, 2, 3, 4, 6, 12];
+
+    pub fn new(step: usize) -> Self {
+        Self {
+            step: step.clamp(1, Self::NOTES),
+        }
+    }
+    /// A level for every note.
+    pub fn per_note() -> Self {
+        Self::new(1)
+    }
+    pub fn step(&self) -> usize {
+        self.step
+    }
+    /// The number of levels (tables).
+    pub fn count(&self) -> usize {
+        Self::NOTES.div_ceil(self.step)
+    }
+    /// The level a note reads.
+    #[inline]
+    pub fn level(&self, note: usize) -> usize {
+        note.min(Self::NOTES - 1) / self.step
+    }
+    /// The highest note of a level, which its table is bandlimited for.
+    pub fn top_note(&self, level: usize) -> usize {
+        ((level + 1) * self.step - 1).min(Self::NOTES - 1)
+    }
+    /// The sample data of a wavetable with `frames` frames of a spectrum with `harmonics`
+    /// harmonics at these levels, in bytes.
+    pub fn memory_bytes(&self, frames: usize, harmonics: usize, sample_rate: f32, max_len: usize) -> usize {
+        let samples: usize = (0..self.count())
+            .map(|level| {
+                let harmonics = WavetableNotes::harmonics_for_note(self.top_note(level), sample_rate)
+                    .min(harmonics);
+                table_len_for(harmonics, max_len) + TABLE_PADDING_BEFORE + TABLE_PADDING_AFTER
+            })
+            .sum();
+        samples * frames * std::mem::size_of::<f32>()
+    }
+    /// The finest levels whose wavetable fits in `budget` bytes (or the coarsest, if none do).
+    pub fn fitting(budget: usize, frames: usize, harmonics: usize, sample_rate: f32, max_len: usize) -> Self {
+        Self::STEPS
+            .iter()
+            .map(|&step| Self::new(step))
+            .find(|levels| levels.memory_bytes(frames, harmonics, sample_rate, max_len) <= budget)
+            .unwrap_or(Self::new(*Self::STEPS.last().unwrap()))
+    }
+}
+
+/// The memory a wavetable's tables may take, which decides its [`NoteLevels`].
+pub const WAVETABLE_MEMORY_BUDGET: usize = 24 << 20;
 
 /// Number of frames in the pulse width sweep wavetable.
 pub const PW_SWEEP_FRAMES: usize = 32;
@@ -1500,12 +1573,45 @@ pub const PW_SWEEP_FRAMES: usize = 32;
 /// A wavetable in the wavetable synth sense: one or more frames (waveforms, each bandlimited per
 /// note) that an oscillator can morph between with its position control.
 pub struct WavetableFrames {
-    /// Display name, which matches the oscillators' wave parameter.
-    #[allow(dead_code)] // only read by the tests and benchmarks so far
-    pub name: &'static str,
+    /// Display name, which matches the oscillators' wave parameter for the built in ones.
+    pub name: String,
     pub frames: Vec<WavetableNotes>,
+    /// Which table of each frame a note reads.
+    pub levels: NoteLevels,
 }
 impl WavetableFrames {
+    /// Generates a wavetable from the spectra of its frames, for the given sample rate. The
+    /// levels are picked to fit [`WAVETABLE_MEMORY_BUDGET`].
+    pub fn from_spectra(
+        name: impl Into<String>,
+        spectra: &[Spectrum],
+        sample_rate: f32,
+        max_len: usize,
+        planner: &mut FftPlanner<f32>,
+    ) -> Self {
+        let harmonics = spectra
+            .iter()
+            .map(Spectrum::harmonics)
+            .max()
+            .unwrap_or(0);
+        let levels = NoteLevels::fitting(
+            WAVETABLE_MEMORY_BUDGET,
+            spectra.len(),
+            harmonics,
+            sample_rate,
+            max_len,
+        );
+        Self {
+            name: name.into(),
+            frames: spectra
+                .iter()
+                .map(|spectrum| {
+                    WavetableNotes::from_spectrum(spectrum, sample_rate, &levels, max_len, planner)
+                })
+                .collect(),
+            levels,
+        }
+    }
     /// Resolves a position (0 to 1) to the two frames to crossfade between and the mix amount
     /// between them.
     pub fn frame_indices(&self, position: f32) -> (usize, usize, f32) {
@@ -1515,8 +1621,24 @@ impl WavetableFrames {
         let b = (a + 1).min(last);
         (a, b, scaled - a as f32)
     }
+    /// The table of a frame that is bandlimited for a MIDI note (see
+    /// [`WavetableNotes::cycles_to_note()`]).
+    #[inline]
+    pub fn table(&self, frame: usize, note: usize) -> &Wavetable {
+        &self.frames[frame].tables[self.levels.level(note)]
+    }
+    /// The wavetable frames to generate a voice from: the two frames to crossfade between and
+    /// the mix between them (see [`frame_indices()`][Self::frame_indices()]), bandlimited for
+    /// the given MIDI note.
+    #[inline]
+    pub fn frame_pair(&self, (a, b, mix): (usize, usize, f32), note: usize) -> FramePair<'_> {
+        FramePair {
+            a: self.table(a, note),
+            b: self.table(b, note),
+            mix,
+        }
+    }
     /// Size of the wavetable's sample data.
-    #[allow(dead_code)] // used by the benchmarks
     pub fn memory_bytes(&self) -> usize {
         self.frames
             .iter()
@@ -1531,42 +1653,45 @@ pub struct WavetableSet {
     pub wavetables: Vec<WavetableFrames>,
 }
 impl WavetableSet {
-    /// Generates the wavetables for the given sample rate. The order matches the oscillators'
-    /// wave parameter.
-    pub fn new(sample_rate: f32, table_len: usize) -> Self {
-        // One FFT plan is shared by all tables; planning is comparatively expensive.
-        let fft = FftPlanner::new().plan_fft_inverse(table_len);
-        let notes = |osc: &AdditiveOsc| {
-            WavetableNotes::from_additive_osc_ifft(osc, sample_rate, table_len, &*fft)
+    /// Generates the wavetables for the given sample rate, with tables of at most `max_len`
+    /// samples. The order matches the oscillators' wave parameter.
+    pub fn new(sample_rate: f32, max_len: usize) -> Self {
+        // One planner is shared by all tables; it caches a plan per length.
+        let mut planner = FftPlanner::new();
+        let mut single = |name: &str, osc: AdditiveOsc| {
+            WavetableFrames::from_spectra(name, &[osc.spectrum()], sample_rate, max_len, &mut planner)
         };
-        let single = |name, osc: AdditiveOsc| WavetableFrames {
-            name,
-            frames: vec![notes(&osc)],
-        };
-        let pulse = |name, duty| single(name, AdditiveOsc::pulse(duty));
+        let sine = single("Sine", AdditiveOsc::sine());
+        let triangle = single("Triangle", AdditiveOsc::triangle());
+        let saw = single("Saw", AdditiveOsc::saw());
+        let exponential = single("Exponential", AdditiveOsc::fake_exp());
+        let square = single("Square", AdditiveOsc::square());
+        let pulse40 = single("Pulse 40%", AdditiveOsc::pulse(0.4));
+        let pulse30 = single("Pulse 30%", AdditiveOsc::pulse(0.3));
+        let pulse20 = single("Pulse 20%", AdditiveOsc::pulse(0.2));
+        let pulse10 = single("Pulse 10%", AdditiveOsc::pulse(0.1));
 
         // From a square wave down to a very narrow pulse
-        let sweep = WavetableFrames {
-            name: "PW Sweep",
-            frames: (0..PW_SWEEP_FRAMES)
-                .map(|frame| {
-                    let duty = 0.5 * (1.0 - frame as f32 / PW_SWEEP_FRAMES as f32);
-                    notes(&AdditiveOsc::pulse(duty))
-                })
-                .collect(),
-        };
+        let sweep_spectra: Vec<Spectrum> = (0..PW_SWEEP_FRAMES)
+            .map(|frame| {
+                let duty = 0.5 * (1.0 - frame as f32 / PW_SWEEP_FRAMES as f32);
+                AdditiveOsc::<2048>::pulse(duty).spectrum()
+            })
+            .collect();
+        let sweep =
+            WavetableFrames::from_spectra("PW Sweep", &sweep_spectra, sample_rate, max_len, &mut planner);
 
         Self {
             wavetables: vec![
-                single("Sine", AdditiveOsc::sine()),
-                single("Triangle", AdditiveOsc::triangle()),
-                single("Saw", AdditiveOsc::saw()),
-                single("Exponential", AdditiveOsc::fake_exp()),
-                single("Square", AdditiveOsc::square()),
-                pulse("Pulse 40%", 0.4),
-                pulse("Pulse 30%", 0.3),
-                pulse("Pulse 20%", 0.2),
-                pulse("Pulse 10%", 0.1),
+                sine,
+                triangle,
+                saw,
+                exponential,
+                square,
+                pulse40,
+                pulse30,
+                pulse20,
+                pulse10,
                 sweep,
             ],
         }
@@ -1575,6 +1700,58 @@ impl WavetableSet {
     #[allow(dead_code)] // used by the benchmarks
     pub fn memory_bytes(&self) -> usize {
         self.wavetables.iter().map(WavetableFrames::memory_bytes).sum()
+    }
+}
+
+/// The harmonics of one cycle of a waveform: `bins[k]` is the complex amplitude of harmonic
+/// `k` (`bins[0]`, the DC offset, is ignored), in the convention where the waveform is the real
+/// part of `sum(bins[k] * e^(i * k * theta))`. A real cycle `x` of `N` samples with forward FFT
+/// `X` has `bins[k] = 2 * X[k] / N`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spectrum {
+    pub bins: Vec<Complex32>,
+}
+
+impl Spectrum {
+    /// The spectrum of one cycle of a waveform, with the DC offset dropped. `fft` must be a
+    /// forward FFT plan of the cycle's length.
+    pub fn from_cycle(cycle: &[f32], fft: &dyn Fft<f32>) -> Self {
+        assert_eq!(cycle.len(), fft.len());
+        let mut buffer: Vec<Complex32> = cycle.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        fft.process(&mut buffer);
+        let scale = 2.0 / cycle.len() as f32;
+        // Harmonics up to, but not including, the Nyquist bin
+        let mut bins: Vec<Complex32> = buffer
+            .iter()
+            .take(cycle.len().div_ceil(2))
+            .map(|bin| bin * scale)
+            .collect();
+        if let Some(dc) = bins.first_mut() {
+            *dc = Complex32::new(0.0, 0.0);
+        }
+        Self { bins }
+    }
+    /// The highest harmonic.
+    pub fn harmonics(&self) -> usize {
+        self.bins.len().saturating_sub(1)
+    }
+    /// Renders one cycle of the first `harmonics` harmonics into `output` using an inverse FFT.
+    /// `fft` must be an inverse FFT plan with the same length as `output`, which must be at least
+    /// twice `harmonics` to keep the result bandlimited.
+    pub fn render_ifft(&self, output: &mut [f32], harmonics: usize, fft: &dyn Fft<f32>) {
+        assert_eq!(output.len(), fft.len());
+        assert!(harmonics <= output.len() / 2);
+
+        // Bin 0 is the DC offset, which is always zero.
+        let mut buffer = vec![Complex32::new(0.0, 0.0); output.len()];
+        for (bin, value) in buffer.iter_mut().zip(self.bins.iter()).skip(1).take(harmonics) {
+            *bin = *value;
+        }
+        fft.process(&mut buffer);
+
+        for (sample, output) in izip!(buffer.iter(), output.iter_mut()) {
+            *output = sample.re;
+        }
     }
 }
 
@@ -1603,31 +1780,17 @@ impl<const N: usize> AdditiveOsc<N> {
             *sample = self.generate(delta * i as f32, harmonics);
         }
     }
-    /// Renders one cycle of the first `harmonics` partials into `output` using an inverse FFT.
-    /// `fft` must be an inverse FFT plan with the same length as `output`, which must be at least
-    /// twice `harmonics` to keep the result bandlimited.
-    pub fn generate_ifft(&self, output: &mut [f32], harmonics: usize, fft: &dyn Fft<f32>) {
-        assert_eq!(output.len(), fft.len());
-        assert!(harmonics <= output.len() / 2);
-
-        // Bin 0 is the DC offset, which is always zero.
-        let mut buffer = vec![Complex32::new(0.0, 0.0); output.len()];
-        for (bin, (amplitude, phase)) in buffer
-            .iter_mut()
-            .skip(1)
-            .zip(self.amplitudes.iter().zip(self.phases.iter()))
-            .take(harmonics)
-        {
+    /// The partials as a [`Spectrum`], for rendering with an inverse FFT.
+    pub fn spectrum(&self) -> Spectrum {
+        let mut bins = Vec::with_capacity(N + 1);
+        bins.push(Complex32::new(0.0, 0.0));
+        for (amplitude, phase) in self.amplitudes.iter().zip(self.phases.iter()) {
             // `i * amplitude * e^(i * phase)`, which the inverse FFT turns into
             // `-amplitude * sin(n * theta + phase)`.
             let (sin, cos) = phase.sin_cos();
-            *bin = Complex32::new(-amplitude * sin, amplitude * cos);
+            bins.push(Complex32::new(-amplitude * sin, amplitude * cos));
         }
-        fft.process(&mut buffer);
-
-        for (sample, output) in izip!(buffer.iter(), output.iter_mut()) {
-            *output = sample.re;
-        }
+        Spectrum { bins }
     }
     pub fn sine() -> Self {
         let mut amplitudes = [0.0; N];
@@ -2086,7 +2249,7 @@ mod tests {
     #[test]
     fn pulse_wavetable_has_the_expected_duty_cycle() {
         let fft = FftPlanner::new().plan_fft_inverse(2048);
-        let table = Wavetable::from_additive_osc_ifft(&AdditiveOsc::pulse(0.25), 2048, 1024, &*fft);
+        let table = Wavetable::from_spectrum(&AdditiveOsc::<2048>::pulse(0.25).spectrum(), 2048, 1024, &*fft);
         let cycle = table.cycle();
         let high = cycle.iter().filter(|sample| **sample > 0.0).count();
         assert!((high as f32 / 2048.0 - 0.25).abs() < 0.01, "{high}");
@@ -2106,5 +2269,73 @@ mod tests {
         assert_eq!((a, b), (15, 16));
         assert!((mix - 0.5).abs() < 1e-5);
         assert_eq!(sweep.frame_indices(1.0), (31, 31, 0.0));
+    }
+
+    /// A cycle's spectrum renders the cycle back (minus its DC offset), at any length that holds
+    /// its harmonics.
+    #[test]
+    fn spectrum_round_trips_a_cycle() {
+        let len = 600;
+        let cycle: Vec<f32> = (0..len)
+            .map(|i| {
+                let phase = 2.0 * PI * i as f32 / len as f32;
+                0.3 + 0.5 * phase.sin() + 0.25 * (3.0 * phase + 1.0).cos() + 0.1 * (40.0 * phase).sin()
+            })
+            .collect();
+        let mut planner = FftPlanner::new();
+        let spectrum = Spectrum::from_cycle(&cycle, &*planner.plan_fft_forward(len));
+        assert_eq!(spectrum.harmonics(), 299);
+        assert!((spectrum.bins[1].norm() - 0.5).abs() < 1e-4);
+        assert!((spectrum.bins[3].norm() - 0.25).abs() < 1e-4);
+        assert!((spectrum.bins[40].norm() - 0.1).abs() < 1e-4);
+
+        let mut rendered = vec![0.0; len];
+        spectrum.render_ifft(&mut rendered, 299, &*planner.plan_fft_inverse(len));
+        for (got, want) in rendered.iter().zip(&cycle) {
+            assert!((got - (want - 0.3)).abs() < 1e-4, "{got} vs {want}");
+        }
+        // At a power of two length the same waveform comes out, resampled
+        let table = Wavetable::from_spectrum(&spectrum, 1024, 299, &*planner.plan_fft_inverse(1024));
+        assert!((table.generate(0.25) - (0.5 + 0.25 * (3.0 * PI / 2.0 + 1.0).cos() + 0.1 * (10.0 * PI).sin())).abs() < 1e-3);
+    }
+
+    /// Tables are as long as their harmonics need, and levels group notes to fit a budget.
+    #[test]
+    fn table_lengths_and_levels_follow_the_harmonics() {
+        assert_eq!(table_len_for(0, 2048), MIN_TABLE_LEN);
+        assert_eq!(table_len_for(4, 2048), MIN_TABLE_LEN);
+        assert_eq!(table_len_for(5, 2048), 128);
+        assert_eq!(table_len_for(64, 2048), 1024);
+        assert_eq!(table_len_for(1000, 2048), 2048);
+        assert_eq!(table_len_for(1000, 8192), 8192);
+
+        let per_note = NoteLevels::per_note();
+        assert_eq!(per_note.count(), 138);
+        assert_eq!(per_note.level(60), 60);
+        assert_eq!(per_note.top_note(60), 60);
+        let coarse = NoteLevels::new(12);
+        assert_eq!(coarse.count(), 12);
+        assert_eq!(coarse.level(0), 0);
+        assert_eq!(coarse.level(11), 0);
+        assert_eq!(coarse.level(12), 1);
+        assert_eq!(coarse.level(137), 11);
+        assert_eq!(coarse.top_note(0), 11);
+        assert_eq!(coarse.top_note(11), 137);
+
+        // A single frame fits per note, 256 frames of 1024 harmonics need coarser levels
+        assert_eq!(NoteLevels::fitting(WAVETABLE_MEMORY_BUDGET, 1, 1024, 44100.0, 2048).step(), 1);
+        let many = NoteLevels::fitting(WAVETABLE_MEMORY_BUDGET, 256, 1024, 44100.0, 2048);
+        assert!(many.step() > 1);
+        assert!(many.memory_bytes(256, 1024, 44100.0, 2048) <= WAVETABLE_MEMORY_BUDGET);
+        // Higher notes have fewer harmonics, so the top tables are the smallest
+        let set = WavetableSet::new(44100.0, 2048);
+        let saw = &set.wavetables[2];
+        assert_eq!(saw.levels, NoteLevels::per_note());
+        assert_eq!(saw.table(0, 0).cycle_len(), 2048);
+        assert_eq!(saw.table(0, 60).cycle_len(), 2048);
+        assert!(saw.table(0, 96).cycle_len() < 2048);
+        assert_eq!(saw.table(0, 137).cycle_len(), MIN_TABLE_LEN);
+        // The set used to take 43 MB with every table 2048 samples long
+        assert!(set.memory_bytes() < 30 << 20, "{}", set.memory_bytes());
     }
 }

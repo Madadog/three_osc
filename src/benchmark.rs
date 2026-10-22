@@ -74,7 +74,7 @@ fn measure_notes(name: &str, notes: &[u8], setup: impl Fn(&mut ThreeOscPlugin)) 
 fn supersaw(osc: &mut OscillatorParams) {
     osc.amp = 1.0;
     osc.voice_count = 8;
-    osc.voices_detune = 0.01;
+    osc.voices_detune = 0.215;
     select_saw(osc);
 }
 
@@ -167,6 +167,20 @@ fn benchmark_synth() {
     measure("default patch, ladder filter", |plugin| {
         plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
     });
+    measure("default patch, 4 modulation routes", |plugin| {
+        use crate::synth::modulation::{ModSource, ModTarget, Route};
+        let route = |source, target, amount| Route {
+            source,
+            target,
+            amount,
+        };
+        plugin.synth.routes.extend_from_slice(&[
+            route(ModSource::Lfo1, ModTarget::FinePitch, 0.2),
+            route(ModSource::Env1, ModTarget::Cutoff, 0.6),
+            route(ModSource::Lfo2, ModTarget::Osc1Position, 0.5),
+            route(ModSource::Velocity, ModTarget::Osc1Amp, -0.3),
+        ]);
+    });
     measure("3 x saw, unison 8, PM + FM", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(|osc| {
             supersaw(osc);
@@ -245,7 +259,7 @@ fn benchmark_lookup_kernel() {
     };
     let mut osc = OscillatorParams::default();
     osc.voice_count = 8;
-    osc.voices_detune = 0.01;
+    osc.voices_detune = 0.215;
     osc.update_detune_factors();
     osc.update_pan_gains(1.0);
     let params = BlockParams {

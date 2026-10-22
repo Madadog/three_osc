@@ -214,21 +214,11 @@ impl FilterController {
             filter_model: FilterModel::RcFilter,
         }
     }
-    pub fn get_cutoff(
-        &self,
-        cutoff_mult: f32,
-        envelope_index: f32,
-        release_index: Option<u32>,
-        sample_rate: f32,
-    ) -> f32 {
-        let envelope = if let Some(release_index) = release_index {
-            let release_time = release_index as f32 / sample_rate;
-            self.cutoff_envelope
-                .sample_released(release_time, envelope_index)
-        } else {
-            self.cutoff_envelope.sample_held(envelope_index)
-        };
-        let envelope = envelope * self.envelope_amount * (440.0 + self.cutoff * cutoff_mult) * 50.0;
+    /// The filter cutoff for a voice: the cutoff control scaled by `cutoff_mult` (keytracking
+    /// and modulation), plus the cutoff envelope at the given level.
+    pub fn get_cutoff(&self, cutoff_mult: f32, envelope_level: f32, sample_rate: f32) -> f32 {
+        let envelope =
+            envelope_level * self.envelope_amount * (440.0 + self.cutoff * cutoff_mult) * 50.0;
         // The filters are only stable below the Nyquist frequency, which matters at low sample
         // rates where the cutoff control's range extends past it.
         let max_cutoff = (sample_rate * 0.49).clamp(10.0, 22000.0);

@@ -98,8 +98,10 @@ fn exp2_fraction(f: f32) -> f32 {
 }
 
 // Minimax fit of 2^f on [-0.5, 0.5] with the constant term pinned to 1 (so that whole powers
-// of two come out exact), relative error 9.1e-8
+// of two come out exact), relative error 9.1e-8. The first coefficient lands near ln(2), as
+// the Taylor series would have it, but it is a fit, not the constant.
 const EXP2_C0: f32 = 1.0;
+#[allow(clippy::approx_constant)]
 const EXP2_C1: f32 = 0.693_147;
 const EXP2_C2: f32 = 0.240_222_42;
 const EXP2_C3: f32 = 0.055_507_337;
@@ -113,7 +115,9 @@ const LOG2_C5: f32 = 0.577_078_04;
 const LOG2_C7: f32 = 0.412_198_57;
 const LOG2_C9: f32 = 0.320_598_9;
 
-// Minimax fit of sin(2 pi x) on [-0.25, 0.25], absolute error 3.3e-9
+// Minimax fit of sin(2 pi x) on [-0.25, 0.25], absolute error 3.3e-9. Like the 2^f fit, the
+// first coefficient only happens to land near 2 pi.
+#[allow(clippy::approx_constant)]
 const SIN_C1: f32 = 6.283_185;
 const SIN_C3: f32 = -41.341_655;
 const SIN_C5: f32 = 81.601_004;
