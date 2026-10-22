@@ -1049,6 +1049,24 @@ mod lookup {
         const CHUNK: usize = 32;
         const CHUNK_VECTORS: usize = CHUNK / UNISON_LANES;
 
+        /// Adds `values * gains` to `out` sample by sample, `out` being a chunk (at most
+        /// `CHUNK` samples) of an output: whole vectors at once, then what's left over.
+        #[inline]
+        fn add_chunk(out: &mut [f32], values: &[f32x8; CHUNK_VECTORS], gains: &[f32x8; CHUNK_VECTORS]) {
+            let whole = out.len() / UNISON_LANES;
+            for (vector, out) in out.chunks_exact_mut(UNISON_LANES).enumerate() {
+                let sum = f32x8::new(out.try_into().unwrap()) + values[vector] * gains[vector];
+                out.copy_from_slice(sum.as_array());
+            }
+            let rest = &mut out[whole * UNISON_LANES..];
+            if !rest.is_empty() {
+                let scaled = values[whole] * gains[whole];
+                for (out, scaled) in rest.iter_mut().zip(scaled.as_array()) {
+                    *out += scaled;
+                }
+            }
+        }
+
         /// Renders a block with the vectors running across time rather than across voices,
         /// for a few voices: the portable version of the AVX2
         /// [`render_block_timewise()`][super::avx2::render_block_timewise()], see there.
@@ -1073,7 +1091,10 @@ mod lookup {
                 deltas[i] = cycles_to_fixed(params.delta * factor);
                 delta_steps[i] = cycles_to_fixed(params.delta_step * factor);
             }
-            // `n + 1` and `n (n + 1) / 2` for the samples of a chunk
+            // `n`, `n + 1` and `n (n + 1) / 2` for the samples of a chunk
+            let indices: [i32x8; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+                i32x8::new(std::array::from_fn(|lane| (vector * UNISON_LANES + lane) as i32))
+            });
             let counts: [u32x8; CHUNK_VECTORS] = std::array::from_fn(|vector| {
                 u32x8::new(std::array::from_fn(|lane| (vector * UNISON_LANES + lane + 1) as u32))
             });
@@ -1091,26 +1112,33 @@ mod lookup {
                 let chunk_len = end - start;
                 let vectors = chunk_len.div_ceil(UNISON_LANES);
 
-                let mut gains = [0.0_f32; CHUNK];
-                let mut offsets = [0_u32; CHUNK];
+                let mut gains = [f32x8::ZERO; CHUNK_VECTORS];
+                let mut offsets = [u32x8::ZERO; CHUNK_VECTORS];
                 let mut fm_deltas = [0.0_f32; CHUNK];
                 if params.modulation.is_some() {
+                    let mut sample_gains = [0.0_f32; CHUNK];
+                    let mut sample_offsets = [0_u32; CHUNK];
                     for n in 0..chunk_len {
                         let sample = controls.next(start + n);
-                        gains[n] = sample.gain;
-                        offsets[n] = sample.phase_offset;
+                        sample_gains[n] = sample.gain;
+                        sample_offsets[n] = sample.phase_offset;
                         if let Some(delta) = sample.fm_delta {
                             fm_deltas[n] = delta;
                         }
                     }
+                    for vector in 0..CHUNK_VECTORS {
+                        let at = vector * UNISON_LANES;
+                        gains[vector] = f32x8::new(sample_gains[at..at + UNISON_LANES].try_into().unwrap());
+                        offsets[vector] = u32x8::new(sample_offsets[at..at + UNISON_LANES].try_into().unwrap());
+                    }
                 } else {
-                    for (n, gain) in gains.iter_mut().enumerate() {
-                        *gain = params.gain + (start + n) as f32 * params.gain_step;
+                    // The gain ramp, with the same rounding as `gain + n as f32 * gain_step`
+                    let (gain, step) = (f32x8::splat(params.gain), f32x8::splat(params.gain_step));
+                    let first = i32x8::splat(start as i32);
+                    for (vector, gains) in gains.iter_mut().enumerate() {
+                        *gains = gain + f32x8::from_i32x8(first + indices[vector]) * step;
                     }
                 }
-                let offsets: [u32x8; CHUNK_VECTORS] = std::array::from_fn(|vector| {
-                    u32x8::new(offsets[vector * UNISON_LANES..][..UNISON_LANES].try_into().unwrap())
-                });
 
                 let mut mono = [f32x8::ZERO; CHUNK_VECTORS];
                 let mut left = [f32x8::ZERO; CHUNK_VECTORS];
@@ -1163,34 +1191,19 @@ mod lookup {
                     }
                 }
 
-                let unpack = |vectors: &[f32x8; CHUNK_VECTORS]| {
-                    let mut values = [0.0_f32; CHUNK];
-                    for (vector, value) in vectors.iter().enumerate() {
-                        values[vector * UNISON_LANES..][..UNISON_LANES]
-                            .copy_from_slice(value.as_array());
-                    }
-                    values
-                };
                 if stereo {
-                    let (left, right) = (unpack(&left), unpack(&right));
-                    let right_out = output.right.as_deref_mut().unwrap();
-                    for n in 0..chunk_len {
-                        output.left[start + n] += left[n] * gains[n];
-                        right_out[start + n] += right[n] * gains[n];
-                    }
+                    add_chunk(&mut output.left[start..end], &left, &gains);
+                    add_chunk(&mut output.right.as_deref_mut().unwrap()[start..end], &right, &gains);
+                } else {
+                    add_chunk(&mut output.left[start..end], &mono, &gains);
                 }
-                if needs_mono {
-                    let mono = unpack(&mono);
-                    if !stereo {
-                        for n in 0..chunk_len {
-                            output.left[start + n] += mono[n] * gains[n];
-                        }
+                if let Some((mono_out, scale)) = &mut output.mono {
+                    let mut scaled = [0.0_f32; CHUNK];
+                    for (vector, mono) in mono.iter().enumerate() {
+                        scaled[vector * UNISON_LANES..][..UNISON_LANES]
+                            .copy_from_slice((*mono * f32x8::splat(*scale)).as_array());
                     }
-                    if let Some((mono_out, scale)) = &mut output.mono {
-                        for n in 0..chunk_len {
-                            mono_out[start + n] = mono[n] * *scale;
-                        }
-                    }
+                    mono_out[start..end].copy_from_slice(&scaled[..chunk_len]);
                 }
                 start = end;
             }
@@ -1471,6 +1484,26 @@ mod lookup {
         const CHUNK: usize = 32;
         const CHUNK_VECTORS: usize = CHUNK / UNISON_LANES;
 
+        /// Adds `values * gains` to `out` sample by sample, `out` being a chunk (at most
+        /// `CHUNK` samples) of an output: whole vectors at once, then what's left over.
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn add_chunk(out: &mut [f32], values: &[__m256; CHUNK_VECTORS], gains: &[__m256; CHUNK_VECTORS]) {
+            let whole = out.len() / UNISON_LANES;
+            for (vector, out) in out.chunks_exact_mut(UNISON_LANES).enumerate() {
+                let sum = _mm256_add_ps(_mm256_loadu_ps(out.as_ptr()), _mm256_mul_ps(values[vector], gains[vector]));
+                _mm256_storeu_ps(out.as_mut_ptr(), sum);
+            }
+            let rest = &mut out[whole * UNISON_LANES..];
+            if !rest.is_empty() {
+                let mut scaled = [0.0_f32; UNISON_LANES];
+                _mm256_storeu_ps(scaled.as_mut_ptr(), _mm256_mul_ps(values[whole], gains[whole]));
+                for (out, scaled) in rest.iter_mut().zip(scaled) {
+                    *out += scaled;
+                }
+            }
+        }
+
         /// Renders a block like [`render_block()`], but with the vectors running across time
         /// rather than across voices: each vector holds 8 consecutive samples of one voice.
         /// That needs no sum across the lanes of a vector for every sample, and no per sample
@@ -1506,11 +1539,13 @@ mod lookup {
                 deltas[i] = cycles_to_fixed(params.delta * factor);
                 delta_steps[i] = cycles_to_fixed(params.delta_step * factor);
             }
-            // `n + 1` and `n (n + 1) / 2` for the samples of a chunk
-            let counts: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
+            // `n`, `n + 1` and `n (n + 1) / 2` for the samples of a chunk
+            let indices: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
                 let n = |lane: i32| vector as i32 * UNISON_LANES as i32 + lane;
-                _mm256_setr_epi32(n(1), n(2), n(3), n(4), n(5), n(6), n(7), n(8))
+                _mm256_setr_epi32(n(0), n(1), n(2), n(3), n(4), n(5), n(6), n(7))
             });
+            let counts: [__m256i; CHUNK_VECTORS] =
+                std::array::from_fn(|vector| _mm256_add_epi32(indices[vector], _mm256_set1_epi32(1)));
             let triangles: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
                 let t = |lane: i32| {
                     let n = vector as i32 * UNISON_LANES as i32 + lane;
@@ -1528,27 +1563,35 @@ mod lookup {
 
                 // The controls of each sample of the chunk. Without modulation there is only
                 // the gain ramp, which is worked out directly rather than added up one sample
-                // at a time (a chain of dependent additions, the slowest part for one voice).
-                let mut gains = [0.0_f32; CHUNK];
-                let mut offsets = [0_u32; CHUNK];
+                // at a time (a chain of dependent additions, the slowest part for one voice),
+                // with the same rounding as `gain + n as f32 * gain_step`.
+                let mut gains = [_mm256_setzero_ps(); CHUNK_VECTORS];
+                let mut offsets = [_mm256_setzero_si256(); CHUNK_VECTORS];
                 let mut fm_deltas = [0.0_f32; CHUNK];
                 if params.modulation.is_some() {
+                    let mut sample_gains = [0.0_f32; CHUNK];
+                    let mut sample_offsets = [0_u32; CHUNK];
                     for n in 0..chunk_len {
                         let sample = controls.next(start + n);
-                        gains[n] = sample.gain;
-                        offsets[n] = sample.phase_offset;
+                        sample_gains[n] = sample.gain;
+                        sample_offsets[n] = sample.phase_offset;
                         if let Some(delta) = sample.fm_delta {
                             fm_deltas[n] = delta;
                         }
                     }
+                    for vector in 0..CHUNK_VECTORS {
+                        let at = vector * UNISON_LANES;
+                        gains[vector] = _mm256_loadu_ps(sample_gains.as_ptr().add(at));
+                        offsets[vector] = _mm256_loadu_si256(sample_offsets.as_ptr().add(at) as *const __m256i);
+                    }
                 } else {
-                    for (n, gain) in gains.iter_mut().enumerate() {
-                        *gain = params.gain + (start + n) as f32 * params.gain_step;
+                    let (gain, step) = (_mm256_set1_ps(params.gain), _mm256_set1_ps(params.gain_step));
+                    let first = _mm256_set1_epi32(start as i32);
+                    for (vector, gains) in gains.iter_mut().enumerate() {
+                        let n = _mm256_cvtepi32_ps(_mm256_add_epi32(first, indices[vector]));
+                        *gains = _mm256_add_ps(gain, _mm256_mul_ps(n, step));
                     }
                 }
-                let offsets: [__m256i; CHUNK_VECTORS] = std::array::from_fn(|vector| {
-                    _mm256_loadu_si256(offsets.as_ptr().add(vector * UNISON_LANES) as *const __m256i)
-                });
 
                 let mut mono = [_mm256_setzero_ps(); CHUNK_VECTORS];
                 let mut left = [_mm256_setzero_ps(); CHUNK_VECTORS];
@@ -1618,33 +1661,19 @@ mod lookup {
                 }
 
                 // Add the chunk to the outputs
-                let unpack = |vectors: &[__m256; CHUNK_VECTORS]| {
-                    let mut values = [0.0_f32; CHUNK];
-                    for (vector, value) in vectors.iter().enumerate() {
-                        _mm256_storeu_ps(values.as_mut_ptr().add(vector * UNISON_LANES), *value);
-                    }
-                    values
-                };
                 if stereo {
-                    let (left, right) = (unpack(&left), unpack(&right));
-                    let right_out = output.right.as_deref_mut().unwrap();
-                    for n in 0..chunk_len {
-                        output.left[start + n] += left[n] * gains[n];
-                        right_out[start + n] += right[n] * gains[n];
-                    }
+                    add_chunk(&mut output.left[start..end], &left, &gains);
+                    add_chunk(&mut output.right.as_deref_mut().unwrap()[start..end], &right, &gains);
+                } else {
+                    add_chunk(&mut output.left[start..end], &mono, &gains);
                 }
-                if needs_mono {
-                    let mono = unpack(&mono);
-                    if !stereo {
-                        for n in 0..chunk_len {
-                            output.left[start + n] += mono[n] * gains[n];
-                        }
+                if let Some((mono_out, scale)) = &mut output.mono {
+                    let mut scaled = [0.0_f32; CHUNK];
+                    for (vector, mono) in mono.iter().enumerate() {
+                        let at = scaled.as_mut_ptr().add(vector * UNISON_LANES);
+                        _mm256_storeu_ps(at, _mm256_mul_ps(*mono, _mm256_set1_ps(*scale)));
                     }
-                    if let Some((mono_out, scale)) = &mut output.mono {
-                        for n in 0..chunk_len {
-                            mono_out[start + n] = mono[n] * *scale;
-                        }
-                    }
+                    mono_out[start..end].copy_from_slice(&scaled[..chunk_len]);
                 }
                 start = end;
             }
