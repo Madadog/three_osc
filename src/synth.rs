@@ -568,7 +568,7 @@ impl Voice {
         self.semitone_detune *= if block_len == CONTROL_BLOCK_SAMPLES {
             context.portamento_block
         } else {
-            (1.0 - context.portamento_rate).powi(block_len as i32)
+            partial_block_portamento(context.portamento_rate, block_len)
         };
         self.pitch_multiply = context.octave_detune;
         let delta = self.delta(sample_rate);
@@ -825,6 +825,14 @@ impl Voice {
         }
         self.gain = gain + step * block_len as f32;
     }
+}
+
+/// The portamento over a block shorter than a control rate block (at the end of a buffer). Out
+/// of line, so that the compiler doesn't work it out for every block just in case.
+#[cold]
+#[inline(never)]
+fn partial_block_portamento(rate: f32, block_len: usize) -> f32 {
+    (1.0 - rate).powi(block_len as i32)
 }
 
 /// Runs every voice's filter over the current block. The Digital (SVF) and Ladder filters are
