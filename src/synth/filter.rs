@@ -169,6 +169,18 @@ impl Filter for CascadeFilter {
 pub(crate) trait Filter {
     fn process(&mut self, input: f32) -> f32;
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32);
+    /// Like [`set_params()`][Self::set_params()], but filters that can interpolate their
+    /// coefficients spread the change over the next `ramp_samples` samples. Filters that can't
+    /// just apply it immediately.
+    fn set_params_ramped(
+        &mut self,
+        sample_rate: f32,
+        cutoff: f32,
+        resonance: f32,
+        _ramp_samples: usize,
+    ) {
+        self.set_params(sample_rate, cutoff, resonance);
+    }
     fn set_filter_type(&mut self, filter_type: FilterType);
 }
 
@@ -293,6 +305,29 @@ impl Filter for FilterContainer {
             FilterContainer::LadderFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             FilterContainer::BiquadFilter(x) => x.set_params(sample_rate, cutoff, resonance),
             FilterContainer::SvfSimperFilter(x) => x.set_params(sample_rate, cutoff, resonance),
+            _ => {}
+        }
+    }
+    fn set_params_ramped(
+        &mut self,
+        sample_rate: f32,
+        cutoff: f32,
+        resonance: f32,
+        ramp_samples: usize,
+    ) {
+        match self {
+            FilterContainer::RcFilter(x) => {
+                x.set_params_ramped(sample_rate, cutoff, resonance, ramp_samples)
+            }
+            FilterContainer::LadderFilter(x) => {
+                x.set_params_ramped(sample_rate, cutoff, resonance, ramp_samples)
+            }
+            FilterContainer::BiquadFilter(x) => {
+                x.set_params_ramped(sample_rate, cutoff, resonance, ramp_samples)
+            }
+            FilterContainer::SvfSimperFilter(x) => {
+                x.set_params_ramped(sample_rate, cutoff, resonance, ramp_samples)
+            }
             _ => {}
         }
     }

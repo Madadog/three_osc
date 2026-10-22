@@ -5,7 +5,6 @@
 //! engine in the [`synth`] module. It exports the synth as a CLAP and a VST3 plugin (and as a
 //! standalone application when the `standalone` feature is enabled), with an egui GUI.
 
-use std::f32::consts::PI;
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -195,8 +194,8 @@ fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch
     osc.pitch_multiplier = multiplier_to_pitch_multiplier(params.multiplier.value());
     osc.voice_count = params.voices.value() as u8;
     osc.voices_detune = (params.super_detune.value() / 100.0).powi(3);
-    osc.phase = params.phase.value() * 2.0 * PI / 100.0;
-    osc.phase_rand = params.phase_rand.value() * 2.0 * PI / 100.0;
+    osc.phase = params.phase.value() / 100.0;
+    osc.phase_rand = params.phase_rand.value() / 100.0;
 }
 
 /// Applies the PM/FM/AM amounts for an oscillator that has a modulator after it.
@@ -351,6 +350,35 @@ mod tests {
         let set = synth::oscillator::WavetableSet::new(44100.0, 64);
         let names: Vec<&str> = set.wavetables.iter().map(|wavetable| wavetable.name).collect();
         assert_eq!(names, params::OscillatorWave::variants());
+    }
+
+    /// Silent oscillators are skipped, unless they modulate an audible oscillator.
+    #[test]
+    fn silent_oscillators_only_matter_when_they_modulate() {
+        let mut plugin = ThreeOscPlugin::default();
+        let render = |plugin: &mut ThreeOscPlugin, osc2_amp: f32, osc1_fm: f32| {
+            plugin.synth.reset();
+            plugin.apply_params();
+            for osc in plugin.synth.oscillators.iter_mut() {
+                osc.phase_rand = 0.0;
+            }
+            plugin.synth.oscillators[1].amp = osc2_amp;
+            plugin.synth.oscillators[1].semitone = 7.0;
+            plugin.synth.oscillators[0].fm = osc1_fm;
+            plugin.synth.note_on(60, 100);
+            let mut left = vec![0.0; 1024];
+            let mut right = vec![0.0; 1024];
+            plugin.synth.run(&mut left, &mut right);
+            left
+        };
+
+        let reference = render(&mut plugin, 0.0, 0.0);
+        // Making osc 2 audible changes the output
+        assert!(max_abs_diff(&render(&mut plugin, 1.0, 0.0), &reference) > 1e-3);
+        // A silent osc 2 that frequency modulates osc 1 changes the output too
+        assert!(max_abs_diff(&render(&mut plugin, 0.0, 0.1), &reference) > 1e-3);
+        // Without modulation the silent oscillator doesn't change anything
+        assert_eq!(max_abs_diff(&render(&mut plugin, 0.0, 0.0), &reference), 0.0);
     }
 
     /// A note that is started and choked in the same instant samples the envelopes at index 0.

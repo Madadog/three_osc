@@ -1,18 +1,35 @@
 use std::f32::consts::PI;
 
 use itertools::izip;
+use wide::f32x8;
 
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
 use self::filter::FilterContainer;
+use self::filter::FilterController;
 use self::notes::Notes;
+use self::oscillator::wrap_cycles_signed;
+use self::oscillator::FramePair;
 use self::oscillator::OscVoice;
 use self::oscillator::OscWave;
-use self::oscillator::modulate_delta;
 use self::oscillator::OscillatorParams;
 use self::oscillator::SuperVoice;
-use self::oscillator::WaveGenerator;
+use self::oscillator::WavetableNotes;
 use self::oscillator::WavetableSet;
+use self::oscillator::UNISON_VECTORS;
+
+/// Samples per control rate block. Envelopes, pitch, the LFO, keytracking and the filter
+/// coefficients are only recalculated this often; gains and pitch are ramped linearly in between
+/// (and so are the SVF's coefficients). Smaller is more accurate, larger is cheaper. The
+/// trade-off mostly shows in fast envelopes, and in the LFO, which can't go faster than half the
+/// control rate (a few hundred Hz).
+pub const CONTROL_BLOCK_SAMPLES: usize = 32;
+
+/// Phase modulation depth, in cycles per unit of modulator output (150 radians).
+const PM_DEPTH_CYCLES: f32 = 150.0 / (2.0 * PI);
+/// Frequency modulation depth, as a multiple of the modulated oscillator's frequency per unit of
+/// modulator output.
+const FM_DEPTH: f32 = 125.0;
 
 pub struct ThreeOsc {
     pub voices: Vec<Voice>,
@@ -162,173 +179,54 @@ impl ThreeOsc {
         for osc in self.oscillators.iter_mut() {
             osc.update_total_pitch();
             osc.update_unison_amp();
+            osc.update_detune_factors();
             osc.update_frames(&self.waves);
             if stereo {
                 osc.update_pan_gains(self.stereo_width);
             }
         }
 
-        let sample_rate = self.sample_rate as f32;
-        let lfo_delta = self.lfo_params.delta(sample_rate);
-
-        // Write samples from all voices
-        for voice in self.voices.iter_mut() {
-            let velocity = voice.velocity as f32 / 128.0;
-
-            voice.pitch_multiply = self.octave_detune;
-
-            let drive = match voice.filter {
-                // Biquad/SVF/none filters are unaffected by drive, so we clamp it between 0 and 1 to
-                // keep the levels the same when switching filter.
-                FilterContainer::BiquadFilter(_) | FilterContainer::SvfSimperFilter(_) | FilterContainer::None => {
-                    self.filter_controller.drive.min(1.0)
-                }
-                FilterContainer::LadderFilter(_) => {
-                    self.filter_controller.drive / 2.0
-                }
-                _ => {self.filter_controller.drive}
+        // An oscillator is only needed if it is audible, or if it modulates an oscillator that
+        // is needed (each oscillator modulates the one before it).
+        let mut active = [false; 3];
+        for i in 0..3 {
+            let osc = &self.oscillators[i];
+            let modulates_needed_osc = i > 0 && active[i - 1] && {
+                let modulated = &self.oscillators[i - 1];
+                modulated.pm > 0.0 || modulated.fm > 0.0 || modulated.am > 0.0
             };
-
-            for (out_l, out_r) in izip!(output_left.iter_mut(), output_right.iter_mut()) {
-                let mut out = 0.0;
-                // Only used when `stereo` is set, `out` is then the left channel.
-                let mut out_right = 0.0;
-
-                voice.advance();
-                let envelope_index = voice.runtime as f32 / sample_rate;
-
-                let delta = voice.delta(sample_rate);
-
-                let mut osc_delta = [0.0; 3];
-                for (x, osc) in izip!(osc_delta.iter_mut(), self.oscillators.iter()) {
-                    *x = osc.total_pitch_multiplier() * delta;
-                }
-
-                voice.semitone_detune = lerp(voice.semitone_detune, 0.0, self.portamento_rate);
-
-                let keytrack_freq = 2.0_f32.powf(
-                    (voice.id as f32 - 69.0 + voice.semitone_detune) / 12.0
-                        * self.filter_controller.keytrack,
-                );
-
-                let lfo_phase = voice.lfo.add_phase(lfo_delta);
-                let lfo = self.lfo_params.wave.generate(lfo_phase);
-
-                let mut osc_lfo_amp = [1.0; 3];
-                let mut osc_lfo_mod = [1.0; 3];
-
-                // set / bypass modulation depending on LFO target
-                match self.lfo_params.target_osc {
-                    Some(x) => {
-                        osc_lfo_amp[x] = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod);
-                        if let Some(lfo_mod) = osc_lfo_mod.get_mut(x + 1) {
-                            *lfo_mod = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod);
-                        };
-                        osc_delta[x] = osc_delta[x] + osc_delta[x] * lfo * self.lfo_params.freq_mod;
-                    },
-                    None => {
-                        for (lfo_amp, lfo_mod, delta) in izip!(osc_lfo_amp.iter_mut(), osc_lfo_mod.iter_mut(), osc_delta.iter_mut()) {
-                            *lfo_amp = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.amp_mod);
-                            *lfo_mod = lerp(1.0, (lfo + 1.) / 2.0, self.lfo_params.mod_mod);
-                            *delta = *delta + *delta * lfo * self.lfo_params.freq_mod;
-                        }
-                    }
-                };
-
-                // Generate the oscillators from the last to the first, since each oscillator
-                // modulates the one before it. The fold's value is the (mono) output of the
-                // oscillator after the current one.
-                self.oscillators.iter_mut()
-                .enumerate()
-                .rev()
-                .fold(0.0, |mod_osc_out, (i, osc)| {
-                    let delta = modulate_delta(osc_delta[i], mod_osc_out * osc.fm);
-
-                    let phases = voice.osc_voice[i].unison_phases(
-                        delta,
-                        osc.voice_count.into(),
-                        osc.voices_detune,
-                    );
-
-                    let frames = osc.frame_pair(&self.waves, osc_delta[i], sample_rate);
-                    let pm_offset = mod_osc_out * osc.pm * 150.0;
-                    let gain = osc.unison_amp
-                        * osc.amp
-                        * lerp(1.0, (mod_osc_out + 1.0) / 2.0, osc.am)
-                        * osc_lfo_amp[i];
-
-                    let osc_out = if stereo {
-                        let (osc_out, osc_left, osc_right) = frames.generate_multi_pm_panned(
-                            phases,
-                            osc.voice_count.into(),
-                            pm_offset,
-                            &osc.pan_gains,
-                        );
-
-                        out += osc_left * gain;
-                        out_right += osc_right * gain;
-
-                        osc_out
-                    } else {
-                        let osc_out = frames.generate_multi_pm(phases, osc.voice_count.into(), pm_offset);
-
-                        out += osc_out * gain;
-
-                        osc_out
-                    };
-
-                    osc_out * osc_lfo_mod[i]
-                });
-
-                // Update filter controls
-                let cutoff = self.filter_controller.get_cutoff(
-                    keytrack_freq + keytrack_freq * lfo * self.lfo_params.filter_mod,
-                    envelope_index,
-                    voice.release_time,
-                    sample_rate,
-                );
-
-                let filter_controller = &self.filter_controller;
-                let configure_filter = |filter: &mut FilterContainer| {
-                    filter.set(
-                        filter_controller.filter_model,
-                        cutoff,
-                        filter_controller.resonance,
-                        sample_rate,
-                        filter_controller.filter_type,
-                    );
-                    filter.set_filter_type(filter_controller.filter_type);
-                    filter.set_params(sample_rate, cutoff, filter_controller.resonance);
-                };
-
-                // Process filter
-                configure_filter(&mut voice.filter);
-                out = voice.filter.process(out * drive);
-                if stereo {
-                    // Filters are stateful, so the right channel needs its own instance.
-                    configure_filter(&mut voice.filter_right);
-                    out_right = voice.filter_right.process(out_right * drive);
-                }
-
-                // amplitude envelope
-                let envelope = if let Some(release_time) = voice.release_time {
-                    let release_index = release_time as f32 / sample_rate;
-                    self.gain_envelope.sample_released(release_index, envelope_index)
-                } else {
-                    self.gain_envelope.sample_held(envelope_index)
-                };
-
-                // keyboard velocity scaling
-                out = out * envelope * velocity;
-
-                *out_l += out;
-                *out_r += if stereo {
-                    out_right * envelope * velocity
-                } else {
-                    out
-                };
-            }
+            active[i] = osc.amp > 0.0 || modulates_needed_osc;
         }
+
+        let context = VoiceContext {
+            oscillators: &self.oscillators,
+            waves: &self.waves,
+            filter_controller: &self.filter_controller,
+            gain_envelope: &self.gain_envelope,
+            lfo_params: &self.lfo_params,
+            sample_rate: self.sample_rate as f32,
+            stereo,
+            octave_detune: self.octave_detune,
+            portamento_rate: self.portamento_rate,
+            active,
+        };
+
+        // Write samples from all voices, one control rate block at a time
+        let len = output_left.len().min(output_right.len());
+        let mut start = 0;
+        while start < len {
+            let end = (start + CONTROL_BLOCK_SAMPLES).min(len);
+            for voice in self.voices.iter_mut() {
+                voice.update_controls(&context, end - start);
+                voice.render(
+                    &context,
+                    &mut output_left[start..end],
+                    &mut output_right[start..end],
+                );
+            }
+            start = end;
+        }
+
         // Apply output volume
         for (out_l, out_r) in izip!(output_left, output_right) {
             *out_l *= self.output_volume;
@@ -351,10 +249,27 @@ pub enum Polyphony {
     Legato,
 }
 
+/// Everything a voice needs from the synth to render itself.
+struct VoiceContext<'a> {
+    oscillators: &'a [OscillatorParams; 3],
+    waves: &'a WavetableSet,
+    filter_controller: &'a FilterController,
+    gain_envelope: &'a AdsrEnvelope,
+    lfo_params: &'a LfoParams,
+    sample_rate: f32,
+    stereo: bool,
+    octave_detune: f32,
+    portamento_rate: f32,
+    /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
+    /// modulate anything are skipped.
+    active: [bool; 3],
+}
+
 /// An individual note press.
 // TODO: Separate phase, oscillator, and filter from note data.
 pub struct Voice {
     id: u32,
+    /// Samples rendered so far.
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 3],
@@ -365,6 +280,24 @@ pub struct Voice {
     velocity: u8,
     pitch_multiply: f32,
     semitone_detune: f32,
+
+    // Control rate state, see `update_controls()`. The deltas and gains are ramped linearly
+    // from one block to the next.
+    /// Each oscillator's phase delta in cycles per sample, before frequency modulation.
+    osc_delta: [f32; 3],
+    osc_delta_step: [f32; 3],
+    /// The MIDI note whose bandlimited wavetable each oscillator reads.
+    osc_note: [usize; 3],
+    /// Each oscillator's output gain, before amplitude modulation.
+    osc_gain: [f32; 3],
+    osc_gain_step: [f32; 3],
+    /// Scales each oscillator's output before it modulates the oscillator before it.
+    osc_mod_scale: [f32; 3],
+    /// The voice's gain: amplitude envelope times velocity.
+    gain: f32,
+    gain_step: f32,
+    /// Filter input gain.
+    drive: f32,
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, osc: &[OscillatorParams]) -> Self {
@@ -385,6 +318,15 @@ impl Voice {
             filter_right: filter::FilterContainer::None,
             pitch_multiply: 1.0,
             semitone_detune: 0.0,
+            osc_delta: [0.0; 3],
+            osc_delta_step: [0.0; 3],
+            osc_note: [0; 3],
+            osc_gain: [0.0; 3],
+            osc_gain_step: [0.0; 3],
+            osc_mod_scale: [1.0; 3],
+            gain: 0.0,
+            gain_step: 0.0,
+            drive: 1.0,
         }
     }
     pub fn release(&mut self) {
@@ -392,30 +334,200 @@ impl Voice {
             self.release_time = Some(self.runtime)
         }
     }
-    pub fn advance(&mut self) {
-        self.runtime += 1;
-    }
+    /// The voice's base phase delta, in cycles per sample.
     pub fn delta(&self, sample_rate: f32) -> f32 {
-        2.0 * PI
-            * 440.0
+        440.0
             * 2.0_f32.powf(
                 (((self.id as i16 - 69) as f32 + self.semitone_detune) * self.pitch_multiply)
                     / 12.0,
             )
             / sample_rate
     }
-    pub fn delta_with_oscillator(&self, sample_rate: f32, oscillator: &OscillatorParams) -> f32 {
-        2.0 * PI
-            * 440.0
-            * 2.0_f32.powf(
-                (((self.id as i16 - 69) as f32
-                    + self.semitone_detune
-                    + oscillator.semitone_detune())
-                    * self.pitch_multiply)
-                    / 12.0,
-            )
-            / sample_rate
-            * oscillator.pitch_multiplier
+    /// The amplitude envelope's level at the given point in the voice's life, in samples.
+    fn envelope(&self, envelope: &AdsrEnvelope, runtime: u32, sample_rate: f32) -> f32 {
+        let index = runtime as f32 / sample_rate;
+        match self.release_time {
+            Some(release_time) => {
+                envelope.sample_released(release_time as f32 / sample_rate, index)
+            }
+            None => envelope.sample_held(index),
+        }
+    }
+    /// Recalculates the control rate state for the next `block_len` samples: the pitch, the
+    /// LFO, the envelopes, keytracking and the filter coefficients. Gains and pitch ramp from
+    /// their current values to the values at the end of the block.
+    fn update_controls(&mut self, context: &VoiceContext, block_len: usize) {
+        let sample_rate = context.sample_rate;
+        let lfo_params = context.lfo_params;
+        let block_start = self.runtime;
+        self.runtime += block_len as u32;
+        let step_scale = 1.0 / block_len as f32;
+        // A new (or retriggered) voice starts from its initial values instead of ramping
+        let first_block = block_start == 0;
+
+        // Portamento, applied for the whole block at once
+        self.semitone_detune *= (1.0 - context.portamento_rate).powi(block_len as i32);
+        self.pitch_multiply = context.octave_detune;
+        let delta = self.delta(sample_rate);
+
+        // LFO, sampled at the end of the block
+        let lfo_phase = self
+            .lfo
+            .add_phase(lfo_params.delta(sample_rate) * block_len as f32);
+        let lfo = lfo_params.wave.generate(lfo_phase);
+        let lfo_unipolar = (lfo + 1.0) / 2.0;
+
+        let keytrack_freq = 2.0_f32.powf(
+            (self.id as f32 - 69.0 + self.semitone_detune) / 12.0
+                * context.filter_controller.keytrack,
+        );
+
+        for (i, osc) in context.oscillators.iter().enumerate() {
+            // The LFO modulates either all oscillators or only the target. The modulation
+            // amount is modulated on the target's modulator, which is the oscillator after it.
+            let targeted = lfo_params.target_osc.is_none_or(|target| target == i);
+            let modulator_targeted = lfo_params.target_osc.is_none_or(|target| target + 1 == i);
+            let (lfo_amp, lfo_freq) = if targeted {
+                (
+                    lerp(1.0, lfo_unipolar, lfo_params.amp_mod),
+                    lfo * lfo_params.freq_mod,
+                )
+            } else {
+                (1.0, 0.0)
+            };
+            self.osc_mod_scale[i] = if modulator_targeted {
+                lerp(1.0, lfo_unipolar, lfo_params.mod_mod)
+            } else {
+                1.0
+            };
+
+            let target_delta = osc.total_pitch_multiplier() * delta * (1.0 + lfo_freq);
+            self.osc_note[i] = WavetableNotes::cycles_to_note(target_delta, sample_rate);
+            let target_gain = osc.unison_amp * osc.amp * lfo_amp;
+            if first_block {
+                self.osc_delta[i] = target_delta;
+                self.osc_gain[i] = target_gain;
+            }
+            self.osc_delta_step[i] = (target_delta - self.osc_delta[i]) * step_scale;
+            self.osc_gain_step[i] = (target_gain - self.osc_gain[i]) * step_scale;
+        }
+
+        // Amplitude envelope and velocity
+        let velocity = self.velocity as f32 / 128.0;
+        if first_block {
+            self.gain = self.envelope(context.gain_envelope, block_start, sample_rate) * velocity;
+        }
+        let target_gain = self.envelope(context.gain_envelope, self.runtime, sample_rate) * velocity;
+        self.gain_step = (target_gain - self.gain) * step_scale;
+
+        // Filter
+        let controller = context.filter_controller;
+        let cutoff = controller.get_cutoff(
+            keytrack_freq + keytrack_freq * lfo * lfo_params.filter_mod,
+            self.runtime as f32 / sample_rate,
+            self.release_time,
+            sample_rate,
+        );
+        let configure_filter = |filter: &mut FilterContainer| {
+            filter.set(
+                controller.filter_model,
+                cutoff,
+                controller.resonance,
+                sample_rate,
+                controller.filter_type,
+            );
+            filter.set_filter_type(controller.filter_type);
+            filter.set_params_ramped(sample_rate, cutoff, controller.resonance, block_len);
+        };
+        configure_filter(&mut self.filter);
+        if context.stereo {
+            // Filters are stateful, so the right channel needs its own instance.
+            configure_filter(&mut self.filter_right);
+        }
+        self.drive = match self.filter {
+            // Biquad/SVF/none filters are unaffected by drive, so we clamp it between 0 and 1 to
+            // keep the levels the same when switching filter.
+            FilterContainer::BiquadFilter(_)
+            | FilterContainer::SvfSimperFilter(_)
+            | FilterContainer::None => controller.drive.min(1.0),
+            FilterContainer::LadderFilter(_) => controller.drive / 2.0,
+            _ => controller.drive,
+        };
+    }
+    /// Renders one control rate block, adding this voice's output to the buffers.
+    fn render(&mut self, context: &VoiceContext, out_left: &mut [f32], out_right: &mut [f32]) {
+        let stereo = context.stereo;
+        let oscillators = context.oscillators;
+        let frames: [FramePair; 3] =
+            std::array::from_fn(|i| oscillators[i].frame_pair(context.waves, self.osc_note[i]));
+        let voice_counts: [usize; 3] = std::array::from_fn(|i| oscillators[i].voice_count.into());
+        let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
+
+        for (out_l, out_r) in izip!(out_left.iter_mut(), out_right.iter_mut()) {
+            let mut out = 0.0;
+            // Only used when `stereo` is set, `out` is then the left channel.
+            let mut out_right = 0.0;
+
+            // Generate the oscillators from the last to the first, since each oscillator
+            // modulates the one before it. `mod_out` is the (mono) output of the oscillator
+            // after the current one.
+            let mut mod_out = 0.0;
+            for i in (0..3).rev() {
+                if !context.active[i] {
+                    // Its output would be silent, and it isn't modulating anything that matters
+                    mod_out = 0.0;
+                    continue;
+                }
+                let osc = &oscillators[i];
+
+                let mut delta = self.osc_delta[i];
+                self.osc_delta[i] += self.osc_delta_step[i];
+                if osc.fm > 0.0 {
+                    delta = wrap_cycles_signed(delta * (1.0 + mod_out * osc.fm * FM_DEPTH));
+                }
+
+                self.osc_voice[i].advance(
+                    delta,
+                    voice_counts[i],
+                    &osc.detune_factors,
+                    mod_out * osc.pm * PM_DEPTH_CYCLES,
+                    frames[i].cycle_len() as f32,
+                    &mut indices,
+                );
+
+                let gain = self.osc_gain[i] * lerp(1.0, (mod_out + 1.0) / 2.0, osc.am);
+                self.osc_gain[i] += self.osc_gain_step[i];
+
+                let mono = if stereo {
+                    let (mono, left, right) =
+                        frames[i].sum_panned(&indices, voice_counts[i], &osc.pan_gains);
+                    out += left * gain;
+                    out_right += right * gain;
+                    mono
+                } else {
+                    let mono = frames[i].sum(&indices, voice_counts[i]);
+                    out += mono * gain;
+                    mono
+                };
+
+                mod_out = mono * self.osc_mod_scale[i];
+            }
+
+            // Process filter
+            out = self.filter.process(out * self.drive);
+            if stereo {
+                out_right = self.filter_right.process(out_right * self.drive);
+            }
+
+            // Amplitude envelope and keyboard velocity scaling
+            *out_l += out * self.gain;
+            *out_r += if stereo {
+                out_right * self.gain
+            } else {
+                out * self.gain
+            };
+            self.gain += self.gain_step;
+        }
     }
 }
 

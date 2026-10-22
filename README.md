@@ -58,6 +58,9 @@ Rough throughput numbers for the synth engine (time per sample for a few patches
 cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 ```
 
+### Control rate
+Envelopes, pitch (including portamento and vibrato), the LFO, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFO, which can't go faster than half the control rate. Change the constant to try other sizes.
+
 ### Previous LV2 version
 Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the LV2 build is gone; if you need it, check out a commit from before the nih-plug port.
 

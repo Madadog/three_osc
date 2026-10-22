@@ -5,8 +5,33 @@ use std::{
 
 use itertools::izip;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use wide::f32x8;
 
 use super::lerp;
+
+/// Maximum number of unison voices per oscillator.
+pub const MAX_UNISON: usize = 32;
+/// Unison voices are processed in SIMD vectors of this many lanes.
+pub const UNISON_LANES: usize = 8;
+/// Number of SIMD vectors needed for all unison voices.
+pub const UNISON_VECTORS: usize = MAX_UNISON / UNISON_LANES;
+
+/// Wraps a non-negative phase in cycles into `[0, 1)`.
+#[inline]
+pub fn wrap_cycles(phase: f32) -> f32 {
+    phase - (phase as i32) as f32
+}
+
+/// Wraps a phase (or phase delta) in cycles of either sign into `[0, 1)`.
+#[inline]
+pub fn wrap_cycles_signed(phase: f32) -> f32 {
+    let wrapped = wrap_cycles(phase);
+    if wrapped < 0.0 {
+        wrapped + 1.0
+    } else {
+        wrapped
+    }
+}
 
 /// A single instance of a playing oscillator. Maintains phase in
 /// internal state
@@ -28,54 +53,62 @@ impl OscVoice {
 /// Brute force approach to oscillator super (playing multiple detuned copies
 /// of a wave simultaneously) which tracks the phase of every wave copy.
 ///
-/// Implemented as a buffer of independent phases with a common base frequency
-/// (delta) which differs for each phase according to the `detune` parameter in
-/// `add_phase()`.
+/// Implemented as a buffer of independent phases (in cycles, kept in `[0, 1)`) with a common
+/// base frequency (delta) which differs for each phase according to the oscillator's detune
+/// factors. The phases are stored as SIMD vectors so all voices advance at once.
 pub struct SuperVoice {
-    pub voice_phases: [f32; 32],
+    pub voice_phases: [f32x8; UNISON_VECTORS],
 }
 impl SuperVoice {
     pub fn new(phase: f32, phase_random: f32) -> Self {
-        let mut voice_phases = [phase; 32];
         let rng = fastrand::Rng::new();
-
-        for phase in voice_phases.iter_mut() {
-            *phase += rng.f32() * phase_random;
+        let mut phases = [0.0_f32; MAX_UNISON];
+        for phase_out in phases.iter_mut() {
+            *phase_out = wrap_cycles(phase + rng.f32() * phase_random);
         }
-        Self { voice_phases }
+        Self {
+            voice_phases: std::array::from_fn(|vector| {
+                let lanes = &phases[vector * UNISON_LANES..(vector + 1) * UNISON_LANES];
+                f32x8::new(lanes.try_into().unwrap())
+            }),
+        }
     }
-    pub fn add_phase(&mut self, delta: f32, voice_count: usize, detune: f32) {
-        // self.phase = (self.phase + delta) % (2.0 * PI);
-        // self.phase
-        self.voice_phases
-            .iter_mut()
-            .take(voice_count)
-            .enumerate()
-            .for_each(|(i, phase): (usize, &mut f32)| {
-                let i = unison_detune_index(i);
-                let delta = delta + delta * i as f32 * detune / (voice_count as f32);
-                *phase = (*phase + delta) % (2.0 * PI);
-            });
-    }
-    pub fn unison_phases(&mut self, delta: f32, voice_count: usize, voices_detune: f32) -> &[f32] {
-        self.add_phase(delta, voice_count, voices_detune);
-        &self.voice_phases
-    }
-    /// TODO: this duplicates all 128 phases, every time.
-    pub fn unison_phases_pm(
+    /// Advances the first `voice_count` voices by `delta` (cycles per sample) times each voice's
+    /// detune factor, then writes each voice's wavetable read position into `indices`: the phase
+    /// offset by `phase_offset` cycles (for phase modulation), scaled to `table_len` samples.
+    ///
+    /// `delta` must be non-negative; the detune factors are positive, so the phases stay in
+    /// `[0, 1)` with a cheap truncating wrap.
+    #[inline]
+    pub fn advance(
         &mut self,
         delta: f32,
         voice_count: usize,
-        voices_detune: f32,
-        pm: f32,
-    ) -> [f32; 32] {
-        self.add_phase(delta, voice_count, voices_detune);
-        let pm = pm * 150.0;
-        let mut out = self.voice_phases;
-        for phase in out.iter_mut().take(voice_count) {
-            *phase = (*phase + pm).rem_euclid(2.0 * PI);
+        detune_factors: &[f32x8; UNISON_VECTORS],
+        phase_offset: f32,
+        table_len: f32,
+        indices: &mut [f32x8; UNISON_VECTORS],
+    ) {
+        let delta = f32x8::splat(delta);
+        let phase_offset = f32x8::splat(phase_offset);
+        let table_len = f32x8::splat(table_len);
+        let zero = f32x8::splat(0.0);
+        let one = f32x8::splat(1.0);
+        // The largest value below 1.0, so that the scaled index stays below the table length.
+        let below_one = f32x8::splat(0.999_999_94);
+
+        let vectors = voice_count.div_ceil(UNISON_LANES).min(UNISON_VECTORS);
+        for vector in 0..vectors {
+            let mut phase = self.voice_phases[vector] + delta * detune_factors[vector];
+            phase -= phase.trunc_int().round_float();
+            self.voice_phases[vector] = phase;
+
+            // The offset can be negative, and the wrapped result can round up to exactly 1.0
+            let mut read = phase + phase_offset;
+            read -= read.trunc_int().round_float();
+            read += read.simd_lt(zero).select(one, zero);
+            indices[vector] = read.min(below_one) * table_len;
         }
-        out
     }
 }
 
@@ -104,7 +137,9 @@ pub struct OscillatorParams {
     /// Amp to keep volume roughly equal across different voice counts
     pub unison_amp: f32,
     /// `(left, right)` gain of each unison voice, see `update_pan_gains()`.
-    pub pan_gains: [(f32, f32); 32],
+    pub pan_gains: [(f32, f32); MAX_UNISON],
+    /// Each unison voice's phase delta relative to the base delta, see `update_detune_factors()`.
+    pub detune_factors: [f32x8; UNISON_VECTORS],
 
     /// Index of the wavetable (in the synth's [`WavetableSet`]) this oscillator plays.
     pub wavetable: usize,
@@ -116,7 +151,9 @@ pub struct OscillatorParams {
     frame_b: usize,
     frame_mix: f32,
 
+    /// Starting phase, in cycles.
     pub phase: f32,
+    /// Starting phase randomisation, in cycles.
     pub phase_rand: f32,
     pub pitch_bend: f32,
 
@@ -144,6 +181,19 @@ impl OscillatorParams {
     pub fn update_unison_amp(&mut self) {
         self.unison_amp = self.calc_unison_amp()
     }
+    /// Updates each unison voice's phase delta relative to the base delta: the centre voice is
+    /// 1, the others spread out above and below it by the unison detune.
+    pub fn update_detune_factors(&mut self) {
+        let voice_count = (self.voice_count as usize).clamp(1, MAX_UNISON);
+        let mut factors = [1.0_f32; MAX_UNISON];
+        for (i, factor) in factors.iter_mut().enumerate().take(voice_count) {
+            *factor = 1.0 + unison_detune_index(i) as f32 * self.voices_detune / voice_count as f32;
+        }
+        self.detune_factors = std::array::from_fn(|vector| {
+            let lanes = &factors[vector * UNISON_LANES..(vector + 1) * UNISON_LANES];
+            f32x8::new(lanes.try_into().unwrap())
+        });
+    }
     /// Resolves the wavetable position to the two frames to crossfade between. Must be called
     /// before `frame_pair()` whenever the wavetable or position changed.
     pub fn update_frames(&mut self, set: &WavetableSet) {
@@ -151,11 +201,11 @@ impl OscillatorParams {
         (self.frame_a, self.frame_b, self.frame_mix) =
             set.wavetables[self.wavetable].frame_indices(self.position);
     }
-    /// The (bandlimited) wavetable frames to generate a voice with the given phase delta from.
+    /// The wavetable frames to generate a voice from, bandlimited for the given MIDI note (see
+    /// [`WavetableNotes::cycles_to_note()`]).
     #[inline]
-    pub fn frame_pair<'a>(&self, set: &'a WavetableSet, delta: f32, sample_rate: f32) -> FramePair<'a> {
+    pub fn frame_pair<'a>(&self, set: &'a WavetableSet, note: usize) -> FramePair<'a> {
         let frames = &set.wavetables[self.wavetable].frames;
-        let note = WavetableNotes::delta_to_note(delta, sample_rate);
         FramePair {
             a: &frames[self.frame_a].tables[note],
             b: &frames[self.frame_b].tables[note],
@@ -213,14 +263,15 @@ impl Default for OscillatorParams {
             voice_count: 1,
             voices_detune: 0.1,
             unison_amp: 1.0,
-            pan_gains: [(1.0, 1.0); 32],
+            pan_gains: [(1.0, 1.0); MAX_UNISON],
+            detune_factors: [f32x8::splat(1.0); UNISON_VECTORS],
             wavetable: 0,
             position: 0.0,
             frame_a: 0,
             frame_b: 0,
             frame_mix: 0.0,
             phase: 0.0,
-            phase_rand: PI * 2.0,
+            phase_rand: 1.0,
             pitch_bend: 0.0,
             fm: 0.0,
             pm: 0.0,
@@ -290,17 +341,6 @@ impl OscWave {
             }
         }
     }
-}
-
-pub fn modulate_delta(delta: f32, linear_fm: f32) -> f32 {
-    // `linear_fm` is expected to be between -1.0 and 1.0,
-    // must be stretched out.
-    let linear_fm = linear_fm * 125.0;
-
-    let delta = delta * (1.0 + linear_fm);
-
-    // `rem_euclid()` prevents negative phases, unlike the default modulo
-    delta.rem_euclid(2.0 * PI)
 }
 
 /// Efficient constant frequency sine approximation based on 2D rotation.
@@ -394,34 +434,44 @@ impl MagicCircleQuad {
 pub struct QuadOsc;
 
 #[derive(Debug, Clone)]
+/// One cycle of a waveform, followed by a copy of its first sample so that reads can interpolate
+/// across the end of the cycle without any wrapping logic.
 pub struct Wavetable {
     pub table: Vec<f32>,
 }
 
 impl Wavetable {
-    pub fn new(table: Vec<f32>) -> Self {
+    pub fn new(mut table: Vec<f32>) -> Self {
+        assert!(!table.is_empty(), "a wavetable needs at least one sample");
+        let first = table[0];
+        table.push(first);
         Self { table }
     }
+    /// Samples per cycle.
     #[inline]
-    pub fn index(&self, index: usize) -> f32 {
-        self.table[index as usize]
+    pub fn cycle_len(&self) -> usize {
+        self.table.len() - 1
     }
+    /// Reads the table at a fractional sample index in `[0, cycle_len)` with linear
+    /// interpolation.
+    /// Out of range indices are clamped to the last sample.
     #[inline]
-    // TODO: This is very slow, compared to the index above
-    pub fn index_lerp(&self, index: f32) -> f32 {
-        let index_floor = index as usize;
-        let index_next = (index_floor + 1) % self.table.len();
-        let from = self.table[index_floor];
-        let to = self.table[index_next];
-        lerp(from, to, index - index_floor as f32)
+    pub fn read(&self, index: f32) -> f32 {
+        let floor = (index as usize).min(self.table.len().saturating_sub(2));
+        // SAFETY: `floor + 1` is at most `table.len() - 1`, and the table always holds at least
+        // two samples (a cycle plus the padding sample).
+        let (from, to) = unsafe {
+            (
+                *self.table.get_unchecked(floor),
+                *self.table.get_unchecked(floor + 1),
+            )
+        };
+        lerp(from, to, index - floor as f32)
     }
+    /// Generates a sample at the given phase in cycles.
     #[inline]
-    pub fn phase_to_index(&self, phase: f32) -> f32 {
-        // Number is slightly greater than 2 to prevent OOB indexes
-        // when phase/2PI == 1, at the expense of a small downwards
-        // pitch detune.
-        // TODO: Find out how many decimal points f32 can handle here, or rethink indexing so that it doesn't require this unnecessary division
-        (phase / (2.000001 * PI)) * self.table.len() as f32
+    pub fn generate(&self, phase: f32) -> f32 {
+        self.read(wrap_cycles_signed(phase) * self.cycle_len() as f32)
     }
     /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
     pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
@@ -433,7 +483,7 @@ impl Wavetable {
             .into_iter()
             .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
             .collect();
-        Self { table }
+        Self::new(table)
     }
     pub fn from_additive_osc_ifft(
         osc: &AdditiveOsc,
@@ -441,56 +491,11 @@ impl Wavetable {
         harmonics: usize,
         fft: &dyn Fft<f32>,
     ) -> Self {
-        let mut table: Vec<f32> = vec![0.0; len];
+        // Room for the padding sample, so `new()` doesn't have to reallocate
+        let mut table: Vec<f32> = Vec::with_capacity(len + 1);
+        table.resize(len, 0.0);
         osc.generate_ifft(&mut table, harmonics, fft);
-        Self { table }
-    }
-}
-
-/// Something that generates a sample from a phase, with helpers for summing unison voices.
-pub trait WaveGenerator {
-    fn generate(&self, phase: f32) -> f32;
-
-    /// Sums the voices at the given phases, all offset by `phase_offset` (for phase modulation).
-    #[inline]
-    fn generate_multi_pm(&self, phases: &[f32], max: usize, phase_offset: f32) -> f32 {
-        phases
-            .iter()
-            .take(max)
-            .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
-            .sum()
-    }
-
-    /// Like [`generate_multi_pm()`][Self::generate_multi_pm()], but also pans the voices into a
-    /// left and a right channel using `gains` (one `(left, right)` gain pair per voice).
-    ///
-    /// Returns `(mono, left, right)`, where `mono` is the plain sum of the voices.
-    #[inline]
-    fn generate_multi_pm_panned(
-        &self,
-        phases: &[f32],
-        max: usize,
-        phase_offset: f32,
-        gains: &[(f32, f32)],
-    ) -> (f32, f32, f32) {
-        phases.iter().zip(gains.iter()).take(max).fold(
-            (0.0, 0.0, 0.0),
-            |(mono, left, right), (phase, (gain_left, gain_right))| {
-                let sample = self.generate((*phase + phase_offset).rem_euclid(2.0 * PI));
-                (
-                    mono + sample,
-                    left + sample * gain_left,
-                    right + sample * gain_right,
-                )
-            },
-        )
-    }
-}
-
-impl WaveGenerator for Wavetable {
-    #[inline]
-    fn generate(&self, phase: f32) -> f32 {
-        self.index_lerp(self.phase_to_index(phase))
+        Self::new(table)
     }
 }
 
@@ -504,15 +509,50 @@ pub struct FramePair<'a> {
     pub mix: f32,
 }
 
-impl WaveGenerator for FramePair<'_> {
+impl FramePair<'_> {
+    /// Samples per cycle.
     #[inline]
-    fn generate(&self, phase: f32) -> f32 {
-        let a = self.a.generate(phase);
+    pub fn cycle_len(&self) -> usize {
+        self.a.cycle_len()
+    }
+    /// Reads the frames at a fractional sample index in `[0, cycle_len)`.
+    #[inline]
+    pub fn read(&self, index: f32) -> f32 {
+        let a = self.a.read(index);
         if self.mix > 0.0 {
-            lerp(a, self.b.generate(phase), self.mix)
+            lerp(a, self.b.read(index), self.mix)
         } else {
             a
         }
+    }
+    /// Sums the first `count` unison voices, read at the given indices.
+    #[inline]
+    pub fn sum(&self, indices: &[f32x8; UNISON_VECTORS], count: usize) -> f32 {
+        let mut total = 0.0;
+        for voice in 0..count.min(MAX_UNISON) {
+            total += self.read(indices[voice / UNISON_LANES].as_array()[voice % UNISON_LANES]);
+        }
+        total
+    }
+    /// Like [`sum()`][Self::sum()], but also pans the voices into a left and a right channel
+    /// using `gains` (one `(left, right)` gain pair per voice). Returns `(mono, left, right)`,
+    /// where `mono` is the plain sum of the voices.
+    #[inline]
+    pub fn sum_panned(
+        &self,
+        indices: &[f32x8; UNISON_VECTORS],
+        count: usize,
+        gains: &[(f32, f32); MAX_UNISON],
+    ) -> (f32, f32, f32) {
+        let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
+        for voice in 0..count.min(MAX_UNISON) {
+            let sample = self.read(indices[voice / UNISON_LANES].as_array()[voice % UNISON_LANES]);
+            let (gain_left, gain_right) = gains[voice];
+            mono += sample;
+            left += sample * gain_left;
+            right += sample * gain_right;
+        }
+        (mono, left, right)
     }
 }
 
@@ -548,19 +588,11 @@ impl WavetableNotes {
     pub fn frequency_to_note(frequency: f32) -> usize {
         (((frequency / 440.0).log2() * 12.0 + 69.0).round() as usize).clamp(0, 137)
     }
-    /// Returns `index` from the equation
-    /// `(2.0 * PI * 440.0 * 2.0_f32.powf(index / 12.0)) = delta * sample_rate`
-    pub fn delta_to_note(delta: f32, sample_rate: f32) -> usize {
-        (((sample_rate * delta / (440.0 * 2.0 * PI)).log2() * 12.0 + 69.0).ceil() as usize)
-            .clamp(0, 137)
-    }
-    /// Returns the appropriate wavetable corresponding to `delta` at `sample_rate`
-    pub fn delta_index(&self, delta: f32, sample_rate: f32) -> &Wavetable {
-        &self.tables[WavetableNotes::delta_to_note(delta, sample_rate)]
-    }
-    /// Returns the appropriate wavetable corresponding to `frequency`
-    pub fn frequency_index(&self, frequency: f32) -> &Wavetable {
-        &self.tables[WavetableNotes::frequency_to_note(frequency)]
+    /// Returns the index of the lowest note whose table is bandlimited enough for a phase delta
+    /// of `delta` cycles per sample, i.e. `index` from `440.0 * 2.0_f32.powf(index / 12.0) =
+    /// delta * sample_rate`, rounded up.
+    pub fn cycles_to_note(delta: f32, sample_rate: f32) -> usize {
+        (((sample_rate * delta / 440.0).log2() * 12.0 + 69.0).ceil() as usize).clamp(0, 137)
     }
     /// Create a bandlimited wavetable for each midi note from a base additive function.
     ///
@@ -870,10 +902,11 @@ mod tests {
 
     #[test]
     fn unison_pan_is_interleaved_and_symmetric() {
-        let mut osc = OscillatorParams::default();
-
         // A single voice stays in the centre
-        osc.voice_count = 1;
+        let mut osc = OscillatorParams {
+            voice_count: 1,
+            ..Default::default()
+        };
         osc.update_pan_gains(1.0);
         assert!((osc.pan_gains[0].0 - 1.0).abs() < 1e-5);
         assert!((osc.pan_gains[0].1 - 1.0).abs() < 1e-5);
@@ -917,12 +950,56 @@ mod tests {
     }
 
     #[test]
+    fn wavetable_reads_interpolate_across_the_wrap() {
+        let table = Wavetable::new(vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(table.cycle_len(), 4);
+        assert_eq!(table.read(0.0), 0.0);
+        assert_eq!(table.read(1.5), 1.5);
+        // Between the last sample and the start of the next cycle
+        assert_eq!(table.read(3.5), 1.5);
+        // Out of range reads are clamped instead of reading out of bounds
+        assert!(table.read(4.0).is_finite());
+        assert!(table.read(1e9).is_finite());
+        assert!(table.read(-1.0).is_finite());
+        assert_eq!(table.generate(0.375), 1.5);
+        assert_eq!(table.generate(-0.625), 1.5);
+    }
+
+    #[test]
+    fn unison_voices_advance_and_wrap() {
+        let mut voice = SuperVoice::new(0.0, 0.0);
+        let mut osc = OscillatorParams {
+            voice_count: 2,
+            voices_detune: 0.5,
+            ..Default::default()
+        };
+        osc.update_detune_factors();
+        let mut indices = [f32x8::splat(0.0); UNISON_VECTORS];
+        // Voice 0 advances by 0.3 cycles, voice 1 by 0.3 * (1 - 0.5 / 2)
+        for _ in 0..4 {
+            voice.advance(0.3, 2, &osc.detune_factors, 0.0, 100.0, &mut indices);
+        }
+        let phases = voice.voice_phases[0].to_array();
+        assert!((phases[0] - 0.2).abs() < 1e-5, "{phases:?}");
+        assert!((phases[1] - 0.9).abs() < 1e-5, "{phases:?}");
+        let read = indices[0].to_array();
+        assert!((read[0] - 20.0).abs() < 1e-3, "{read:?}");
+        // A negative phase offset wraps too
+        voice.advance(0.0, 2, &osc.detune_factors, -0.5, 100.0, &mut indices);
+        let read = indices[0].to_array();
+        assert!((read[0] - 70.0).abs() < 1e-3, "{read:?}");
+        assert!((read[1] - 40.0).abs() < 1e-3, "{read:?}");
+        assert!(read.iter().all(|index| *index < 100.0));
+    }
+
+    #[test]
     fn pulse_wavetable_has_the_expected_duty_cycle() {
         let fft = FftPlanner::new().plan_fft_inverse(2048);
         let table = Wavetable::from_additive_osc_ifft(&AdditiveOsc::pulse(0.25), 2048, 1024, &*fft);
-        let high = table.table.iter().filter(|sample| **sample > 0.0).count();
+        let cycle = &table.table[..table.cycle_len()];
+        let high = cycle.iter().filter(|sample| **sample > 0.0).count();
         assert!((high as f32 / 2048.0 - 0.25).abs() < 0.01, "{high}");
-        let mean: f32 = table.table.iter().sum::<f32>() / 2048.0;
+        let mean: f32 = cycle.iter().sum::<f32>() / 2048.0;
         assert!(mean.abs() < 1e-3, "{mean}");
     }
 

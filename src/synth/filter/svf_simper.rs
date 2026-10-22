@@ -47,6 +47,13 @@ pub struct SvfSimper {
 
     k: f32,
 
+    /// Per sample change of the coefficients while ramping towards new parameters, see
+    /// `set_params_ramped()`.
+    a1_step: f32,
+    a2_step: f32,
+    a3_step: f32,
+    k_step: f32,
+
     pub filter_type: FilterType,
 }
 
@@ -69,6 +76,11 @@ impl SvfSimper {
 
             k,
 
+            a1_step: 0.0,
+            a2_step: 0.0,
+            a3_step: 0.0,
+            k_step: 0.0,
+
             filter_type: FilterType::Lowpass,
         }
     }
@@ -79,11 +91,21 @@ impl SvfSimper {
         self.a1 = new.a1;
         self.a2 = new.a2;
         self.a3 = new.a3;
+        self.k = new.k;
+        self.a1_step = 0.0;
+        self.a2_step = 0.0;
+        self.a3_step = 0.0;
+        self.k_step = 0.0;
     }
 }
 impl Filter for SvfSimper {
     #[inline]
     fn process(&mut self, input: f32) -> f32 {
+        self.a1 += self.a1_step;
+        self.a2 += self.a2_step;
+        self.a3 += self.a3_step;
+        self.k += self.k_step;
+
         let v3 = input - self.ic2eq;
         let v1 = (self.a1 * self.ic1eq) + (self.a2 * v3);
         let v2 = self.ic2eq + (self.a2 * self.ic1eq) + (self.a3 * v3);
@@ -103,6 +125,26 @@ impl Filter for SvfSimper {
 
     fn set_params(&mut self, sample_rate: f32, cutoff: f32, resonance: f32) {
         self.set(cutoff, resonance / 10.0, sample_rate)
+    }
+
+    /// Ramps the coefficients linearly to the new parameters over the next `ramp_samples`
+    /// samples, so that control rate cutoff changes don't step.
+    fn set_params_ramped(
+        &mut self,
+        sample_rate: f32,
+        cutoff: f32,
+        resonance: f32,
+        ramp_samples: usize,
+    ) {
+        if ramp_samples == 0 {
+            return self.set_params(sample_rate, cutoff, resonance);
+        }
+        let new = Self::new(cutoff, resonance / 10.0, sample_rate);
+        let scale = 1.0 / ramp_samples as f32;
+        self.a1_step = (new.a1 - self.a1) * scale;
+        self.a2_step = (new.a2 - self.a2) * scale;
+        self.a3_step = (new.a3 - self.a3) * scale;
+        self.k_step = (new.k - self.k) * scale;
     }
 
     fn set_filter_type(&mut self, filter_type: FilterType) {

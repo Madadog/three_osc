@@ -34,6 +34,8 @@ nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 fastrand = "1.7.0"
 itertools = "0.10.3"
 rustfft = "6.0.1"
+# Portable SIMD for the unison voice loop
+wide = "1.7"
 
 # The wavetables are generated with thousands of FFTs when the synth is created, which is painfully
 # slow with an unoptimised rustfft (debug builds and tests).
