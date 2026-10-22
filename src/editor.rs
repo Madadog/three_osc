@@ -11,6 +11,7 @@
 //! fills in a free slot of the modulation matrix. The matrix itself lists every route, with its
 //! amount, and modulated sliders are marked.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -21,10 +22,11 @@ use nih_plug_egui::{create_egui_editor, EguiState};
 
 use crate::params::{
     EnvelopeParams, FilterEnvParams, FilterParams, GlobalParams, LfoParams, ModParams,
-    ModSlotParams, OscParams, ThreeOscParams,
+    ModSlotParams, OscParams, OscillatorWave, ThreeOscParams, WavetableFile,
 };
 use crate::synth::modulation::{ModSource, ModTarget, N_SLOTS};
-use crate::ThreeOscPlugin;
+use crate::synth::wavetable_file;
+use crate::{Task, ThreeOscPlugin};
 
 /// The window's default size, in logical pixels.
 pub const DEFAULT_WIDTH: u32 = 1400;
@@ -49,13 +51,48 @@ pub fn default_state() -> Arc<EguiState> {
     EguiState::from_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
 }
 
-pub fn create(params: Arc<ThreeOscParams>) -> Option<Box<dyn Editor>> {
+/// State that only the GUI needs: the listing of the wavetable folder.
+pub struct EditorState {
+    folder: PathBuf,
+    /// The `.wav` files in the folder.
+    files: Vec<String>,
+    scanned: bool,
+    /// A path typed in to load a file from anywhere else.
+    custom_path: String,
+}
+
+impl EditorState {
+    fn new() -> Self {
+        Self {
+            folder: wavetable_file::default_folder(),
+            files: Vec::new(),
+            scanned: false,
+            custom_path: String::new(),
+        }
+    }
+    fn rescan(&mut self) {
+        self.files = wavetable_file::list_folder(&self.folder);
+        self.scanned = true;
+    }
+}
+
+/// What the GUI needs besides the parameters: the wavetable folder listing, and a way to run
+/// wavetable loads in the background.
+struct Gui<'a> {
+    state: &'a mut EditorState,
+    executor: &'a AsyncExecutor<ThreeOscPlugin>,
+}
+
+pub fn create(
+    params: Arc<ThreeOscParams>,
+    async_executor: AsyncExecutor<ThreeOscPlugin>,
+) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
     create_egui_editor(
         egui_state.clone(),
-        (),
+        EditorState::new(),
         |_, _| {},
-        move |egui_ctx, setter, _state| {
+        move |egui_ctx, setter, state| {
             ResizableWindow::new("three-osc-window")
                 .min_size(egui::vec2(320.0, 240.0))
                 .show(egui_ctx, &egui_state, |ui| {
@@ -63,13 +100,22 @@ pub fn create(params: Arc<ThreeOscParams>) -> Option<Box<dyn Editor>> {
                     // that the contents scroll instead of being cut off.
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| draw(ui, &params, setter));
+                        .show(ui, |ui| {
+                            let mut gui = Gui {
+                                state,
+                                executor: &async_executor,
+                            };
+                            draw(ui, &params, setter, &mut gui)
+                        });
                 });
         },
     )
 }
 
-fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter) {
+fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
+    if !gui.state.scanned {
+        gui.state.rescan();
+    }
     let matrix = Matrix {
         slots: &params.mod_slots,
     };
@@ -90,14 +136,26 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter) {
     ui.separator();
 
     ui.horizontal_top(|ui| {
-        oscillator(ui, "Osc 1", 0, &params.osc1, Some(&params.osc1_mod), &matrix, setter);
-        oscillator(ui, "Osc 2", 1, &params.osc2, Some(&params.osc2_mod), &matrix, setter);
-        oscillator(ui, "Osc 3", 2, &params.osc3, None, &matrix, setter);
+        for (index, title) in ["Osc 1", "Osc 2", "Osc 3"].into_iter().enumerate() {
+            let modulation = [Some(&params.osc1_mod), Some(&params.osc2_mod), None][index];
+            oscillator(
+                ui,
+                title,
+                index,
+                params.oscillator(index),
+                modulation,
+                params.wavetable_file(index),
+                &matrix,
+                setter,
+                gui,
+            );
+        }
         ui.vertical(|ui| {
             for (i, lfo_params) in params.lfos.iter().enumerate() {
                 lfo(ui, i, lfo_params, &matrix, setter);
             }
             midi_sources(ui);
+            wavetable_folder(ui, params, setter, gui);
         });
     });
 
@@ -125,24 +183,31 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oscillator(
     ui: &mut Ui,
     title: &str,
     index: usize,
     osc: &OscParams,
     modulation: Option<&ModParams>,
+    file: &WavetableFile,
     matrix: &Matrix,
     setter: &ParamSetter,
+    gui: &mut Gui,
 ) {
     section(ui, title, None, |ui| {
         combo(
             ui,
             &osc.wave,
             "The wavetable the oscillator plays. The basic shapes and fixed pulse widths are \
-             single frames; PW Sweep has many frames that Position morphs between. All waves \
-             are bandlimited (alias-free).",
+             single frames; PW Sweep has many frames that Position morphs between. File plays \
+             a wavetable loaded from a .wav file (see the Wavetable Files box). All waves are \
+             bandlimited (alias-free).",
             setter,
         );
+        if osc.wave.value() == OscillatorWave::File {
+            wavetable_file_rows(ui, index, file, gui);
+        }
         mod_slider(
             ui,
             &osc.position,
@@ -254,6 +319,119 @@ fn lfo(ui: &mut Ui, index: usize, lfo: &LfoParams, matrix: &Matrix, setter: &Par
             );
         },
     );
+}
+
+/// The rows picking an oscillator's wavetable file and showing how its load went.
+fn wavetable_file_rows(ui: &mut Ui, index: usize, file: &WavetableFile, gui: &mut Gui) {
+    ui.label("File").on_hover_text(
+        "The .wav file this oscillator plays as a wavetable: one or more single cycles one \
+         after the other, 2048 samples each unless the file says otherwise. Pick one from the \
+         wavetable folder here, or type a path into the Wavetable Files box.",
+    );
+    let current = file.path();
+    let current_name = Path::new(&current)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(("wavetable file", index))
+        .selected_text(if current.is_empty() {
+            String::from("(none)")
+        } else {
+            current_name
+        })
+        .width(COMBO_WIDTH)
+        .show_ui(ui, |ui| {
+            if gui.state.files.is_empty() {
+                ui.label(RichText::new("No .wav files in the wavetable folder").weak());
+            }
+            for name in &gui.state.files {
+                if ui.selectable_label(current == *name, name).clicked() {
+                    picked = Some(name.clone());
+                }
+            }
+        });
+    ui.end_row();
+    if let Some(name) = picked {
+        load_wavetable_file(file, index, name, gui.executor);
+    }
+    let mut status = file.status();
+    if file.path().is_empty() {
+        status = String::from("No file loaded: plays a sine until one is.");
+    }
+    if !status.is_empty() {
+        ui.label("");
+        ui.add(egui::Label::new(RichText::new(status).small().weak()).wrap());
+        ui.end_row();
+    }
+}
+
+/// Sets an oscillator's wavetable file and starts loading it in the background.
+fn load_wavetable_file(
+    file: &WavetableFile,
+    osc: usize,
+    path: String,
+    executor: &AsyncExecutor<ThreeOscPlugin>,
+) {
+    file.set_path(path);
+    if let Some(generation) = file.claim_load() {
+        file.set_status(String::from("Loading..."));
+        executor.execute_background(Task::LoadWavetable { osc, generation });
+    }
+}
+
+/// The wavetable folder: where the oscillators' File combo boxes look, with a way to load a
+/// file from anywhere else.
+fn wavetable_folder(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
+    ui.push_id("wavetable folder", |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width(SECTION_WIDTH);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Wavetable Files").strong()).on_hover_text(
+                        "Put .wav wavetables in this folder and set an oscillator's Wave to \
+                         File to play them. The folder is Documents/Three Osc/Wavetables in your \
+                         home directory, or wherever the THREE_OSC_WAVETABLES environment \
+                         variable points.",
+                    );
+                    if ui.small_button("Rescan").clicked() {
+                        gui.state.rescan();
+                    }
+                });
+                ui.separator();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(gui.state.folder.to_string_lossy()).small().weak(),
+                    )
+                    .wrap(),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut gui.state.custom_path)
+                            .hint_text("Path to a .wav file")
+                            .desired_width(SLIDER_WIDTH + 40.0),
+                    )
+                    .on_hover_text(
+                        "A file outside the folder, loaded into an oscillator with the buttons.",
+                    );
+                    for osc in 0..3 {
+                        if ui
+                            .small_button(format!("Osc {}", osc + 1))
+                            .on_hover_text(
+                                "Loads the file into this oscillator, and sets its Wave to File.",
+                            )
+                            .clicked()
+                            && !gui.state.custom_path.trim().is_empty()
+                        {
+                            let path = gui.state.custom_path.trim().to_string();
+                            load_wavetable_file(params.wavetable_file(osc), osc, path, gui.executor);
+                            set_param(setter, &params.oscillator(osc).wave, OscillatorWave::File);
+                        }
+                    }
+                });
+            });
+        });
+    });
 }
 
 /// The modulation sources that come from MIDI (and the random one), as a row of drag handles.
@@ -680,10 +858,10 @@ fn mod_slider<P: Param>(
             })
             .collect();
         if !routes.is_empty() {
-            ui.add(
-                egui::Label::new(RichText::new("◆").color(MOD_COLOR).small()).selectable(false),
-            )
-            .on_hover_text(format!("Modulated by:\n{}", routes.join("\n")));
+            // Painted rather than a glyph, which the default proportional fonts may lack
+            let (rect, marker) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 3.5, MOD_COLOR);
+            marker.on_hover_text(format!("Modulated by:\n{}", routes.join("\n")));
         }
     });
     ui.end_row();

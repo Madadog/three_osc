@@ -932,6 +932,7 @@ fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
 
 pub mod fastmath;
 pub mod wav;
+pub mod wavetable_file;
 pub mod modulation;
 pub mod oscillator;
 

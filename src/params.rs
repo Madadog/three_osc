@@ -7,8 +7,10 @@
 //! The parameter IDs (e.g. `osc1_wave`, `fil1_cutoff`, `vol_attack`) intentionally match the old
 //! LV2 port symbols.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
+use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 
@@ -73,12 +75,78 @@ pub enum OscillatorWave {
     #[id = "pw_sweep"]
     #[name = "PW Sweep"]
     PwSweep,
+    /// The wavetable loaded from the oscillator's file (see [`WavetableFile`]).
+    #[id = "file"]
+    #[name = "File"]
+    File,
 }
 
 impl OscillatorWave {
-    /// The index of this wavetable in the synth's `WavetableSet`.
-    pub fn wavetable_index(self) -> usize {
-        self.to_index()
+    /// The index of this wavetable in the synth's `WavetableSet`, or `None` for the wavetable
+    /// loaded from a file.
+    pub fn wavetable_index(self) -> Option<usize> {
+        (self != OscillatorWave::File).then(|| self.to_index())
+    }
+}
+
+/// The path of the wavetable file an oscillator plays when its wave is set to File, saved with
+/// the plugin's state. The file is read and its tables generated on a background thread (see
+/// [`crate::Task`]); the audio thread only compares a generation counter to notice a new path,
+/// and a load is claimed by whichever of the GUI and the audio thread sees the change first.
+#[derive(Debug, Default)]
+pub struct WavetableFile {
+    /// Absolute, or a file name in the wavetable folder (see
+    /// [`wavetable_file::resolve()`][crate::synth::wavetable_file::resolve()]). Empty for none.
+    path: RwLock<String>,
+    /// Bumped whenever the path changes.
+    generation: AtomicU32,
+    /// The generation a load was last started for.
+    requested: AtomicU32,
+    /// What became of the last load, for the GUI.
+    status: Mutex<String>,
+}
+
+impl WavetableFile {
+    pub fn path(&self) -> String {
+        self.path.read().unwrap().clone()
+    }
+    pub fn set_path(&self, path: String) {
+        PersistentField::set(self, path);
+    }
+    pub fn generation(&self) -> u32 {
+        self.generation.load(Ordering::SeqCst)
+    }
+    /// Claims the load of the current path, if nobody has yet: returns the generation to load
+    /// for, or `None` when it is already being (or has been) loaded.
+    pub fn claim_load(&self) -> Option<u32> {
+        let generation = self.generation();
+        let previous = self.requested.load(Ordering::SeqCst);
+        if previous == generation {
+            return None;
+        }
+        self.requested
+            .compare_exchange(previous, generation, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| generation)
+    }
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+    pub fn set_status(&self, status: String) {
+        *self.status.lock().unwrap() = status;
+    }
+}
+
+impl PersistentField<'_, String> for WavetableFile {
+    fn set(&self, new_value: String) {
+        *self.path.write().unwrap() = new_value;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+    fn map<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&String) -> R,
+    {
+        f(&self.path.read().unwrap())
     }
 }
 
@@ -188,6 +256,14 @@ pub struct ThreeOscParams {
     #[nested(id_prefix = "osc3", group = "Osc 3")]
     pub osc3: OscParams,
 
+    /// The wavetable files the oscillators play when their wave is set to File.
+    #[persist = "osc1_file"]
+    pub osc1_file: WavetableFile,
+    #[persist = "osc2_file"]
+    pub osc2_file: WavetableFile,
+    #[persist = "osc3_file"]
+    pub osc3_file: WavetableFile,
+
     #[nested(id_prefix = "fil1", group = "Filter 1")]
     pub filter: FilterParams,
     #[nested(id_prefix = "fil1", group = "Filter 1 Env.")]
@@ -222,6 +298,9 @@ impl Default for ThreeOscParams {
             osc2: OscParams::new(0.0, OscillatorWave::Sine),
             osc2_mod: ModParams::new("Osc 3"),
             osc3: OscParams::new(0.0, OscillatorWave::Sine),
+            osc1_file: WavetableFile::default(),
+            osc2_file: WavetableFile::default(),
+            osc3_file: WavetableFile::default(),
 
             filter: FilterParams::new(),
             filter_env: FilterEnvParams::new(),
@@ -234,6 +313,17 @@ impl Default for ThreeOscParams {
 
             global: GlobalParams::new(),
         }
+    }
+}
+
+impl ThreeOscParams {
+    /// An oscillator's wavetable file, by oscillator index.
+    pub fn wavetable_file(&self, osc: usize) -> &WavetableFile {
+        [&self.osc1_file, &self.osc2_file, &self.osc3_file][osc]
+    }
+    /// An oscillator's controls, by oscillator index.
+    pub fn oscillator(&self, osc: usize) -> &OscParams {
+        [&self.osc1, &self.osc2, &self.osc3][osc]
     }
 }
 
@@ -796,6 +886,21 @@ mod tests {
         assert_eq!(multiplier_to_pitch_multiplier(1), 2.0);
         assert_eq!(multiplier_to_pitch_multiplier(-1), 0.5);
         assert_eq!(multiplier_to_pitch_multiplier(-3), 0.25);
+    }
+
+    #[test]
+    fn wavetable_file_loads_are_claimed_once_per_path() {
+        let file = WavetableFile::default();
+        assert_eq!(file.claim_load(), None);
+        file.set_path(String::from("saw.wav"));
+        assert_eq!(file.path(), "saw.wav");
+        assert_eq!(file.claim_load(), Some(1));
+        assert_eq!(file.claim_load(), None);
+        PersistentField::set(&file, String::from("square.wav"));
+        assert_eq!(PersistentField::map(&file, |path| path.clone()), "square.wav");
+        assert_eq!(file.claim_load(), Some(2));
+        file.set_status(String::from("ok"));
+        assert_eq!(file.status(), "ok");
     }
 
     #[test]

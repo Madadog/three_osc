@@ -524,13 +524,7 @@ impl Filter for LadderFilter {
         self.cutoff_frequency = (cutoff as f64 / 7000.0) + 0.0001;
         // Self-resonance starts at resonance >= 0.5
         self.resonance = (resonance / 16.6) as f64;
-        // The decimator's coefficients only depend on the sample rate, and redesigning it also
-        // clears its state, so it is left alone unless the rate actually changed.
-        if self.sample_rate != sample_rate as f64 {
-            self.set_sample_rate(sample_rate as f64);
-        } else {
-            self.set_integration_rate();
-        }
+        self.set_sample_rate(sample_rate as f64);
     }
 
     fn set_filter_type(&mut self, filter_type: FilterType) {

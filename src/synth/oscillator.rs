@@ -1735,6 +1735,17 @@ impl Spectrum {
     pub fn harmonics(&self) -> usize {
         self.bins.len().saturating_sub(1)
     }
+    /// Drops the harmonics above the last one that is at least `floor` times the strongest
+    /// (e.g. 1e-5 for -100 dB), so that tables aren't made longer than the content needs.
+    pub fn trim(&mut self, floor: f32) {
+        let peak = self.bins.iter().map(|bin| bin.norm()).fold(0.0, f32::max);
+        let last = self
+            .bins
+            .iter()
+            .rposition(|bin| bin.norm() > peak * floor)
+            .unwrap_or(0);
+        self.bins.truncate(last + 1);
+    }
     /// Renders one cycle of the first `harmonics` harmonics into `output` using an inverse FFT.
     /// `fft` must be an inverse FFT plan with the same length as `output`, which must be at least
     /// twice `harmonics` to keep the result bandlimited.
@@ -2294,6 +2305,17 @@ mod tests {
         for (got, want) in rendered.iter().zip(&cycle) {
             assert!((got - (want - 0.3)).abs() < 1e-4, "{got} vs {want}");
         }
+        // Trimming keeps the harmonics with content
+        let mut trimmed = spectrum.clone();
+        trimmed.trim(1e-5);
+        assert_eq!(trimmed.harmonics(), 40);
+        assert_eq!(trimmed.bins[..], spectrum.bins[..41]);
+        let mut silent = Spectrum {
+            bins: vec![Complex32::new(0.0, 0.0); 8],
+        };
+        silent.trim(1e-5);
+        assert_eq!(silent.harmonics(), 0);
+
         // At a power of two length the same waveform comes out, resampled
         let table = Wavetable::from_spectrum(&spectrum, 1024, 299, &*planner.plan_fft_inverse(1024));
         assert!((table.generate(0.25) - (0.5 + 0.25 * (3.0 * PI / 2.0 + 1.0).cos() + 0.1 * (10.0 * PI).sin())).abs() < 1e-3);

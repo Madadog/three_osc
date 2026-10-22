@@ -12,10 +12,10 @@ Currently a work in progress, but usable nevertheless.
 ## Features
 
 * 3 oscillators which can modulate eachother via phase, frequency, and amplitude modulation (PM, FM & AM) simultaneously
-* Choose between 3 multimode filter models (RC, Ladder, Simper SVF) with keytracking and envelope. The ladder filter runs four voices at a time with AVX where available.
+* Choose between 3 multimode filter models (RC, Ladder, Simper SVF) with keytracking and envelope. The Digital (SVF) filter runs eight voices at a time and the ladder four (with AVX where available).
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
-* Wavetable oscillators with sine, triangle, absolute sine, saw, square and pulse waves, plus a pulse width sweep wavetable that each oscillator's position control morphs through
+* Wavetable oscillators with sine, triangle, absolute sine, saw, square and pulse waves, a pulse width sweep wavetable that each oscillator's position control morphs through, and wavetables loaded from `.wav` files (single cycles or multi-frame tables, including the `clm` frame size chunk Serum-style tables carry)
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic, linear or no interpolation (a global control, for trading quality against CPU)
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
@@ -60,6 +60,15 @@ cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 
 ### Modulation
 Every modulation route goes from a source to a target with an amount from -100% to 100%. At 100% a source's full swing moves a slider target across its whole length, a pitch target by an octave (the Fine Pitch target by a semitone), the filter cutoff by 10 octaves, the resonance by 10 times, the drive by 32 times and an LFO's rate by 4 octaves; a target's routes add up and the result is clamped to the control's range. The LFOs and the random value are bipolar (-1 to 1), the envelopes and MIDI sources go from 0 to 1. Each note runs its own copies of the LFOs and envelopes, so the routes are evaluated per voice at the control rate (see below). In the GUI, drag the handle next to a source's title (or in the "More Sources" box) onto any slider with a drop highlight to fill in a free row of the matrix; modulated sliders show an orange marker that lists their routes.
+
+### Wavetable files
+Set an oscillator's Wave to File to play a wavetable from a `.wav` file. The File row that appears lists the `.wav` files in the wavetable folder, `Documents/Three Osc/Wavetables` in your home directory (or the folder the `THREE_OSC_WAVETABLES` environment variable names); the Wavetable Files box shows the folder, rescans it, and loads a file from any other path into an oscillator. The chosen path is saved with the plugin's state.
+
+A file holds one or more frames, single cycles one after the other. The frame length comes from the file's `clm ` chunk when it has one (wavetable editors such as Serum write it), otherwise frames are taken to be 2048 samples long when the file divides evenly into them, and any other file up to 65536 samples is one cycle. PCM (8 to 32-bit) and float files are read, stereo files are mixed to mono, and files with more than 256 frames are thinned out to 256. Position morphs through the frames like it does for PW Sweep.
+
+The file is read and analysed on a background thread: each frame's spectrum is kept, and the bandlimited tables for every note are generated from it for the current sample rate (and regenerated when it changes), so a loaded wavetable is as alias-free as the built in ones. Until the file is loaded, or when none is set, the oscillator plays a sine.
+
+Each note's table is only as long as its harmonics need (a power of two of at least 16 samples per harmonic, from 64 up to 2048 samples), and a wavetable with many frames shares one table between neighbouring notes when it would otherwise take more than 24 MB. The built in wavetables take 26 MB.
 
 ### Control rate
 Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate. Change the constant to try other sizes.
@@ -118,6 +127,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
     * Knobs instead of sliders, envelope / waveform displays
     * 2nd page for oversampling and other unimportant things
 * Load Scala .scl and .kbm files
+* A file browser for wavetable files outside the wavetable folder (paths can be typed in for now)
 * Publish
 
 ## LICENSE

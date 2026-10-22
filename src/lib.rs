@@ -5,7 +5,9 @@
 //! engine in the [`synth`] module. It exports the synth as a CLAP and a VST3 plugin (and as a
 //! standalone application when the `standalone` feature is enabled), with an egui GUI.
 
-use std::sync::Arc;
+use std::any::Any;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
 
@@ -15,10 +17,14 @@ mod editor;
 mod params;
 mod synth;
 
-use params::{multiplier_to_pitch_multiplier, EnvelopeParams, ModParams, OscParams, ThreeOscParams};
+use params::{
+    multiplier_to_pitch_multiplier, EnvelopeParams, ModParams, OscParams, OscillatorWave,
+    ThreeOscParams,
+};
 use synth::envelopes::AdsrEnvelope;
 use synth::modulation::{ModSource, ModTarget, Route};
-use synth::oscillator::OscillatorParams;
+use synth::oscillator::{OscillatorParams, WavetableFrames};
+use synth::wavetable_file::{self, LoadedSpectra};
 use synth::ThreeOsc;
 
 /// The sample rate the synth is created with before the host tells us the real one in
@@ -28,6 +34,50 @@ const DEFAULT_SAMPLE_RATE: f64 = 44100.0;
 pub struct ThreeOscPlugin {
     params: Arc<ThreeOscParams>,
     synth: ThreeOsc,
+    loader: Loader,
+}
+
+/// Work the plugin does off the audio thread, see [`Plugin::task_executor()`].
+pub enum Task {
+    /// Loads the wavetable file an oscillator is set to (the path at the given generation of
+    /// its [`params::WavetableFile`]), generates its tables and hands them to the audio thread.
+    LoadWavetable { osc: usize, generation: u32 },
+    /// Frees something the audio thread is done with, so it isn't deallocated there.
+    Dispose(Arc<dyn Any + Send + Sync>),
+}
+
+/// A loaded wavetable file on its way to the audio thread.
+struct LoadedWavetable {
+    osc: usize,
+    generation: u32,
+    /// The sample rate the tables were generated for.
+    sample_rate: f32,
+    result: LoadResult,
+}
+
+enum LoadResult {
+    /// The file's spectra and the tables generated from them.
+    Loaded(Arc<LoadedSpectra>, Arc<WavetableFrames>),
+    /// The path was cleared.
+    Cleared,
+    /// The file couldn't be loaded; the GUI shows why.
+    Failed,
+}
+
+/// One finished load per oscillator, waiting for the audio thread. A newer load replaces an
+/// older one that wasn't picked up yet, which then gets freed on the background thread.
+type LoadedSlots = [Mutex<Option<LoadedWavetable>>; 3];
+
+/// The plugin's side of wavetable file loading: loaded files come back from the background
+/// thread through [`LoadedSlots`], which the audio thread only ever `try_lock`s, and the
+/// spectra of each loaded file are kept so its tables can be regenerated when the sample rate
+/// changes. Nothing is allocated or freed on the audio thread: replaced tables and spectra go
+/// back to the background thread to be dropped.
+struct Loader {
+    slots: Arc<LoadedSlots>,
+    /// The current sample rate (as `f32` bits), for the background thread.
+    sample_rate: Arc<AtomicU32>,
+    spectra: [Option<Arc<LoadedSpectra>>; 3],
 }
 
 impl Default for ThreeOscPlugin {
@@ -35,11 +85,78 @@ impl Default for ThreeOscPlugin {
         Self {
             params: Arc::new(ThreeOscParams::default()),
             synth: ThreeOsc::new(DEFAULT_SAMPLE_RATE),
+            loader: Loader {
+                slots: Arc::new(Default::default()),
+                sample_rate: Arc::new(AtomicU32::new((DEFAULT_SAMPLE_RATE as f32).to_bits())),
+                spectra: [None, None, None],
+            },
         }
     }
 }
 
 impl ThreeOscPlugin {
+    /// Picks up the wavetable files the background thread has loaded and installs them in the
+    /// synth, and starts loads for paths that changed (from the GUI, or a loaded preset).
+    /// `execute` runs a task on the background thread.
+    fn update_wavetable_files(&mut self, mut execute: impl FnMut(Task)) {
+        for osc in 0..3 {
+            // Never waits: if the background thread is storing a result right now, it is
+            // picked up next time.
+            let loaded = match self.loader.slots[osc].try_lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => None,
+            };
+            if let Some(loaded) = loaded {
+                self.install_wavetable_file(loaded, &mut execute);
+            }
+            if let Some(generation) = self.params.wavetable_file(osc).claim_load() {
+                execute(Task::LoadWavetable { osc, generation });
+            }
+        }
+    }
+
+    /// Installs a finished load, if it is still wanted.
+    fn install_wavetable_file(&mut self, loaded: LoadedWavetable, execute: &mut impl FnMut(Task)) {
+        let LoadedWavetable {
+            osc,
+            generation,
+            sample_rate,
+            result,
+        } = loaded;
+        let current = generation == self.params.wavetable_file(osc).generation();
+        let right_rate = sample_rate == self.synth.sample_rate as f32;
+        match result {
+            LoadResult::Loaded(spectra, frames) if current && right_rate => {
+                if let Some(old) = self.loader.spectra[osc].replace(spectra) {
+                    execute(Task::Dispose(old));
+                }
+                if let Some(old) = self.synth.user_waves[osc].replace(frames) {
+                    execute(Task::Dispose(old));
+                }
+            }
+            LoadResult::Cleared if current => {
+                if let Some(old) = self.loader.spectra[osc].take() {
+                    execute(Task::Dispose(old));
+                }
+                if let Some(old) = self.synth.user_waves[osc].take() {
+                    execute(Task::Dispose(old));
+                }
+            }
+            LoadResult::Loaded(spectra, frames) => {
+                execute(Task::Dispose(spectra));
+                execute(Task::Dispose(frames));
+                if current {
+                    // Generated for a sample rate that changed in the meantime: again
+                    execute(Task::LoadWavetable { osc, generation });
+                }
+                // Otherwise the path changed again since, and a newer load is on its way
+            }
+            // A cleared path that changed again, or a failed load (the synth keeps what it
+            // had, and the GUI shows the error)
+            LoadResult::Cleared | LoadResult::Failed => {}
+        }
+    }
+
     /// Reads the current parameter values and applies them to the synth engine.
     ///
     /// This mirrors what the LV2 version did with its control ports at the start of every `run()`
@@ -197,7 +314,9 @@ impl ThreeOscPlugin {
 
 /// Applies the controls shared by all oscillators.
 fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch: f32) {
-    osc.wavetable = params.wave.value().wavetable_index();
+    let wave = params.wave.value();
+    osc.use_file = wave == OscillatorWave::File;
+    osc.wavetable = wave.wavetable_index().unwrap_or(0);
     osc.position = params.position.value();
     osc.amp = params.amp.value() / 100.0;
     osc.semitone = params.semitone.value() + global_pitch;
@@ -250,29 +369,84 @@ impl Plugin for ThreeOscPlugin {
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
-    type BackgroundTask = ();
+    type BackgroundTask = Task;
+
+    fn task_executor(&mut self) -> TaskExecutor<Self> {
+        let params = self.params.clone();
+        let slots = self.loader.slots.clone();
+        let sample_rate = self.loader.sample_rate.clone();
+        Box::new(move |task| match task {
+            Task::LoadWavetable { osc, generation } => {
+                let file = params.wavetable_file(osc);
+                let path = file.path();
+                let sample_rate = f32::from_bits(sample_rate.load(Ordering::Relaxed));
+                let (result, status) = if path.is_empty() {
+                    (LoadResult::Cleared, String::new())
+                } else {
+                    match LoadedSpectra::load(&wavetable_file::resolve(&path)) {
+                        Ok(spectra) => {
+                            let frames = Arc::new(spectra.generate(sample_rate));
+                            let status = spectra.describe(&frames);
+                            (LoadResult::Loaded(Arc::new(spectra), frames), status)
+                        }
+                        Err(error) => (LoadResult::Failed, format!("Error: {error}")),
+                    }
+                };
+                file.set_status(status);
+                let loaded = LoadedWavetable {
+                    osc,
+                    generation,
+                    sample_rate,
+                    result,
+                };
+                // A result the audio thread hasn't picked up yet is replaced, and dropped here
+                // once the lock is released
+                let replaced = slots[osc]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(loaded);
+                drop(replaced);
+            }
+            Task::Dispose(_) => {}
+        })
+    }
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
 
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone())
+    fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        editor::create(self.params.clone(), async_executor)
     }
 
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
+        context: &mut impl InitContext<Self>,
     ) -> bool {
         // The synth's wavetables are generated for a specific sample rate, so the synth needs to
         // be rebuilt when the sample rate changes. This may be called several times in a row, so
         // avoid the (fairly expensive) rebuild when nothing changed.
         let sample_rate = buffer_config.sample_rate as f64;
+        self.loader
+            .sample_rate
+            .store((sample_rate as f32).to_bits(), Ordering::Relaxed);
         if self.synth.sample_rate != sample_rate {
             self.synth = ThreeOsc::new(sample_rate);
+            // Loaded wavetable files are regenerated for the new rate right here, since
+            // initialising may block.
+            for (osc, spectra) in self.loader.spectra.iter().enumerate() {
+                if let Some(spectra) = spectra {
+                    self.synth.user_waves[osc] = Some(Arc::new(spectra.generate(sample_rate as f32)));
+                }
+            }
         }
+        // Wavetable files restored with the plugin's state are loaded before processing starts,
+        // so offline renders have them from the first sample: the first pass runs the loads on
+        // this thread, the second installs them.
+        self.update_wavetable_files(|task| context.execute(task));
+        self.update_wavetable_files(|task| context.execute(task));
 
         true
     }
@@ -288,6 +462,7 @@ impl Plugin for ThreeOscPlugin {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         self.apply_params();
+        self.update_wavetable_files(|task| context.execute_background(task));
 
         let (out_l, out_r) = match buffer.as_slice() {
             [out_l, out_r, ..] => (out_l, out_r),
@@ -370,7 +545,12 @@ mod tests {
     fn wavetable_order_matches_the_wave_parameter() {
         let set = synth::oscillator::WavetableSet::new(44100.0, 64);
         let names: Vec<&str> = set.wavetables.iter().map(|wavetable| wavetable.name.as_str()).collect();
-        assert_eq!(names, params::OscillatorWave::variants());
+        // The last wave is the loaded file
+        let variants = params::OscillatorWave::variants();
+        assert_eq!(names, &variants[..variants.len() - 1]);
+        assert_eq!(variants.last(), Some(&"File"));
+        assert_eq!(OscillatorWave::File.wavetable_index(), None);
+        assert_eq!(OscillatorWave::Saw.wavetable_index(), Some(2));
     }
 
     /// Silent oscillators are skipped, unless they modulate an audible oscillator.
@@ -618,6 +798,90 @@ mod tests {
         assert_eq!(plugin.synth.mod_wheel, 0.75);
         assert_eq!(plugin.synth.aftertouch, 0.5);
         assert_eq!(plugin.synth.voices.len(), 1);
+    }
+
+    /// A wavetable file set for an oscillator is loaded on the background thread, installed on
+    /// the audio thread, and played when the oscillator's wave is set to File.
+    #[test]
+    fn wavetable_files_are_loaded_and_played() {
+        use std::f32::consts::PI;
+
+        // A file with one cycle of a 5th harmonic, so it's nothing like the built in waves
+        let dir = std::env::temp_dir().join(format!("three_osc_plugin_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cycle: Vec<f32> = (0..1024).map(|i| (2.0 * PI * 5.0 * i as f32 / 1024.0).sin()).collect();
+        let path = dir.join("fifth.wav");
+        std::fs::write(&path, synth::wav::write_float(44100, 1, &cycle, Some(1024))).unwrap();
+
+        let mut plugin = ThreeOscPlugin::default();
+        let executor = plugin.task_executor();
+        let render = |plugin: &mut ThreeOscPlugin| {
+            plugin.synth.reset();
+            plugin.apply_params();
+            plugin.synth.oscillators[0].use_file = true;
+            plugin.synth.oscillators[0].phase_rand = 0.0;
+            plugin.synth.filter_controller.filter_model = synth::filter::FilterModel::None;
+            plugin.synth.note_on(60, 100);
+            let mut left = vec![0.0; 2048];
+            let mut right = vec![0.0; 2048];
+            plugin.synth.run(&mut left, &mut right);
+            left
+        };
+        // Nothing loaded yet: the file wave falls back to the first built in wave
+        let fallback = render(&mut plugin);
+        assert_eq!(plugin.synth.oscillator_frames(0).name, "Sine");
+
+        // Set the path, as the GUI or a preset would, and run the load the way the host does
+        let params = plugin.params.clone();
+        let file = params.wavetable_file(0);
+        file.set_path(path.to_string_lossy().into_owned());
+        let mut tasks = Vec::new();
+        plugin.update_wavetable_files(|task| tasks.push(task));
+        assert!(matches!(tasks.as_slice(), [Task::LoadWavetable { osc: 0, generation: 1 }]));
+        // A load is only started once per path
+        let mut more = Vec::new();
+        plugin.update_wavetable_files(|task| more.push(task));
+        assert!(more.is_empty());
+        for task in tasks.drain(..) {
+            executor(task);
+        }
+        assert!(file.status().starts_with("1 frame of 1024 samples"), "{}", file.status());
+
+        // The next process call installs it, with nothing to dispose of yet
+        plugin.update_wavetable_files(|task| tasks.push(task));
+        assert!(tasks.is_empty());
+        assert_eq!(plugin.synth.oscillator_frames(0).name, "fifth.wav");
+        let loaded = render(&mut plugin);
+        assert!(max_abs_diff(&loaded, &fallback) > 0.05);
+        // It plays at the 5th harmonic of middle C
+        let cycle_samples = 44100.0 / (440.0 * 2.0_f32.powf(-9.0 / 12.0)) / 5.0;
+        let zero_crossings = loaded.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+        let expected = 2.0 * 2048.0 / cycle_samples;
+        assert!((zero_crossings as f32 - expected).abs() < 4.0, "{zero_crossings} vs {expected}");
+
+        // A missing file reports an error and keeps the loaded wavetable
+        file.set_path(String::from("missing.wav"));
+        plugin.update_wavetable_files(|task| tasks.push(task));
+        for task in tasks.drain(..) {
+            executor(task);
+        }
+        assert!(file.status().starts_with("Error"), "{}", file.status());
+        plugin.update_wavetable_files(|task| tasks.push(task));
+        assert!(tasks.is_empty());
+        assert_eq!(plugin.synth.oscillator_frames(0).name, "fifth.wav");
+
+        // Clearing the path unloads it, and the old tables are disposed of in the background
+        file.set_path(String::new());
+        plugin.update_wavetable_files(|task| tasks.push(task));
+        for task in tasks.drain(..) {
+            executor(task);
+        }
+        plugin.update_wavetable_files(|task| tasks.push(task));
+        // Both the spectra and the tables
+        assert!(matches!(tasks.as_slice(), [Task::Dispose(_), Task::Dispose(_)]));
+        assert_eq!(plugin.synth.oscillator_frames(0).name, "Sine");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Parameter IDs must be unique for the host to tell the parameters apart.

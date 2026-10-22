@@ -257,9 +257,7 @@ impl FilterContainer {
                 *x = FilterContainer::RcFilter(filter)
             },
             (x, FilterModel::LadderFilter) => {
-                let mut filter = LadderFilter::default();
-                filter.set_sample_rate(sample_rate as f64);
-                *x = FilterContainer::LadderFilter(filter)
+                *x = FilterContainer::LadderFilter(LadderFilter::default())
             }
             (x, FilterModel::BiquadFilter) => {
                 *x = FilterContainer::BiquadFilter(BiquadFilter::with_params(

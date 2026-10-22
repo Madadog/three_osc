@@ -79,17 +79,17 @@ fn supersaw(osc: &mut OscillatorParams) {
 }
 
 fn select_saw(osc: &mut OscillatorParams) {
-    osc.wavetable = OscillatorWave::Saw.wavetable_index();
+    osc.wavetable = OscillatorWave::Saw.wavetable_index().unwrap();
 }
 
 /// A 40% pulse wave.
 fn select_pulse(osc: &mut OscillatorParams) {
-    osc.wavetable = OscillatorWave::Pulse40.wavetable_index();
+    osc.wavetable = OscillatorWave::Pulse40.wavetable_index().unwrap();
 }
 
 /// The pulse width sweep wavetable, in between two frames so both are read.
 fn select_sweep(osc: &mut OscillatorParams) {
-    osc.wavetable = OscillatorWave::PwSweep.wavetable_index();
+    osc.wavetable = OscillatorWave::PwSweep.wavetable_index().unwrap();
     osc.position = 0.37;
 }
 
