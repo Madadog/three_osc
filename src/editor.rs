@@ -15,7 +15,7 @@ use nih_plug_egui::{create_egui_editor, EguiState};
 
 use crate::params::{
     EnvelopeParams, FilterEnvParams, FilterParams, GlobalParams, LfoParams, ModParams, OscParams,
-    PulseParams, ThreeOscParams,
+    ThreeOscParams,
 };
 use crate::ThreeOscPlugin;
 
@@ -69,9 +69,9 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter) {
     ui.separator();
 
     ui.horizontal_top(|ui| {
-        oscillator(ui, "Osc 1", &params.osc1, Some(&params.osc1_mod), None, setter);
-        oscillator(ui, "Osc 2", &params.osc2, Some(&params.osc2_mod), None, setter);
-        oscillator(ui, "Osc 3", &params.osc3, None, Some(&params.osc3_pulse), setter);
+        oscillator(ui, "Osc 1", &params.osc1, Some(&params.osc1_mod), setter);
+        oscillator(ui, "Osc 2", &params.osc2, Some(&params.osc2_mod), setter);
+        oscillator(ui, "Osc 3", &params.osc3, None, setter);
     });
 
     ui.horizontal_top(|ui| {
@@ -92,14 +92,23 @@ fn oscillator(
     title: &str,
     osc: &OscParams,
     modulation: Option<&ModParams>,
-    pulse: Option<&PulseParams>,
     setter: &ParamSetter,
 ) {
     section(ui, title, |ui| {
         combo(
             ui,
             &osc.wave,
-            "The oscillator's waveform. All waves are bandlimited (alias-free).",
+            "The wavetable the oscillator plays. The basic shapes and fixed pulse widths are \
+             single frames; PW Sweep has many frames that Position morphs between. All waves \
+             are bandlimited (alias-free).",
+            setter,
+        );
+        slider(
+            ui,
+            &osc.position,
+            "Position within the wavetable. Only has an effect on wavetables with more than one \
+             frame: for PW Sweep it sweeps the pulse width from 50% (a square wave) down to a \
+             very narrow pulse.",
             setter,
         );
         slider(
@@ -136,14 +145,6 @@ fn oscillator(
                 &modulation.am,
                 "Amplitude modulation of this oscillator by the oscillator after it. Also known as \
                  'Ring Modulation'. Can be used for telephone sounds and tremolo.",
-                setter,
-            );
-        }
-        if let Some(pulse) = pulse {
-            slider(
-                ui,
-                &pulse.pulse_width,
-                "Pulse width modulation. Adjusts the width of the square waveform.",
                 setter,
             );
         }

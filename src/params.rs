@@ -7,7 +7,6 @@
 //! The parameter IDs (e.g. `osc1_wave`, `fil1_cutoff`, `vol_attack`) intentionally match the old
 //! LV2 port symbols.
 
-use std::f32::consts::PI;
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -17,7 +16,7 @@ use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::oscillator::OscWave;
 use crate::synth::Polyphony;
 
-/// Waveforms available to the oscillators and the LFO.
+/// Waveforms available to the LFO.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wave {
     #[id = "sine"]
@@ -42,14 +41,43 @@ impl Wave {
             Wave::Square => OscWave::Square,
         }
     }
+}
 
-    /// Like [`to_osc_wave()`][Self::to_osc_wave()], but the square wave becomes a pulse wave with
-    /// an adjustable width. Used by Osc 3.
-    pub fn to_osc_wave_pulse(self) -> OscWave {
-        match self {
-            Wave::Square => OscWave::Pulse { width: PI },
-            wave => wave.to_osc_wave(),
-        }
+/// Wavetables available to the oscillators, in the order they are stored in the synth's
+/// `WavetableSet`.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscillatorWave {
+    #[id = "sine"]
+    Sine,
+    #[id = "triangle"]
+    Triangle,
+    #[id = "saw"]
+    Saw,
+    #[id = "exponential"]
+    Exponential,
+    #[id = "square"]
+    Square,
+    #[id = "pulse40"]
+    #[name = "Pulse 40%"]
+    Pulse40,
+    #[id = "pulse30"]
+    #[name = "Pulse 30%"]
+    Pulse30,
+    #[id = "pulse20"]
+    #[name = "Pulse 20%"]
+    Pulse20,
+    #[id = "pulse10"]
+    #[name = "Pulse 10%"]
+    Pulse10,
+    #[id = "pw_sweep"]
+    #[name = "PW Sweep"]
+    PwSweep,
+}
+
+impl OscillatorWave {
+    /// The index of this wavetable in the synth's `WavetableSet`.
+    pub fn wavetable_index(self) -> usize {
+        self.to_index()
     }
 }
 
@@ -165,8 +193,6 @@ pub struct ThreeOscParams {
 
     #[nested(id_prefix = "osc3", group = "Osc 3")]
     pub osc3: OscParams,
-    #[nested(id_prefix = "osc3", group = "Osc 3")]
-    pub osc3_pulse: PulseParams,
 
     #[nested(id_prefix = "fil1", group = "Filter 1")]
     pub filter: FilterParams,
@@ -189,12 +215,11 @@ impl Default for ThreeOscParams {
             editor_state: crate::editor::default_state(),
 
             // The first oscillator defaults to an audible saw wave, the others are silent.
-            osc1: OscParams::new(100.0, Wave::Saw),
+            osc1: OscParams::new(100.0, OscillatorWave::Saw),
             osc1_mod: ModParams::new("Osc 2"),
-            osc2: OscParams::new(0.0, Wave::Sine),
+            osc2: OscParams::new(0.0, OscillatorWave::Sine),
             osc2_mod: ModParams::new("Osc 3"),
-            osc3: OscParams::new(0.0, Wave::Sine),
-            osc3_pulse: PulseParams::new(),
+            osc3: OscParams::new(0.0, OscillatorWave::Sine),
 
             filter: FilterParams::new(),
             filter_env: FilterEnvParams::new(),
@@ -212,7 +237,10 @@ impl Default for ThreeOscParams {
 #[derive(Params)]
 pub struct OscParams {
     #[id = "wave"]
-    pub wave: EnumParam<Wave>,
+    pub wave: EnumParam<OscillatorWave>,
+    /// Position within the wavetable, 0 to 1. Morphs between frames for multi-frame wavetables.
+    #[id = "position"]
+    pub position: FloatParam,
     /// Oscillator output volume, in percent.
     #[id = "amp"]
     pub amp: FloatParam,
@@ -240,9 +268,10 @@ pub struct OscParams {
 }
 
 impl OscParams {
-    pub fn new(default_amp: f32, default_wave: Wave) -> Self {
+    pub fn new(default_amp: f32, default_wave: OscillatorWave) -> Self {
         Self {
             wave: EnumParam::new("Wave", default_wave),
+            position: amount_param("Position", 0.0),
             amp: FloatParam::new(
                 "Amplitude",
                 default_amp,
@@ -321,37 +350,6 @@ impl ModParams {
             fm: amount_param(format!("<- {modulator} FM"), 0.0),
             am: amount_param(format!("<- {modulator} AM"), 0.0),
         }
-    }
-}
-
-/// Osc 3 swaps the modulation controls for pulse width modulation.
-#[derive(Params)]
-pub struct PulseParams {
-    /// Pulse width, in percent of a cycle. 50 % is a square wave.
-    #[id = "pwm"]
-    pub pulse_width: FloatParam,
-}
-
-impl PulseParams {
-    pub fn new() -> Self {
-        Self {
-            pulse_width: FloatParam::new(
-                "Pulse Width",
-                50.0,
-                FloatRange::Linear {
-                    min: 0.0,
-                    max: 50.0,
-                },
-            )
-            .with_unit(" %")
-            .with_value_to_string(formatters::v2s_f32_rounded(1)),
-        }
-    }
-}
-
-impl Default for PulseParams {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

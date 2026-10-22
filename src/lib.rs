@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
+#[cfg(test)]
+mod benchmark;
 mod editor;
 mod params;
 mod synth;
@@ -109,17 +111,12 @@ impl ThreeOscPlugin {
         let global_pitch = global.global_pitch.value() as f32;
         apply_osc_params(&mut synth.oscillators[0], &params.osc1, global_pitch);
         apply_mod_params(&mut synth.oscillators[0], &params.osc1_mod);
-        synth.oscillators[0].wave = params.osc1.wave.value().to_osc_wave();
 
         apply_osc_params(&mut synth.oscillators[1], &params.osc2, global_pitch);
         apply_mod_params(&mut synth.oscillators[1], &params.osc2_mod);
-        synth.oscillators[1].wave = params.osc2.wave.value().to_osc_wave();
 
-        // The third oscillator has nothing after it to modulate it, but its square wave has an
-        // adjustable pulse width instead.
+        // The third oscillator has nothing after it to modulate it.
         apply_osc_params(&mut synth.oscillators[2], &params.osc3, global_pitch);
-        synth.oscillators[2].wave = params.osc3.wave.value().to_osc_wave_pulse();
-        synth.oscillators[2].pulse_width = params.osc3_pulse.pulse_width.value() * 2.0 * PI / 100.0;
     }
 
     fn handle_event(&mut self, event: NoteEvent<()>) {
@@ -190,6 +187,8 @@ impl ThreeOscPlugin {
 
 /// Applies the controls shared by all oscillators.
 fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch: f32) {
+    osc.wavetable = params.wave.value().wavetable_index();
+    osc.position = params.position.value();
     osc.amp = params.amp.value() / 100.0;
     osc.semitone = params.semitone.value() + global_pitch;
     osc.octave = params.octave.value();
@@ -307,11 +306,12 @@ mod tests {
     use super::*;
 
     /// Renders a note with the default patch and returns the first non-finite sample, if any.
-    fn first_non_finite_sample(sample_rate: f64, note: u8, samples: usize) -> Option<(usize, f32)> {
-        let mut plugin = ThreeOscPlugin {
-            synth: ThreeOsc::new(sample_rate),
-            ..Default::default()
-        };
+    fn first_non_finite_sample(
+        plugin: &mut ThreeOscPlugin,
+        note: u8,
+        samples: usize,
+    ) -> Option<(usize, f32)> {
+        plugin.synth.reset();
         plugin.apply_params();
         plugin.synth.note_on(note, 100);
 
@@ -330,8 +330,13 @@ mod tests {
     fn default_patch_renders_finite_audio() {
         let mut failures = Vec::new();
         for sample_rate in [8000.0, 22050.0, 44100.0, 48000.0, 96000.0, 192000.0] {
+            // Generating the wavetables is the expensive part, so one synth is shared per rate.
+            let mut plugin = ThreeOscPlugin {
+                synth: ThreeOsc::new(sample_rate),
+                ..Default::default()
+            };
             for note in [0, 36, 60, 96, 127] {
-                if let Some((index, sample)) = first_non_finite_sample(sample_rate, note, 4096) {
+                if let Some((index, sample)) = first_non_finite_sample(&mut plugin, note, 4096) {
                     failures.push(format!(
                         "{sample_rate} Hz, note {note}: sample {index} is {sample}"
                     ));
@@ -339,6 +344,13 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "non-finite output:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn wavetable_order_matches_the_wave_parameter() {
+        let set = synth::oscillator::WavetableSet::new(44100.0, 64);
+        let names: Vec<&str> = set.wavetables.iter().map(|wavetable| wavetable.name).collect();
+        assert_eq!(names, params::OscillatorWave::variants());
     }
 
     /// A note that is started and choked in the same instant samples the envelopes at index 0.
@@ -384,8 +396,8 @@ mod tests {
 
     /// Renders one note with the default patch, the given number of unison voices on every
     /// oscillator, and the given stereo width.
-    fn render_stereo(voices: u8, width: f32) -> (Vec<f32>, Vec<f32>) {
-        let mut plugin = ThreeOscPlugin::default();
+    fn render_stereo(plugin: &mut ThreeOscPlugin, voices: u8, width: f32) -> (Vec<f32>, Vec<f32>) {
+        plugin.synth.reset();
         plugin.apply_params();
         plugin.synth.stereo_width = width;
         for osc in plugin.synth.oscillators.iter_mut() {
@@ -411,20 +423,22 @@ mod tests {
 
     #[test]
     fn stereo_width_spreads_unison_voices() {
+        let mut plugin = ThreeOscPlugin::default();
+
         // A single voice stays in the centre whatever the width.
-        let (left, right) = render_stereo(1, 1.0);
+        let (left, right) = render_stereo(&mut plugin, 1, 1.0);
         assert!(left.iter().any(|sample| sample.abs() > 0.01));
         assert!(max_abs_diff(&left, &right) < 1e-4);
 
         // Unison voices are spread out...
-        let (left, right) = render_stereo(8, 1.0);
+        let (left, right) = render_stereo(&mut plugin, 8, 1.0);
         assert!(left.iter().chain(right.iter()).all(|sample| sample.is_finite()));
         assert!(max_abs_diff(&left, &right) > 1e-2);
 
         // ...and a width of (almost) zero matches the mono path.
-        let (mono_left, mono_right) = render_stereo(8, 0.0);
+        let (mono_left, mono_right) = render_stereo(&mut plugin, 8, 0.0);
         assert_eq!(max_abs_diff(&mono_left, &mono_right), 0.0);
-        let (left, right) = render_stereo(8, 1e-6);
+        let (left, right) = render_stereo(&mut plugin, 8, 1e-6);
         assert!(max_abs_diff(&left, &mono_left) < 1e-3);
         assert!(max_abs_diff(&right, &mono_right) < 1e-3);
     }

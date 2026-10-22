@@ -11,6 +11,7 @@ use self::oscillator::OscWave;
 use self::oscillator::modulate_delta;
 use self::oscillator::OscillatorParams;
 use self::oscillator::SuperVoice;
+use self::oscillator::WaveGenerator;
 use self::oscillator::WavetableSet;
 
 pub struct ThreeOsc {
@@ -161,6 +162,7 @@ impl ThreeOsc {
         for osc in self.oscillators.iter_mut() {
             osc.update_total_pitch();
             osc.update_unison_amp();
+            osc.update_frames(&self.waves);
             if stereo {
                 osc.update_pan_gains(self.stereo_width);
             }
@@ -200,12 +202,6 @@ impl ThreeOsc {
                 let mut osc_delta = [0.0; 3];
                 for (x, osc) in izip!(osc_delta.iter_mut(), self.oscillators.iter()) {
                     *x = osc.total_pitch_multiplier() * delta;
-                }
-
-                for osc in self.oscillators.iter_mut() {
-                    if let OscWave::Pulse { width } = &mut osc.wave {
-                        *width = osc.pulse_width;
-                    }
                 }
 
                 voice.semitone_detune = lerp(voice.semitone_detune, 0.0, self.portamento_rate);
@@ -254,7 +250,7 @@ impl ThreeOsc {
                         osc.voices_detune,
                     );
 
-                    let table = self.waves.select(&osc.wave).delta_index(osc_delta[i], sample_rate);
+                    let frames = osc.frame_pair(&self.waves, osc_delta[i], sample_rate);
                     let pm_offset = mod_osc_out * osc.pm * 150.0;
                     let gain = osc.unison_amp
                         * osc.amp
@@ -262,37 +258,19 @@ impl ThreeOsc {
                         * osc_lfo_amp[i];
 
                     let osc_out = if stereo {
-                        let (mut osc_out, mut osc_left, mut osc_right) = table.generate_multi_pm_panned(
+                        let (osc_out, osc_left, osc_right) = frames.generate_multi_pm_panned(
                             phases,
                             osc.voice_count.into(),
                             pm_offset,
                             &osc.pan_gains,
                         );
 
-                        // if pulse wave, subtract 2 saw waves
-                        if let OscWave::Pulse { width } = osc.wave {
-                            let (pulse, pulse_left, pulse_right) = table.generate_multi_pm_panned(
-                                phases,
-                                osc.voice_count.into(),
-                                width,
-                                &osc.pan_gains,
-                            );
-                            osc_out -= pulse;
-                            osc_left -= pulse_left;
-                            osc_right -= pulse_right;
-                        }
-
                         out += osc_left * gain;
                         out_right += osc_right * gain;
 
                         osc_out
                     } else {
-                        let mut osc_out = table.generate_multi_pm(phases, osc.voice_count.into(), pm_offset);
-
-                        // if pulse wave, subtract 2 saw waves
-                        if let OscWave::Pulse { width } = osc.wave {
-                            osc_out -= table.generate_multi_pm(phases, osc.voice_count.into(), width);
-                        }
+                        let osc_out = frames.generate_multi_pm(phases, osc.voice_count.into(), pm_offset);
 
                         out += osc_out * gain;
 

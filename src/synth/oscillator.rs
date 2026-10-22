@@ -1,14 +1,10 @@
 use std::{
     convert::TryInto,
     f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4, PI, SQRT_2},
-    iter,
 };
 
 use itertools::izip;
-use rustfft::{
-    num_complex::{Complex, Complex32},
-    FftPlanner,
-};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 
 use super::lerp;
 
@@ -109,12 +105,20 @@ pub struct OscillatorParams {
     pub unison_amp: f32,
     /// `(left, right)` gain of each unison voice, see `update_pan_gains()`.
     pub pan_gains: [(f32, f32); 32],
-    pub wave: OscWave,
+
+    /// Index of the wavetable (in the synth's [`WavetableSet`]) this oscillator plays.
+    pub wavetable: usize,
+    /// Position within the wavetable, from 0 to 1. Morphs between the frames of wavetables that
+    /// have more than one.
+    pub position: f32,
+    /// The frames to crossfade between for the current position, see `update_frames()`.
+    frame_a: usize,
+    frame_b: usize,
+    frame_mix: f32,
+
     pub phase: f32,
     pub phase_rand: f32,
     pub pitch_bend: f32,
-
-    pub pulse_width: f32,
 
     pub fm: f32,
     pub pm: f32,
@@ -140,26 +144,57 @@ impl OscillatorParams {
     pub fn update_unison_amp(&mut self) {
         self.unison_amp = self.calc_unison_amp()
     }
+    /// Resolves the wavetable position to the two frames to crossfade between. Must be called
+    /// before `frame_pair()` whenever the wavetable or position changed.
+    pub fn update_frames(&mut self, set: &WavetableSet) {
+        self.wavetable = self.wavetable.min(set.wavetables.len() - 1);
+        (self.frame_a, self.frame_b, self.frame_mix) =
+            set.wavetables[self.wavetable].frame_indices(self.position);
+    }
+    /// The (bandlimited) wavetable frames to generate a voice with the given phase delta from.
+    #[inline]
+    pub fn frame_pair<'a>(&self, set: &'a WavetableSet, delta: f32, sample_rate: f32) -> FramePair<'a> {
+        let frames = &set.wavetables[self.wavetable].frames;
+        let note = WavetableNotes::delta_to_note(delta, sample_rate);
+        FramePair {
+            a: &frames[self.frame_a].tables[note],
+            b: &frames[self.frame_b].tables[note],
+            mix: self.frame_mix,
+        }
+    }
     /// Updates the left and right gain of each unison voice for the given stereo width, where 0
     /// is mono and 1 spreads the voices across the whole stereo field.
     ///
-    /// Voices are panned according to their detune, so the lowest voice ends up furthest left and
-    /// the highest furthest right, using a constant power pan law scaled so that a centred voice
-    /// has a gain of 1 on both channels. That way a width of 0 is identical to a mono mix, and an
-    /// oscillator with a single voice always stays in the centre.
+    /// The voices are ordered by pitch and spread out from the centre, alternating sides as the
+    /// pitch rises (the lowest voice is furthest left, the second lowest is on the right, ...),
+    /// mirrored about the centre so that the highest voice is furthest right. Both sides thus get
+    /// an even mix of low and high voices, which keeps the bass end balanced. Gains follow a
+    /// constant power pan law scaled so that a centred voice has a gain of 1 on both channels.
+    /// That way a width of 0 is identical to a mono mix, and an oscillator with a single voice
+    /// always stays in the centre.
     pub fn update_pan_gains(&mut self, stereo_width: f32) {
         let voice_count = (self.voice_count as usize).clamp(1, self.pan_gains.len());
-        let detune_indices = || (0..voice_count).map(unison_detune_index);
-        let min = detune_indices().min().unwrap_or(0) as f32;
-        let max = detune_indices().max().unwrap_or(0) as f32;
-        let range = max - min;
 
         for (i, gains) in self.pan_gains.iter_mut().enumerate().take(voice_count) {
             // Pan position between -1 (left) and 1 (right)
-            let pan = if range > 0.0 {
-                (unison_detune_index(i) as f32 - min) / range * 2.0 - 1.0
-            } else {
+            let pan = if voice_count == 1 {
                 0.0
+            } else {
+                // The voice's rank when sorted by pitch (the detune indices are all distinct).
+                let detune = unison_detune_index(i);
+                let rank = (0..voice_count)
+                    .filter(|&j| unison_detune_index(j) < detune)
+                    .count();
+                let magnitude = ((2 * rank) as f32 / (voice_count - 1) as f32 - 1.0).abs();
+
+                let mirrored_rank = voice_count - 1 - rank;
+                let lower_rank = rank.min(mirrored_rank);
+                let mut side = if lower_rank % 2 == 0 { -1.0 } else { 1.0 };
+                if rank > mirrored_rank {
+                    side = -side;
+                }
+
+                side * magnitude
             };
             let angle = (pan * stereo_width + 1.0) * FRAC_PI_4;
             let (sin, cos) = angle.sin_cos();
@@ -179,11 +214,14 @@ impl Default for OscillatorParams {
             voices_detune: 0.1,
             unison_amp: 1.0,
             pan_gains: [(1.0, 1.0); 32],
-            wave: OscWave::Sine,
+            wavetable: 0,
+            position: 0.0,
+            frame_a: 0,
+            frame_b: 0,
+            frame_mix: 0.0,
             phase: 0.0,
             phase_rand: PI * 2.0,
             pitch_bend: 0.0,
-            pulse_width: PI,
             fm: 0.0,
             pm: 0.0,
             am: 0.0,
@@ -192,14 +230,13 @@ impl Default for OscillatorParams {
 }
 
 #[derive(Debug, Clone)]
-/// Naive wave generators to be replaced later on
+/// Naive wave generators, used by the LFO.
 pub enum OscWave {
     Sine,
     Tri,
     Saw,
     Exp,
     Square,
-    Pulse { width: f32 },
 }
 
 impl OscWave {
@@ -221,13 +258,6 @@ impl OscWave {
             Exp => phase.sin().abs() - (0.5 + 0.5 / PI),
             Square => {
                 if phase <= PI {
-                    FRAC_1_SQRT_2
-                } else {
-                    -FRAC_1_SQRT_2
-                }
-            }
-            Pulse { width } => {
-                if phase <= *width {
                     FRAC_1_SQRT_2
                 } else {
                     -FRAC_1_SQRT_2
@@ -258,33 +288,6 @@ impl OscWave {
                     -1.0
                 }
             }
-            Pulse { width } => {
-                if phase <= *width {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-        }
-    }
-    pub fn from_index(index: f32) -> Self {
-        match index {
-            x if x < 1.0 => OscWave::Sine,
-            x if x < 2.0 => OscWave::Tri,
-            x if x < 3.0 => OscWave::Saw,
-            x if x < 4.0 => OscWave::Exp,
-            x if x < 5.0 => OscWave::Square,
-            _ => OscWave::Sine,
-        }
-    }
-    pub fn from_index_pulse(index: f32) -> Self {
-        match index {
-            x if x < 1.0 => OscWave::Sine,
-            x if x < 2.0 => OscWave::Tri,
-            x if x < 3.0 => OscWave::Saw,
-            x if x < 4.0 => OscWave::Exp,
-            x if x < 5.0 => OscWave::Pulse { width: PI },
-            _ => OscWave::Sine,
         }
     }
 }
@@ -420,32 +423,50 @@ impl Wavetable {
         // TODO: Find out how many decimal points f32 can handle here, or rethink indexing so that it doesn't require this unnecessary division
         (phase / (2.000001 * PI)) * self.table.len() as f32
     }
-    #[inline]
-    pub fn generate(&self, phase: f32) -> f32 {
-        self.index_lerp(self.phase_to_index(phase))
+    /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
+    pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
+        assert!(
+            harmonics <= (len / 2),
+            "Generated {harmonics} harmonics with {len} len"
+        );
+        let table: Vec<f32> = (0..len)
+            .into_iter()
+            .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
+            .collect();
+        Self { table }
     }
-    #[inline]
-    pub fn generate_multi(&self, phases: &[f32], max: usize) -> f32 {
-        phases
-            .iter()
-            .take(max)
-            .map(|phase| self.generate(*phase))
-            .sum()
+    pub fn from_additive_osc_ifft(
+        osc: &AdditiveOsc,
+        len: usize,
+        harmonics: usize,
+        fft: &dyn Fft<f32>,
+    ) -> Self {
+        let mut table: Vec<f32> = vec![0.0; len];
+        osc.generate_ifft(&mut table, harmonics, fft);
+        Self { table }
     }
+}
+
+/// Something that generates a sample from a phase, with helpers for summing unison voices.
+pub trait WaveGenerator {
+    fn generate(&self, phase: f32) -> f32;
+
+    /// Sums the voices at the given phases, all offset by `phase_offset` (for phase modulation).
     #[inline]
-    pub fn generate_multi_pm(&self, phases: &[f32], max: usize, phase_offset: f32) -> f32 {
+    fn generate_multi_pm(&self, phases: &[f32], max: usize, phase_offset: f32) -> f32 {
         phases
             .iter()
             .take(max)
             .map(|phase| self.generate((*phase + phase_offset).rem_euclid(2.0 * PI)))
             .sum()
     }
+
     /// Like [`generate_multi_pm()`][Self::generate_multi_pm()], but also pans the voices into a
     /// left and a right channel using `gains` (one `(left, right)` gain pair per voice).
     ///
     /// Returns `(mono, left, right)`, where `mono` is the plain sum of the voices.
     #[inline]
-    pub fn generate_multi_pm_panned(
+    fn generate_multi_pm_panned(
         &self,
         phases: &[f32],
         max: usize,
@@ -464,22 +485,34 @@ impl Wavetable {
             },
         )
     }
-    /// `harmonics` should be less than or equal to half of `len` to prevent aliasing
-    pub fn from_additive_osc(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
-        assert!(
-            harmonics <= (len / 2),
-            "Generated {harmonics} harmonics with {len} len"
-        );
-        let table: Vec<f32> = (0..len)
-            .into_iter()
-            .map(|x| osc.generate(2.0 * PI * (x as f32 / len as f32), harmonics))
-            .collect();
-        Self { table }
+}
+
+impl WaveGenerator for Wavetable {
+    #[inline]
+    fn generate(&self, phase: f32) -> f32 {
+        self.index_lerp(self.phase_to_index(phase))
     }
-    pub fn from_additive_osc_ifft(osc: &AdditiveOsc, len: usize, harmonics: usize) -> Self {
-        let mut table: Vec<f32> = vec![0.0; len];
-        osc.generate_ifft(&mut table, harmonics);
-        Self { table }
+}
+
+/// A position within a multi-frame wavetable, resolved to the (bandlimited) tables of the two
+/// frames to crossfade between. Single frame wavetables have `mix` set to 0, which skips the
+/// second lookup.
+#[derive(Debug, Clone, Copy)]
+pub struct FramePair<'a> {
+    pub a: &'a Wavetable,
+    pub b: &'a Wavetable,
+    pub mix: f32,
+}
+
+impl WaveGenerator for FramePair<'_> {
+    #[inline]
+    fn generate(&self, phase: f32) -> f32 {
+        let a = self.a.generate(phase);
+        if self.mix > 0.0 {
+            lerp(a, self.b.generate(phase), self.mix)
+        } else {
+            a
+        }
     }
 }
 
@@ -581,6 +614,7 @@ impl WavetableNotes {
         osc: &AdditiveOsc,
         sample_rate: f32,
         table_length: usize,
+        fft: &dyn Fft<f32>,
     ) -> Self {
         let tables: Vec<Wavetable> = (0..=137)
             .into_iter()
@@ -597,7 +631,7 @@ impl WavetableNotes {
             .map(|harmonics| {
                 // clamp to nyquist
                 let harmonics = harmonics.min(table_length / 2);
-                Wavetable::from_additive_osc_ifft(osc, table_length, harmonics)
+                Wavetable::from_additive_osc_ifft(osc, table_length, harmonics, fft)
             })
             .collect();
         Self {
@@ -606,48 +640,85 @@ impl WavetableNotes {
     }
 }
 
+/// Number of frames in the pulse width sweep wavetable.
+pub const PW_SWEEP_FRAMES: usize = 32;
+
+/// A wavetable in the wavetable synth sense: one or more frames (waveforms, each bandlimited per
+/// note) that an oscillator can morph between with its position control.
+pub struct WavetableFrames {
+    pub name: &'static str,
+    pub frames: Vec<WavetableNotes>,
+}
+impl WavetableFrames {
+    /// Resolves a position (0 to 1) to the two frames to crossfade between and the mix amount
+    /// between them.
+    pub fn frame_indices(&self, position: f32) -> (usize, usize, f32) {
+        let last = self.frames.len().saturating_sub(1);
+        let scaled = position.clamp(0.0, 1.0) * last as f32;
+        let a = (scaled as usize).min(last);
+        let b = (a + 1).min(last);
+        (a, b, scaled - a as f32)
+    }
+    /// Size of the wavetable's sample data.
+    #[allow(dead_code)] // used by the benchmarks
+    pub fn memory_bytes(&self) -> usize {
+        self.frames
+            .iter()
+            .flat_map(|notes| notes.tables.iter())
+            .map(|table| table.table.len() * std::mem::size_of::<f32>())
+            .sum()
+    }
+}
+
+/// All the wavetables the oscillators can choose from.
 pub struct WavetableSet {
-    pub wavetables: Vec<WavetableNotes>,
+    pub wavetables: Vec<WavetableFrames>,
 }
 impl WavetableSet {
+    /// Generates the wavetables for the given sample rate. The order matches the oscillators'
+    /// wave parameter.
     pub fn new(sample_rate: f32, table_len: usize) -> Self {
+        // One FFT plan is shared by all tables; planning is comparatively expensive.
+        let fft = FftPlanner::new().plan_fft_inverse(table_len);
+        let notes = |osc: &AdditiveOsc| {
+            WavetableNotes::from_additive_osc_ifft(osc, sample_rate, table_len, &*fft)
+        };
+        let single = |name, osc: AdditiveOsc| WavetableFrames {
+            name,
+            frames: vec![notes(&osc)],
+        };
+        let pulse = |name, duty| single(name, AdditiveOsc::pulse(duty));
+
+        // From a square wave down to a very narrow pulse
+        let sweep = WavetableFrames {
+            name: "PW Sweep",
+            frames: (0..PW_SWEEP_FRAMES)
+                .map(|frame| {
+                    let duty = 0.5 * (1.0 - frame as f32 / PW_SWEEP_FRAMES as f32);
+                    notes(&AdditiveOsc::pulse(duty))
+                })
+                .collect(),
+        };
+
         Self {
             wavetables: vec![
-                WavetableNotes::from_additive_osc_ifft(
-                    &AdditiveOsc::sine(),
-                    sample_rate,
-                    table_len,
-                ),
-                WavetableNotes::from_additive_osc_ifft(
-                    &AdditiveOsc::triangle(),
-                    sample_rate,
-                    table_len,
-                ),
-                WavetableNotes::from_additive_osc_ifft(&AdditiveOsc::saw(), sample_rate, table_len),
-                WavetableNotes::from_additive_osc_ifft(
-                    &AdditiveOsc::fake_exp(),
-                    sample_rate,
-                    table_len,
-                ),
-                WavetableNotes::from_additive_osc_ifft(
-                    &AdditiveOsc::square(),
-                    sample_rate,
-                    table_len,
-                ),
+                single("Sine", AdditiveOsc::sine()),
+                single("Triangle", AdditiveOsc::triangle()),
+                single("Saw", AdditiveOsc::saw()),
+                single("Exponential", AdditiveOsc::fake_exp()),
+                single("Square", AdditiveOsc::square()),
+                pulse("Pulse 40%", 0.4),
+                pulse("Pulse 30%", 0.3),
+                pulse("Pulse 20%", 0.2),
+                pulse("Pulse 10%", 0.1),
+                sweep,
             ],
         }
     }
-    pub fn select(&self, wave: &OscWave) -> &WavetableNotes {
-        let wave_index = match wave {
-            OscWave::Sine => 0,
-            OscWave::Tri => 1,
-            OscWave::Saw => 2,
-            OscWave::Exp => 3,
-            OscWave::Square => 4,
-            OscWave::Pulse { width: _ } => 2,
-            _ => 0,
-        };
-        &self.wavetables[wave_index]
+    /// Total size of all wavetable sample data.
+    #[allow(dead_code)] // used by the benchmarks
+    pub fn memory_bytes(&self) -> usize {
+        self.wavetables.iter().map(WavetableFrames::memory_bytes).sum()
     }
 }
 
@@ -676,29 +747,25 @@ impl<const N: usize> AdditiveOsc<N> {
             *sample = self.generate(delta * i as f32, harmonics);
         }
     }
-    pub fn generate_ifft(&self, output: &mut [f32], harmonics: usize) {
-        assert_eq!(output.len(), N);
+    /// Renders one cycle of the first `harmonics` partials into `output` using an inverse FFT.
+    /// `fft` must be an inverse FFT plan with the same length as `output`, which must be at least
+    /// twice `harmonics` to keep the result bandlimited.
+    pub fn generate_ifft(&self, output: &mut [f32], harmonics: usize, fft: &dyn Fft<f32>) {
+        assert_eq!(output.len(), fft.len());
+        assert!(harmonics <= output.len() / 2);
 
-        let dc_offset = iter::once((&0.0_f32, &0.0_f32));
-
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_inverse(N);
-        let mut buffer: Vec<Complex32> = dc_offset
-            .chain(
-                self.amplitudes
-                    .iter()
-                    .take(harmonics)
-                    .zip(self.phases.iter()),
-            )
-            // TODO: use phase
-            .map(|(amplitude, _phase)| Complex {
-                re: 0.0,
-                im: *amplitude,
-            })
-            .collect();
-        // FFTs must be constant length
-        if buffer.len() < N {
-            buffer.extend(vec![Complex32 { re: 0.0, im: 0.0 }; N - buffer.len()])
+        // Bin 0 is the DC offset, which is always zero.
+        let mut buffer = vec![Complex32::new(0.0, 0.0); output.len()];
+        for (bin, (amplitude, phase)) in buffer
+            .iter_mut()
+            .skip(1)
+            .zip(self.amplitudes.iter().zip(self.phases.iter()))
+            .take(harmonics)
+        {
+            // `i * amplitude * e^(i * phase)`, which the inverse FFT turns into
+            // `-amplitude * sin(n * theta + phase)`.
+            let (sin, cos) = phase.sin_cos();
+            *bin = Complex32::new(-amplitude * sin, amplitude * cos);
         }
         fft.process(&mut buffer);
 
@@ -752,6 +819,26 @@ impl<const N: usize> AdditiveOsc<N> {
         let phases = [0.0; N];
         Self { amplitudes, phases }
     }
+    /// A pulse wave that is high for `duty` (between 0 and 1) of its cycle, scaled so that a duty
+    /// of 0.5 is identical to [`square()`][Self::square()].
+    ///
+    /// Built as the difference of two saw waves offset by the duty, which gives the pulse no DC
+    /// offset at any width.
+    pub fn pulse(duty: f32) -> Self {
+        let mut amplitudes = [0.0; N];
+        let mut phases = [0.0; N];
+        let offset = 2.0 * PI * duty;
+        for (i, (amplitude, phase)) in amplitudes.iter_mut().zip(phases.iter_mut()).enumerate() {
+            let n = (i + 1) as f32;
+            // The saw's partials are `1 / n`, and delaying it by `offset` multiplies partial `n`
+            // by `e^(i * n * offset)`.
+            let coefficient =
+                (Complex32::new(1.0, 0.0) - Complex32::from_polar(1.0, n * offset)) / (2.0 * n);
+            *amplitude = coefficient.norm();
+            *phase = coefficient.arg();
+        }
+        Self { amplitudes, phases }
+    }
 }
 
 mod tests {
@@ -774,5 +861,82 @@ mod tests {
     fn test_frequency_to_note() {
         assert!(WavetableNotes::frequency_to_note(440.0) == 69);
         assert!(WavetableNotes::frequency_to_note(415.0) == 68);
+    }
+
+    /// Recovers the pan position (-1 to 1) of a voice from its gains at a stereo width of 1.
+    fn pan_from_gains((left, right): (f32, f32)) -> f32 {
+        right.atan2(left) / FRAC_PI_4 - 1.0
+    }
+
+    #[test]
+    fn unison_pan_is_interleaved_and_symmetric() {
+        let mut osc = OscillatorParams::default();
+
+        // A single voice stays in the centre
+        osc.voice_count = 1;
+        osc.update_pan_gains(1.0);
+        assert!((osc.pan_gains[0].0 - 1.0).abs() < 1e-5);
+        assert!((osc.pan_gains[0].1 - 1.0).abs() < 1e-5);
+
+        // Detune indices per voice: 0, -1, 2, -3, 4, -5, 6, -7
+        osc.voice_count = 8;
+        osc.update_pan_gains(1.0);
+        let pans: Vec<f32> = osc.pan_gains[..8].iter().map(|&g| pan_from_gains(g)).collect();
+        // Lowest voice hard left, highest hard right
+        assert!((pans[7] + 1.0).abs() < 1e-5, "{pans:?}");
+        assert!((pans[6] - 1.0).abs() < 1e-5, "{pans:?}");
+        // Second lowest on the right, second highest on the left
+        assert!(pans[5] > 0.5, "{pans:?}");
+        assert!(pans[4] < -0.5, "{pans:?}");
+        // The field is symmetric
+        let mut sorted = pans.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for i in 0..4 {
+            assert!((sorted[i] + sorted[7 - i]).abs() < 1e-5, "{sorted:?}");
+        }
+
+        // With three voices the centre voice stays centred and the others go to opposite sides
+        osc.voice_count = 3;
+        osc.update_pan_gains(1.0);
+        let pans: Vec<f32> = osc.pan_gains[..3].iter().map(|&g| pan_from_gains(g)).collect();
+        assert!(pans[0].abs() < 1e-5, "{pans:?}");
+        assert!((pans[1] + 1.0).abs() < 1e-5, "{pans:?}");
+        assert!((pans[2] - 1.0).abs() < 1e-5, "{pans:?}");
+    }
+
+    #[test]
+    fn half_duty_pulse_is_a_square_wave() {
+        let square = AdditiveOsc::<64>::square();
+        let pulse = AdditiveOsc::<64>::pulse(0.5);
+        for (n, (square, pulse)) in square.amplitudes.iter().zip(pulse.amplitudes.iter()).enumerate() {
+            assert!((square - pulse).abs() < 1e-5, "harmonic {}", n + 1);
+        }
+        for phase in pulse.phases.iter().zip(pulse.amplitudes.iter()).filter(|(_, a)| **a > 1e-5).map(|(p, _)| p) {
+            assert!(phase.abs() < 1e-4, "{phase}");
+        }
+    }
+
+    #[test]
+    fn pulse_wavetable_has_the_expected_duty_cycle() {
+        let fft = FftPlanner::new().plan_fft_inverse(2048);
+        let table = Wavetable::from_additive_osc_ifft(&AdditiveOsc::pulse(0.25), 2048, 1024, &*fft);
+        let high = table.table.iter().filter(|sample| **sample > 0.0).count();
+        assert!((high as f32 / 2048.0 - 0.25).abs() < 0.01, "{high}");
+        let mean: f32 = table.table.iter().sum::<f32>() / 2048.0;
+        assert!(mean.abs() < 1e-3, "{mean}");
+    }
+
+    #[test]
+    fn wavetable_frames_are_resolved_from_the_position() {
+        let set = WavetableSet::new(44100.0, 64);
+        let single = &set.wavetables[0];
+        assert_eq!(single.frame_indices(0.7), (0, 0, 0.0));
+        let sweep = set.wavetables.last().unwrap();
+        assert_eq!(sweep.frames.len(), PW_SWEEP_FRAMES);
+        assert_eq!(sweep.frame_indices(0.0), (0, 1, 0.0));
+        let (a, b, mix) = sweep.frame_indices(0.5);
+        assert_eq!((a, b), (15, 16));
+        assert!((mix - 0.5).abs() < 1e-5);
+        assert_eq!(sweep.frame_indices(1.0), (31, 31, 0.0));
     }
 }

@@ -15,7 +15,7 @@ Currently a work in progress, but usable nevertheless.
 * Choose between 3 multimode filter models (RC, Ladder, Simper SVF) with keytracking and envelope
 * Unlimited polyphony, with optional monophonic and legato modes
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
-* Sine, triangle, absolute sine, saw, and square waves
+* Wavetable oscillators with sine, triangle, absolute sine, saw, square and pulse waves, plus a pulse width sweep wavetable that each oscillator's position control morphs through
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off)
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
@@ -49,6 +49,13 @@ The synth can also run on its own, outside of a plugin host, using JACK or your 
 cargo run --release --features standalone
 # or, to list the audio backend / device options:
 cargo run --release --features standalone -- --help
+```
+
+### Benchmarks
+Rough throughput numbers for the synth engine (time per sample for a few patches, and wavetable generation time and memory):
+
+```shell
+cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
 ```
 
 ### Previous LV2 version
