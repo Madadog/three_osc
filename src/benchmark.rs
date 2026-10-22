@@ -342,6 +342,47 @@ fn benchmark_ladder() {
         println!("{name:<52} {ns_per_sample:>7.1} ns/sample");
         assert!(sink.is_finite());
     }
+
+    // Four filters in lockstep, in blocks of 32 samples like the synth runs them
+    #[cfg(target_arch = "x86_64")]
+    if SimdLevel::detect().has_avx() {
+        use crate::synth::filter::LADDER_LANES;
+        let mut filters: Vec<LadderFilter> = (0..LADDER_LANES).map(|_| LadderFilter::default()).collect();
+        for filter in filters.iter_mut() {
+            filter.set_params(SAMPLE_RATE as f32, 2000.0, 3.0);
+        }
+        let mut buffers: Vec<Vec<f32>> = vec![input.clone(); LADDER_LANES];
+        let run = |filters: &mut [LadderFilter], buffers: &mut [Vec<f32>]| {
+            for start in (0..input.len()).step_by(32) {
+                let mut lanes: Vec<Option<(&mut LadderFilter, &mut [f32])>> = filters
+                    .iter_mut()
+                    .zip(buffers.iter_mut())
+                    .map(|(filter, buffer)| {
+                        buffer[start..start + 32].copy_from_slice(&input[start..start + 32]);
+                        Some((filter, &mut buffer[start..start + 32]))
+                    })
+                    .collect();
+                lanes.resize_with(LADDER_LANES, || None);
+                let lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES] =
+                    lanes.try_into().ok().unwrap();
+                // SAFETY: checked for AVX above
+                unsafe { LadderFilter::process_block_x4(lanes) };
+            }
+        };
+        run(&mut filters, &mut buffers);
+        let iterations = 200;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            run(&mut filters, &mut buffers);
+        }
+        let ns_per_voice_sample = start.elapsed().as_nanos() as f64
+            / (iterations * input.len() * LADDER_LANES) as f64;
+        println!(
+            "{:<52} {ns_per_voice_sample:>7.1} ns/sample",
+            "ladder filter, 4 in lockstep (per filter)"
+        );
+        assert!(buffers.iter().flatten().all(|sample| sample.is_finite()));
+    }
 }
 
 #[test]

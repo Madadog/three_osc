@@ -92,6 +92,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * The absolute sine / exponential wave is like a saw wave where the harmonics decrease volume at -12dB per octave instead of -6 dB per octave (i.e. it's a saw wave tracked by a soft filter). Similarly, the triangle wave is like a square wave where the harmonics diminish at -12dB per octave instead of -6dB.
 * Increasing envelope slope makes it steeper, decreasing it does the opposite. Slope = 0 gives perfectly linear slopes, which are not perceptually linear. Slope = 1 gives perceptually-linear (logarithmic) volume decay.
 * The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Underdriving the filters (i.e. drive below 1) and sweeping them very slowly gives a 'harmonic snap' effect.
+* The Ladder filter runs 3x oversampled, and its cutoff can't go higher than about 12.6 kHz at a 44.1 kHz sample rate (13.7 kHz at 48 kHz), so even fully open it softens the top octave (15 kHz comes out about 12 dB below 1 kHz at 44.1 kHz). At 88.2 kHz and above it opens up fully.
 * Setting octave detune to -0.0028 gives near perfect fifths, while 0.0342 gives near perfect major thirds.
 * FM changes frequency with the modulator's waveform, PM changes frequency with the derivative of the modulator's waveform. (I.E. PM by triangle == FM by square wave)
 

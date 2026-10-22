@@ -113,7 +113,7 @@ impl Default for LadderFilter {
             ut_1: 0.0,
             out: 0.0,
             iir_lowpass: IirFilter::new_lowpass(
-                44100.0 * 2.0,
+                44100.0 * 3.0,
                 IIR_DOWNSAMPLING_BANDWIDTH * 44100.0 / 2.0,
                 IIR_DOWNSAMPLE_ORDER,
             ),
@@ -167,9 +167,18 @@ impl LadderFilter {
         let mode = first.ladder_filter_mode;
         let decimate = oversampling_factor > 1;
         let biquads = first.iir_lowpass.decimator_order / 2;
-        let iir_k = first.iir_lowpass.k;
-        let iir_a1 = first.iir_lowpass.a1;
-        let iir_a2 = first.iir_lowpass.a2;
+        // The decimator's coefficients, broadcast once: `k`, `a1`, `a2`, `2 - a1`, `1 - a2`
+        // (see `IirFilter::filter()`)
+        let iir = &first.iir_lowpass;
+        let iir_k: [__m256d; IIR_MAX_ORDER / 2] = std::array::from_fn(|i| _mm256_set1_pd(iir.k[i]));
+        let iir_a1: [__m256d; IIR_MAX_ORDER / 2] =
+            std::array::from_fn(|i| _mm256_set1_pd(iir.a1[i]));
+        let iir_a2: [__m256d; IIR_MAX_ORDER / 2] =
+            std::array::from_fn(|i| _mm256_set1_pd(iir.a2[i]));
+        let iir_b1: [__m256d; IIR_MAX_ORDER / 2] =
+            std::array::from_fn(|i| _mm256_set1_pd(2.0 - iir.a1[i]));
+        let iir_b2: [__m256d; IIR_MAX_ORDER / 2] =
+            std::array::from_fn(|i| _mm256_set1_pd(1.0 - iir.a2[i]));
         let block_len = lanes
             .iter()
             .flatten()
@@ -206,6 +215,16 @@ impl LadderFilter {
         let dt = load(&dt);
         let feedback = load(&feedback);
         let half_dt = _mm256_mul_pd(_mm256_set1_pd(0.5), dt);
+        // The last output, before the output gain, per lane
+        let mut out = {
+            let mut values = [0.0_f64; LADDER_LANES];
+            for (value, lane) in values.iter_mut().zip(lanes.iter()) {
+                if let Some((filter, _)) = lane {
+                    *value = filter.out;
+                }
+            }
+            load(&values)
+        };
         let mut z: [__m256d; IIR_MAX_ORDER] = std::array::from_fn(|i| load(&z[i]));
 
         // Padé 3/2 approximant of tanh, the same operations as `tanh_pade32()`
@@ -260,36 +279,38 @@ impl LadderFilter {
                 p1 = correct(p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
                 let tanh_new_in = tanh(_mm256_sub_pd(input, _mm256_mul_pd(feedback, p3)));
                 p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
-            }
 
-            ut_1 = input;
+                // The input steps to its new value during the first oversampled step
+                ut_1 = input;
 
-            let mut out = match mode {
-                FilterType::Lowpass => p3,
-                FilterType::Bandpass => _mm256_sub_pd(p1, p3),
-                FilterType::Highpass => tanh(_mm256_sub_pd(
-                    _mm256_sub_pd(input, p0),
-                    _mm256_mul_pd(feedback, p3),
-                )),
-            };
+                out = match mode {
+                    FilterType::Lowpass => p3,
+                    FilterType::Bandpass => _mm256_sub_pd(p1, p3),
+                    FilterType::Highpass => tanh(_mm256_sub_pd(
+                        _mm256_sub_pd(input, p0),
+                        _mm256_mul_pd(feedback, p3),
+                    )),
+                };
 
-            if decimate {
-                // The same cascade as `IirFilter::filter()`
-                for biquad in 0..biquads {
-                    let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
-                    let biquad_in = _mm256_sub_pd(
-                        _mm256_sub_pd(
-                            _mm256_mul_pd(_mm256_set1_pd(iir_k[biquad]), out),
-                            _mm256_mul_pd(_mm256_set1_pd(iir_a1[biquad]), z0),
-                        ),
-                        _mm256_mul_pd(_mm256_set1_pd(iir_a2[biquad]), z1),
-                    );
-                    out = _mm256_add_pd(
-                        _mm256_add_pd(biquad_in, _mm256_mul_pd(_mm256_set1_pd(2.0), z0)),
-                        z1,
-                    );
-                    z[2 * biquad + 1] = z0;
-                    z[2 * biquad] = biquad_in;
+                if decimate {
+                    // Every oversampled output goes through the decimation filter, with the
+                    // same operations as `IirFilter::filter()`
+                    for biquad in 0..biquads {
+                        let (z0, z1) = (z[2 * biquad], z[2 * biquad + 1]);
+                        let recursive = _mm256_add_pd(
+                            _mm256_mul_pd(iir_a1[biquad], z0),
+                            _mm256_mul_pd(iir_a2[biquad], z1),
+                        );
+                        let feedforward = _mm256_add_pd(
+                            _mm256_mul_pd(iir_b1[biquad], z0),
+                            _mm256_mul_pd(iir_b2[biquad], z1),
+                        );
+                        let scaled = _mm256_mul_pd(iir_k[biquad], out);
+                        let biquad_in = _mm256_sub_pd(scaled, recursive);
+                        out = _mm256_add_pd(scaled, feedforward);
+                        z[2 * biquad + 1] = z0;
+                        z[2 * biquad] = biquad_in;
+                    }
                 }
             }
 
@@ -312,6 +333,7 @@ impl LadderFilter {
             values
         };
         let (p0, p1, p2, p3, ut_1) = (store(p0), store(p1), store(p2), store(p3), store(ut_1));
+        let out = store(out);
         let z: Vec<[f64; LADDER_LANES]> = z.iter().map(|z| store(*z)).collect();
         for (lane, entry) in lanes.iter_mut().enumerate() {
             if let Some((filter, _)) = entry {
@@ -320,11 +342,7 @@ impl LadderFilter {
                 filter.p2 = p2[lane];
                 filter.p3 = p3[lane];
                 filter.ut_1 = ut_1[lane];
-                filter.out = match mode {
-                    FilterType::Lowpass => filter.p3,
-                    FilterType::Bandpass => filter.p1 - filter.p3,
-                    FilterType::Highpass => filter.out,
-                };
+                filter.out = out[lane];
                 for (filter_z, z) in filter.iir_lowpass.z.iter_mut().zip(z.iter()) {
                     *filter_z = z[lane];
                 }
@@ -452,26 +470,24 @@ impl LadderFilter {
                     self.p3 = c * p3_prime + b * (p2_prime + self.p2);
                 }
             }
-        }
 
-        self.ut_1 = input;
+            // As in the original, the input steps to its new value during the first
+            // oversampled step and holds for the rest.
+            self.ut_1 = input;
 
-        match self.ladder_filter_mode {
-            FilterType::Lowpass => {
-                self.out = self.p3;
-            }
-            FilterType::Bandpass => {
-                self.out = self.p1 - self.p3;
-            }
-            FilterType::Highpass => {
-                self.out = tanh_pade32(input - self.p0 - feedback * self.p3);
-            }
-            #[allow(unreachable_patterns)]
-            _ => self.out = 0.0,
-        }
+            self.out = match self.ladder_filter_mode {
+                FilterType::Lowpass => self.p3,
+                FilterType::Bandpass => self.p1 - self.p3,
+                FilterType::Highpass => tanh_pade32(input - self.p0 - feedback * self.p3),
+                #[allow(unreachable_patterns)]
+                _ => 0.0,
+            };
 
-        if self.oversampling_factor > 1 {
-            self.out = self.iir_lowpass.filter(self.out);
+            // Every oversampled output goes through the decimation filter, and the last one
+            // is kept: decimation.
+            if self.oversampling_factor > 1 {
+                self.out = self.iir_lowpass.filter(self.out);
+            }
         }
     }
     pub fn output(&self) -> f64 {
@@ -494,19 +510,35 @@ impl LadderFilter {
     pub fn set_filtermode(&mut self, mode: FilterType) {
         self.ladder_filter_mode = mode;
     }
-    /// Sets the order of the IIR filter applied after oversampling (0 disables it).
+    /// Sets the order of the decimation filter (0 disables it, so the oversampled signal is
+    /// decimated without filtering).
     pub fn set_decimator_order(&mut self, order: usize) {
-        self.decimator_order = order;
-        self.iir_lowpass.set_order(order);
+        self.decimator_order = order.min(IIR_MAX_ORDER);
+        self.update_decimator();
     }
     pub fn set_sample_rate(&mut self, sample_rate: f64) {
         self.sample_rate = sample_rate;
-        self.iir_lowpass.sample_rate = sample_rate * self.oversampling_factor as f64;
-        self.iir_lowpass.cutoff_frequency = IIR_DOWNSAMPLING_BANDWIDTH * sample_rate / 2.0;
-        self.iir_lowpass.decimator_order = self.decimator_order;
-
+        self.update_decimator();
         self.set_integration_rate();
     }
+    /// Designs the decimation filter for the current sample rate, oversampling factor and
+    /// order, if any of them changed: a lowpass running at the oversampled rate that removes
+    /// everything above 90% of the output's Nyquist frequency, so that the distortion the
+    /// filter generates above it doesn't alias when the signal is decimated. Redesigning clears
+    /// the decimator's state, so it is only done when something changed (this is called for
+    /// every control rate block).
+    fn update_decimator(&mut self) {
+        let rate = self.sample_rate * self.oversampling_factor as f64;
+        let cutoff = IIR_DOWNSAMPLING_BANDWIDTH * self.sample_rate / 2.0;
+        let iir = &self.iir_lowpass;
+        if iir.sample_rate != rate
+            || iir.cutoff_frequency != cutoff
+            || iir.decimator_order != self.decimator_order
+        {
+            self.iir_lowpass.redesign(rate, cutoff, self.decimator_order);
+        }
+    }
+
 }
 
 impl Filter for LadderFilter {
@@ -585,6 +617,14 @@ mod iir {
             iir.compute_coefficients();
             iir
         }
+        /// Runs one sample through the cascade.
+        ///
+        /// Each biquad is `w = k x - a1 z0 - a2 z1` and `y = w + 2 z0 + z1`, rearranged as
+        /// `y = k x + ((2 - a1) z0 + (1 - a2) z1)` so that only a multiplication and an
+        /// addition stand between a stage's input and its output: the sum of the delay terms
+        /// doesn't depend on the input, so it is computed while the previous stage is still
+        /// busy. The lockstep ladder (see `LadderFilter::process_block_x4()`) uses the same
+        /// operations in the same order.
         pub fn filter(&mut self, input: f64) -> f64 {
             let mut out = input;
 
@@ -592,14 +632,15 @@ mod iir {
                 .zip(self.z.chunks_exact_mut(2))
                 .take(self.decimator_order / 2)
             {
-                // compute biquad input
-                let biquad_in = k * out - a1 * z[0] - a2 * z[1];
-
-                // compute biquad output
-                out = biquad_in + 2.0 * z[0] + z[1];
+                let (z0, z1) = (z[0], z[1]);
+                let recursive = a1 * z0 + a2 * z1;
+                let feedforward = (2.0 - a1) * z0 + (1.0 - a2) * z1;
+                let scaled = k * out;
+                let biquad_in = scaled - recursive;
+                out = scaled + feedforward;
 
                 // update delays
-                z[1] = z[0];
+                z[1] = z0;
                 z[0] = biquad_in;
             }
 
@@ -607,6 +648,15 @@ mod iir {
         }
 
         pub fn set_order(&mut self, order: usize) {
+            self.decimator_order = order.clamp(0, IIR_MAX_ORDER);
+            self.initialize_biquad_cascade();
+            self.compute_coefficients();
+        }
+        /// Sets the sample rate, cutoff and order at once, with a single recomputation of the
+        /// coefficients. Clears the filter's state.
+        pub fn redesign(&mut self, sample_rate: f64, cutoff_frequency: f64, order: usize) {
+            self.sample_rate = sample_rate;
+            self.cutoff_frequency = cutoff_frequency;
             self.decimator_order = order.clamp(0, IIR_MAX_ORDER);
             self.initialize_biquad_cascade();
             self.compute_coefficients();
@@ -691,6 +741,97 @@ mod iir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gain in dB of a sine at `freq` Hz through `process`, measured after it settles.
+    fn gain_db(sample_rate: f64, freq: f64, mut process: impl FnMut(f64) -> f64) -> f64 {
+        let len = sample_rate as usize;
+        let (mut energy_in, mut energy_out) = (0.0, 0.0);
+        for i in 0..len {
+            let x = 0.1 * (2.0 * std::f64::consts::PI * freq * i as f64 / sample_rate).sin();
+            let y = process(x);
+            if i >= len / 4 {
+                energy_in += x * x;
+                energy_out += y * y;
+            }
+        }
+        10.0 * (energy_out / energy_in).log10()
+    }
+
+    /// The decimator is designed for the oversampled rate of whatever rate the filter runs at,
+    /// and keeps its state when the parameters are set again at the same rate (which happens
+    /// every control rate block).
+    #[test]
+    fn decimator_follows_the_sample_rate() {
+        let design = |filter: &LadderFilter| {
+            let iir = &filter.iir_lowpass;
+            (iir.sample_rate, iir.cutoff_frequency, iir.decimator_order)
+        };
+        let expected =
+            |rate: f64| (rate * 3.0, IIR_DOWNSAMPLING_BANDWIDTH * rate / 2.0, IIR_DOWNSAMPLE_ORDER);
+        let mut filter = LadderFilter::with_seed(1);
+        assert_eq!(design(&filter), expected(44100.0));
+        for rate in [48000.0, 96000.0, 22050.0, 44100.0] {
+            filter.set_params(rate as f32, 1000.0, 1.0);
+            assert_eq!(design(&filter), expected(rate));
+        }
+
+        for _ in 0..64 {
+            filter.process(0.5);
+        }
+        let state = filter.iir_lowpass.z;
+        assert!(state.iter().any(|z| *z != 0.0));
+        filter.set_params(44100.0, 2000.0, 2.0);
+        assert_eq!(filter.iir_lowpass.z, state);
+
+        filter.set_decimator_order(8);
+        assert_eq!(design(&filter).2, 8);
+        filter.set_decimator_order(1000);
+        assert_eq!(design(&filter).2, IIR_MAX_ORDER);
+    }
+
+    /// At the oversampled rate, the decimator passes the audio band and removes what would
+    /// alias into it when only every third sample is kept.
+    #[test]
+    fn decimator_rejects_what_would_alias() {
+        for rate in [44100.0, 96000.0] {
+            let mut filter = LadderFilter::default();
+            filter.set_params(rate as f32, 1000.0, 1.0);
+            let oversampled = rate * 3.0;
+            let gain = |freq: f64| {
+                let mut iir = filter.iir_lowpass.clone();
+                gain_db(oversampled, freq, |x| iir.filter(x))
+            };
+            // Flat up to a third of the output rate (15 kHz at 44.1 kHz)...
+            for freq in [0.02, 0.2, 0.34] {
+                let gain = gain(freq * rate);
+                assert!(gain.abs() < 0.5, "{rate} Hz: {} Hz at {gain} dB", freq * rate);
+            }
+            // ...and at least 60 dB down from two thirds of it (what lands on 14 kHz and
+            // below at 44.1 kHz once decimated) up to the oversampled Nyquist frequency
+            for freq in [0.68, 0.9, 1.2] {
+                let gain = gain(freq * rate);
+                assert!(gain < -60.0, "{rate} Hz: {} Hz at {gain} dB", freq * rate);
+            }
+        }
+    }
+
+    /// Wide open, the ladder keeps the top of the audio band. With the decimator running at the
+    /// output rate (as it used to) it cut everything above 10 kHz at 44.1 kHz: 12 kHz came out
+    /// 51 dB below 1 kHz, and 15 kHz 120 dB below.
+    #[test]
+    fn wide_open_ladder_keeps_the_top_octave() {
+        let rate = 44100.0;
+        let response = |freq: f64| {
+            let mut filter = LadderFilter::with_seed(1);
+            filter.set_params(rate as f32, 22000.0, 0.7);
+            gain_db(rate, freq, |x| filter.process(x as f32) as f64)
+        };
+        let reference = response(1000.0);
+        for (freq, floor) in [(5000.0, -3.0), (12000.0, -12.0), (15000.0, -18.0)] {
+            let relative = response(freq) - reference;
+            assert!(relative > floor, "{freq} Hz is {relative} dB below 1 kHz");
+        }
+    }
 
     /// A test signal: a detuned pair of saws
     fn signal(len: usize) -> Vec<f32> {
