@@ -678,6 +678,8 @@ pub const PW_SWEEP_FRAMES: usize = 32;
 /// A wavetable in the wavetable synth sense: one or more frames (waveforms, each bandlimited per
 /// note) that an oscillator can morph between with its position control.
 pub struct WavetableFrames {
+    /// Display name, which matches the oscillators' wave parameter.
+    #[allow(dead_code)] // only read by the tests and benchmarks so far
     pub name: &'static str,
     pub frames: Vec<WavetableNotes>,
 }
