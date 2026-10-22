@@ -3,7 +3,6 @@ use std::{
     f32::consts::{FRAC_PI_4, PI, SQRT_2},
 };
 
-use itertools::izip;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use wide::{bytemuck::cast, f32x8, i32x8, u32x8};
 
@@ -654,17 +653,17 @@ impl Wavetable {
     pub fn generate(&self, phase: f32) -> f32 {
         self.read_fixed::<CUBIC>(cycles_to_fixed(phase))
     }
-    /// One cycle of the first `harmonics` partials of a spectrum, `len` samples long. `fft`
-    /// must be an inverse FFT plan of length `len`.
+    /// One cycle of the first `harmonics` partials of a spectrum, `len` samples long (at least
+    /// twice `harmonics`).
+    #[cfg_attr(not(test), allow(dead_code))] // the synth renders its tables two at a time
     pub fn from_spectrum(
         spectrum: &Spectrum,
         len: usize,
         harmonics: usize,
-        fft: &dyn Fft<f32>,
+        renderer: &mut CycleRenderer,
     ) -> Self {
-        let mut table: Vec<f32> = vec![0.0; len];
-        spectrum.render_ifft(&mut table, harmonics, fft);
-        Self::new(table)
+        let (cycle, _) = renderer.render(len, (spectrum, harmonics), None);
+        Self::new(cycle)
     }
 }
 
@@ -1866,17 +1865,36 @@ impl WavetableNotes {
         sample_rate: f32,
         levels: &NoteLevels,
         max_len: usize,
-        planner: &mut FftPlanner<f32>,
+        renderer: &mut CycleRenderer,
     ) -> Self {
-        let tables = (0..levels.count())
+        // The length and number of harmonics of each level's table
+        let sizes: Vec<(usize, usize)> = (0..levels.count())
             .map(|level| {
                 let harmonics = WavetableNotes::harmonics_for_note(levels.top_note(level), sample_rate)
                     .min(spectrum.harmonics());
                 let len = table_len_for(harmonics, max_len);
-                let fft = planner.plan_fft_inverse(len);
-                Wavetable::from_spectrum(spectrum, len, harmonics.min(len / 2), &*fft)
+                (len, harmonics.min(len / 2))
             })
             .collect();
+        // Neighbouring levels mostly have tables of the same length, which render together
+        let mut tables = Vec::with_capacity(sizes.len());
+        let mut level = 0;
+        while level < sizes.len() {
+            let (len, harmonics) = sizes[level];
+            match sizes.get(level + 1) {
+                Some(&(next_len, next_harmonics)) if next_len == len => {
+                    let (a, b) = renderer.render(len, (spectrum, harmonics), Some((spectrum, next_harmonics)));
+                    tables.push(Wavetable::new(a));
+                    tables.push(Wavetable::new(b.unwrap()));
+                    level += 2;
+                }
+                _ => {
+                    let (a, _) = renderer.render(len, (spectrum, harmonics), None);
+                    tables.push(Wavetable::new(a));
+                    level += 1;
+                }
+            }
+        }
         Self { tables }
     }
 }
@@ -1981,7 +1999,7 @@ impl WavetableFrames {
         spectra: &[Spectrum],
         sample_rate: f32,
         max_len: usize,
-        planner: &mut FftPlanner<f32>,
+        renderer: &mut CycleRenderer,
     ) -> Self {
         let harmonics = spectra
             .iter()
@@ -2000,7 +2018,7 @@ impl WavetableFrames {
             frames: spectra
                 .iter()
                 .map(|spectrum| {
-                    WavetableNotes::from_spectrum(spectrum, sample_rate, &levels, max_len, planner)
+                    WavetableNotes::from_spectrum(spectrum, sample_rate, &levels, max_len, renderer)
                 })
                 .collect(),
             levels,
@@ -2050,10 +2068,10 @@ impl WavetableSet {
     /// Generates the wavetables for the given sample rate, with tables of at most `max_len`
     /// samples. The order matches the oscillators' wave parameter.
     pub fn new(sample_rate: f32, max_len: usize) -> Self {
-        // One planner is shared by all tables; it caches a plan per length.
-        let mut planner = FftPlanner::new();
+        // One renderer is shared by all tables; it caches an FFT plan per length.
+        let mut renderer = CycleRenderer::new();
         let mut single = |name: &str, osc: AdditiveOsc| {
-            WavetableFrames::from_spectra(name, &[osc.spectrum()], sample_rate, max_len, &mut planner)
+            WavetableFrames::from_spectra(name, &[osc.spectrum()], sample_rate, max_len, &mut renderer)
         };
         let sine = single("Sine", AdditiveOsc::sine());
         let triangle = single("Triangle", AdditiveOsc::triangle());
@@ -2073,7 +2091,7 @@ impl WavetableSet {
             })
             .collect();
         let sweep =
-            WavetableFrames::from_spectra("PW Sweep", &sweep_spectra, sample_rate, max_len, &mut planner);
+            WavetableFrames::from_spectra("PW Sweep", &sweep_spectra, sample_rate, max_len, &mut renderer);
 
         Self {
             wavetables: vec![
@@ -2140,23 +2158,69 @@ impl Spectrum {
             .unwrap_or(0);
         self.bins.truncate(last + 1);
     }
-    /// Renders one cycle of the first `harmonics` harmonics into `output` using an inverse FFT.
-    /// `fft` must be an inverse FFT plan with the same length as `output`, which must be at least
-    /// twice `harmonics` to keep the result bandlimited.
-    pub fn render_ifft(&self, output: &mut [f32], harmonics: usize, fft: &dyn Fft<f32>) {
-        assert_eq!(output.len(), fft.len());
-        assert!(harmonics <= output.len() / 2);
+}
 
-        // Bin 0 is the DC offset, which is always zero.
-        let mut buffer = vec![Complex32::new(0.0, 0.0); output.len()];
-        for (bin, value) in buffer.iter_mut().zip(self.bins.iter()).skip(1).take(harmonics) {
-            *bin = *value;
-        }
-        fft.process(&mut buffer);
+/// Renders cycles of waveforms from their spectra with inverse FFTs, reusing its FFT plans and
+/// buffers from one cycle to the next. The cycles are real, so two of the same length can go
+/// through one complex transform: one in the real part, the other in the imaginary part.
+pub struct CycleRenderer {
+    planner: FftPlanner<f32>,
+    buffer: Vec<Complex32>,
+    scratch: Vec<Complex32>,
+}
 
-        for (sample, output) in izip!(buffer.iter(), output.iter_mut()) {
-            *output = sample.re;
+impl CycleRenderer {
+    pub fn new() -> Self {
+        Self {
+            planner: FftPlanner::new(),
+            buffer: Vec::new(),
+            scratch: Vec::new(),
         }
+    }
+    /// Renders one cycle of `len` samples of the first `a.1` harmonics of the spectrum `a.0`
+    /// and, when `b` is given, one of the first `b.1` harmonics of `b.0`. The cycles hold at
+    /// most `len / 2` harmonics, so `len` must be at least twice them to keep them bandlimited.
+    pub fn render(
+        &mut self,
+        len: usize,
+        a: (&Spectrum, usize),
+        b: Option<(&Spectrum, usize)>,
+    ) -> (Vec<f32>, Option<Vec<f32>>) {
+        let fft = self.planner.plan_fft_inverse(len);
+        self.buffer.clear();
+        self.buffer.resize(len, Complex32::new(0.0, 0.0));
+        // Each harmonic is split between its bin and its mirror image, complex conjugated, so
+        // that the cycle comes out real, with the value of the real part of
+        // `sum(bins[k] * e^(i * k * theta))`. `b`'s spectrum goes in times `i`, which puts its
+        // cycle in the imaginary part. Bin 0 is the DC offset, which is always zero.
+        let buffer = &mut self.buffer;
+        let mut add = |(spectrum, harmonics): (&Spectrum, usize), rotate: fn(Complex32) -> Complex32| {
+            assert!(harmonics <= len / 2);
+            let bins = spectrum.bins.get(1..).unwrap_or(&[]);
+            let bins = &bins[..harmonics.min(bins.len())];
+            // The harmonics below the Nyquist frequency, whose mirror images are other bins
+            let below = bins.len().min(len.div_ceil(2) - 1);
+            let (low, high) = buffer.split_at_mut(len.div_ceil(2));
+            for ((bin, out), mirror) in bins[..below].iter().zip(&mut low[1..]).zip(high.iter_mut().rev()) {
+                let half = bin * 0.5;
+                *out += rotate(half);
+                *mirror += rotate(half.conj());
+            }
+            // A harmonic at the Nyquist frequency is its own mirror image
+            if let Some(bin) = bins.get(below) {
+                buffer[len / 2] += rotate(bin * 0.5) + rotate(bin.conj() * 0.5);
+            }
+        };
+        add(a, |bin| bin);
+        if let Some(b) = b {
+            add(b, |bin| Complex32::new(-bin.im, bin.re));
+        }
+        self.scratch.resize(fft.get_inplace_scratch_len(), Complex32::new(0.0, 0.0));
+        fft.process_with_scratch(&mut self.buffer, &mut self.scratch);
+
+        let a = self.buffer.iter().map(|sample| sample.re).collect();
+        let b = b.map(|_| self.buffer.iter().map(|sample| sample.im).collect());
+        (a, b)
     }
 }
 
@@ -2653,8 +2717,8 @@ mod tests {
 
     #[test]
     fn pulse_wavetable_has_the_expected_duty_cycle() {
-        let fft = FftPlanner::new().plan_fft_inverse(2048);
-        let table = Wavetable::from_spectrum(&AdditiveOsc::<2048>::pulse(0.25).spectrum(), 2048, 1024, &*fft);
+        let spectrum = AdditiveOsc::<2048>::pulse(0.25).spectrum();
+        let table = Wavetable::from_spectrum(&spectrum, 2048, 1024, &mut CycleRenderer::new());
         let cycle = table.cycle();
         let high = cycle.iter().filter(|sample| **sample > 0.0).count();
         assert!((high as f32 / 2048.0 - 0.25).abs() < 0.01, "{high}");
@@ -2694,8 +2758,8 @@ mod tests {
         assert!((spectrum.bins[3].norm() - 0.25).abs() < 1e-4);
         assert!((spectrum.bins[40].norm() - 0.1).abs() < 1e-4);
 
-        let mut rendered = vec![0.0; len];
-        spectrum.render_ifft(&mut rendered, 299, &*planner.plan_fft_inverse(len));
+        let mut renderer = CycleRenderer::new();
+        let (rendered, _) = renderer.render(len, (&spectrum, 299), None);
         for (got, want) in rendered.iter().zip(&cycle) {
             assert!((got - (want - 0.3)).abs() < 1e-4, "{got} vs {want}");
         }
@@ -2711,8 +2775,45 @@ mod tests {
         assert_eq!(silent.harmonics(), 0);
 
         // At a power of two length the same waveform comes out, resampled
-        let table = Wavetable::from_spectrum(&spectrum, 1024, 299, &*planner.plan_fft_inverse(1024));
+        let table = Wavetable::from_spectrum(&spectrum, 1024, 299, &mut renderer);
         assert!((table.generate(0.25) - (0.5 + 0.25 * (3.0 * PI / 2.0 + 1.0).cos() + 0.1 * (10.0 * PI).sin())).abs() < 1e-3);
+    }
+
+    /// Two cycles rendered through one transform come out as they do on their own, and match
+    /// the sum of their harmonics. A spectrum without harmonics renders silence.
+    #[test]
+    fn cycles_render_in_pairs() {
+        let empty = Spectrum { bins: Vec::new() };
+        let (silence, _) = CycleRenderer::new().render(64, (&empty, 10), Some((&empty, 3)));
+        assert!(silence.iter().all(|sample| *sample == 0.0));
+
+        let saw = AdditiveOsc::<2048>::saw().spectrum();
+        let pulse = AdditiveOsc::<2048>::pulse(0.3).spectrum();
+        let mut renderer = CycleRenderer::new();
+        for (len, a, b) in [(256, 100, 37), (2048, 1024, 900), (600, 299, 1), (601, 300, 300)] {
+            let (alone_a, none) = renderer.render(len, (&saw, a), None);
+            assert!(none.is_none());
+            let (alone_b, _) = renderer.render(len, (&pulse, b), None);
+            let (pair_a, pair_b) = renderer.render(len, (&saw, a), Some((&pulse, b)));
+            let pair_b = pair_b.unwrap();
+            for n in 0..len {
+                assert!((pair_a[n] - alone_a[n]).abs() < 1e-5, "{len} {n}: {} vs {}", pair_a[n], alone_a[n]);
+                assert!((pair_b[n] - alone_b[n]).abs() < 1e-5, "{len} {n}: {} vs {}", pair_b[n], alone_b[n]);
+            }
+            // The real part of the sum of the harmonics, at a few samples
+            for n in [0, 1, len / 3, len - 1] {
+                let theta = 2.0 * std::f64::consts::PI * n as f64 / len as f64;
+                let want: f64 = saw.bins[1..=a]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, bin)| {
+                        let angle = (k + 1) as f64 * theta;
+                        bin.re as f64 * angle.cos() - bin.im as f64 * angle.sin()
+                    })
+                    .sum();
+                assert!((alone_a[n] as f64 - want).abs() < 1e-4, "{len} {n}: {} vs {want}", alone_a[n]);
+            }
+        }
     }
 
     /// Tables are as long as their harmonics need, and levels group notes to fit a budget.

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use rustfft::FftPlanner;
 
-use super::oscillator::{Spectrum, WavetableFrames};
+use super::oscillator::{CycleRenderer, Spectrum, WavetableFrames};
 use super::wav;
 
 /// The usual length of a wavetable frame, assumed for files that don't say.
@@ -97,7 +97,7 @@ impl LoadedSpectra {
             &self.spectra,
             sample_rate,
             MAX_TABLE_LEN,
-            &mut FftPlanner::new(),
+            &mut CycleRenderer::new(),
         )
     }
     /// A one line description for the GUI.

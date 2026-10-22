@@ -490,9 +490,14 @@ fn benchmark_svf() {
 #[test]
 #[ignore]
 fn benchmark_wavetable_generation() {
-    let start = Instant::now();
-    let synth = ThreeOsc::new(SAMPLE_RATE);
-    let elapsed = start.elapsed();
+    // The best of a few runs, since a single one is easily disturbed
+    let mut synth = ThreeOsc::new(SAMPLE_RATE);
+    let mut elapsed = std::time::Duration::MAX;
+    for _ in 0..5 {
+        let start = Instant::now();
+        synth = ThreeOsc::new(SAMPLE_RATE);
+        elapsed = elapsed.min(start.elapsed());
+    }
     let frames: usize = synth
         .waves
         .wavetables
