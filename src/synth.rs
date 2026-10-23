@@ -5,8 +5,10 @@ use itertools::izip;
 use nih_plug::prelude::Enum;
 use wide::f32x8;
 
+use self::effects::{EffectSettings, Effects};
 use self::envelopes::AdsrEnvelope;
 use self::filter::Filter;
+use self::monitor::{Monitor, NewestVoice, VoiceState};
 use self::filter::FilterContainer;
 use self::filter::FilterController;
 #[cfg(target_arch = "x86_64")]
@@ -14,7 +16,7 @@ use self::filter::{LadderFilter, LADDER_LANES};
 use self::filter::{LadderSamples, SvfSamples, SvfSimper, SVF_LANES};
 use self::modulation::{
     apply_routes, ModSource, ModTarget, Route, Sources, Targets, N_LFOS, N_MOD_ENVELOPES,
-    N_SOURCES,
+    N_SOURCES, N_TARGETS,
 };
 use self::notes::Notes;
 use self::oscillator::BlockOutput;
@@ -85,9 +87,18 @@ pub struct ThreeOsc {
     pub mod_wheel: f32,
     /// MIDI channel pressure, from 0 to 1.
     pub aftertouch: f32,
-    /// How far unison voices are spread across the stereo field, from 0 (mono: both outputs are
-    /// identical) to 1 (the lowest voice fully left and the highest fully right).
+    /// How far unison voices are spread across the stereo field, from 0 (all of an oscillator's
+    /// voices where its pan puts it) to 1 (the lowest voice fully left and the highest fully
+    /// right).
     pub stereo_width: f32,
+    /// The effects after the voices, and their settings before modulation. Taken out of the
+    /// synth while the voices render (like the voices themselves), and `Some` otherwise.
+    effects: Option<Effects>,
+    pub effect_settings: EffectSettings,
+    /// The modulation the effects follow: the newest voice's, held after the voices finish.
+    effect_modulation: Targets,
+    /// The newest voice's modulation at the end of the last buffer, for the GUI.
+    newest_modulation: Targets,
     /// The SIMD instructions the wavetable lookups use.
     pub simd: SimdLevel,
     /// How the wavetables are read in between their samples.
@@ -124,7 +135,11 @@ impl ThreeOsc {
             routes: Vec::with_capacity(modulation::N_SLOTS),
             mod_wheel: 0.0,
             aftertouch: 0.0,
-            stereo_width: 0.0,
+            stereo_width: 1.0,
+            effects: Some(Effects::new(sample_rate as f32)),
+            effect_settings: EffectSettings::default(),
+            effect_modulation: [0.0; N_TARGETS],
+            newest_modulation: [0.0; N_TARGETS],
             simd: SimdLevel::detect(),
             interpolation: Interpolation::default(),
             modulation_rate: ModulationRate::default(),
@@ -218,6 +233,10 @@ impl ThreeOsc {
     pub fn reset(&mut self) {
         self.voices.clear();
         self.notes.notes.clear();
+        if let Some(effects) = &mut self.effects {
+            effects.reset();
+        }
+        self.effect_modulation = [0.0; N_TARGETS];
     }
     pub fn release_voices(&mut self) {
         let duration = (self.gain_envelope.release_time * self.sample_rate as f32) as u32;
@@ -242,14 +261,16 @@ impl ThreeOsc {
             &self.waves.wavetables[params.wavetable.min(self.waves.wavetables.len() - 1)]
         }
     }
-    /// Everything the voices need from the synth to render themselves, for the current settings.
-    fn voice_context(&self, stereo: bool) -> VoiceContext<'_> {
-        // An oscillator is only needed if it can be audible, or if it modulates an oscillator
-        // that is needed (each oscillator modulates the one before it). Modulation routes can
-        // turn up amounts that are set to zero, so a targeted amount counts as nonzero.
-        let targeted = |target: Option<ModTarget>| {
-            target.is_some_and(|target| self.routes.iter().any(|route| route.target == target))
-        };
+    /// Whether a route modulates `target`.
+    fn targeted(&self, target: ModTarget) -> bool {
+        self.routes.iter().any(|route| route.target == target)
+    }
+    /// Which oscillators need to be rendered at all. An oscillator is only needed if it can be
+    /// audible, or if it modulates an oscillator that is needed (each oscillator modulates the
+    /// one before it). Modulation routes can turn up amounts that are set to zero, so a
+    /// targeted amount counts as nonzero.
+    fn active_oscillators(&self) -> [bool; 3] {
+        let targeted = |target: Option<ModTarget>| target.is_some_and(|target| self.targeted(target));
         let mut active = [false; 3];
         for i in 0..3 {
             let osc = &self.oscillators[i];
@@ -265,6 +286,23 @@ impl ThreeOsc {
             };
             active[i] = audible || modulates_needed_osc;
         }
+        active
+    }
+    /// Whether the voices need rendering in stereo: when an oscillator that plays has unison
+    /// voices for the stereo width to spread out, or is panned (or its pan is modulated).
+    /// Otherwise everything is in the centre, and the cheaper mono path gives the same output on
+    /// both channels.
+    fn needs_stereo(&self, active: &[bool; 3]) -> bool {
+        (0..3).any(|i| {
+            let osc = &self.oscillators[i];
+            active[i]
+                && ((self.stereo_width > 0.0 && osc.unison_voices() > 1)
+                    || osc.pan != 0.0
+                    || self.targeted(ModTarget::osc_pan(i)))
+        })
+    }
+    /// Everything the voices need from the synth to render themselves, for the current settings.
+    fn voice_context(&self, stereo: bool, active: [bool; 3]) -> VoiceContext<'_> {
         let sources_used = std::array::from_fn(|source| {
             self.routes
                 .iter()
@@ -290,6 +328,7 @@ impl ThreeOsc {
             aftertouch: self.aftertouch,
             sample_rate: self.sample_rate as f32,
             stereo,
+            stereo_width: self.stereo_width,
             octave_detune: self.octave_detune,
             portamento_rate: self.portamento_rate,
             portamento_block: (1.0 - self.portamento_rate).powi(CONTROL_BLOCK_SAMPLES as i32),
@@ -305,10 +344,6 @@ impl ThreeOsc {
         self.release_voices();
         self.filter_controller.cutoff = self.filter_controller.target_cutoff;
 
-        // Unison voices are only spread across the stereo field when the width is above zero.
-        // Otherwise the cheaper mono path is used, and both outputs are identical.
-        let stereo = self.stereo_width > 0.0;
-
         // Minor optimisation: Semitone / octave / pitch multiplier offset is calculated and cached
         // once per run, not once per sample
         for osc in self.oscillators.iter_mut() {
@@ -316,25 +351,38 @@ impl ThreeOsc {
             osc.update_unison_amp();
             osc.update_detune_factors();
             osc.clamp_wavetable(&self.waves);
-            if stereo {
+        }
+        let active = self.active_oscillators();
+        let stereo = self.needs_stereo(&active);
+        if stereo {
+            for osc in self.oscillators.iter_mut() {
                 osc.update_pan_gains(self.stereo_width);
             }
         }
 
-        // The voices are taken out of the synth while the context borrows the rest of it. This
-        // doesn't allocate: the vector keeps its capacity and goes back afterwards.
+        // The voices and the effects are taken out of the synth while the context borrows the
+        // rest of it. This doesn't allocate: the vector keeps its capacity and goes back
+        // afterwards, and so do the effects.
         let mut voices = std::mem::take(&mut self.voices);
-        let context = self.voice_context(stereo);
+        let mut effects = self.effects.take();
+        let settings = self.effect_settings;
+        let mut effect_modulation = self.effect_modulation;
+        let output_volume = self.output_volume;
+        let context = self.voice_context(stereo, active);
+        let modulated_effects = settings.any_enabled() && context.routes.iter().any(|route| route.target.is_effect());
 
         // Write samples from all voices, one control rate block at a time. Each block goes
         // through three stages: the oscillators of every voice, then the filters (which can run
-        // several voices in lockstep), then the amplitude envelopes mixing into the output.
+        // several voices in lockstep), then the amplitude envelopes mixing into the output,
+        // which then goes through the output gain and the effects.
         let len = output_left.len().min(output_right.len());
         let per_sample = context.per_sample;
         let mut start = 0;
+        let mut last_block_len = 0;
         while start < len {
             let end = (start + CONTROL_BLOCK_SAMPLES).min(len);
             let block_len = end - start;
+            last_block_len = block_len;
             for voice in voices.iter_mut() {
                 if per_sample {
                     voice.update_controls_per_sample(&context, block_len);
@@ -354,30 +402,49 @@ impl ThreeOsc {
                     &mut output_right[start..end],
                 );
             }
+
+            let (left, right) = (&mut output_left[start..end], &mut output_right[start..end]);
+            for (left, right) in izip!(left.iter_mut(), right.iter_mut()) {
+                *left *= output_volume;
+                *right *= output_volume;
+            }
+            if let Some(effects) = &mut effects {
+                if settings.any_enabled() {
+                    // The newest voice's modulation, which holds once the voices have finished
+                    if modulated_effects {
+                        if let Some(voice) = voices.last() {
+                            effect_modulation = voice.modulation_now(&context, block_len);
+                        }
+                    }
+                    effects.process(&settings.modulated(&effect_modulation), left, right);
+                }
+            }
             start = end;
         }
+        let newest_modulation = match voices.last() {
+            Some(voice) if last_block_len > 0 => voice.modulation_now(&context, last_block_len),
+            _ => self.newest_modulation,
+        };
+        self.newest_modulation = newest_modulation;
         self.voices = voices;
-
-        // Apply output volume
-        for (out_l, out_r) in izip!(output_left, output_right) {
-            *out_l *= self.output_volume;
-            *out_r *= self.output_volume;
-        }
+        self.effects = effects;
+        self.effect_modulation = effect_modulation;
     }
     /// Runs only the control rate update of every voice for `blocks` blocks, at the modulation
     /// rate, for the benchmarks.
     #[cfg(test)]
     pub(crate) fn run_control_updates_only(&mut self, blocks: usize) {
         self.release_voices();
-        let stereo = self.stereo_width > 0.0;
         for osc in self.oscillators.iter_mut() {
             osc.update_total_pitch();
             osc.update_unison_amp();
             osc.update_detune_factors();
             osc.clamp_wavetable(&self.waves);
         }
+        let active = self.active_oscillators();
+        let stereo = self.needs_stereo(&active);
         let mut voices = std::mem::take(&mut self.voices);
-        let context = self.voice_context(stereo);
+        let context = self.voice_context(stereo, active);
         for _ in 0..blocks {
             for voice in voices.iter_mut() {
                 if context.per_sample {
@@ -388,6 +455,19 @@ impl ThreeOsc {
             }
         }
         self.voices = voices;
+    }
+    /// Shows the GUI the notes that are playing, see [`Monitor`].
+    pub fn publish(&self, monitor: &Monitor) {
+        let voices = self.voices.iter().map(|voice| VoiceState {
+            runtime: voice.runtime,
+            released: voice.release_time,
+        });
+        let newest = self.voices.last().map(|voice| NewestVoice {
+            lfo_phases: std::array::from_fn(|lfo| voice.lfos[lfo].phase as f32),
+            modulation: self.newest_modulation,
+            cutoff: voice.cutoff,
+        });
+        monitor.store(voices, newest);
     }
     pub fn pitch_bend(&mut self, bend: u16) {
         let bend = (bend as i32 - 8192) as f32 / 8192.0 * self.bend_range;
@@ -421,6 +501,9 @@ struct VoiceContext<'a> {
     aftertouch: f32,
     sample_rate: f32,
     stereo: bool,
+    /// How far the unison voices are spread across the stereo field, see
+    /// [`ThreeOsc::stereo_width`].
+    stereo_width: f32,
     octave_detune: f32,
     portamento_rate: f32,
     /// The portamento rate applied over a whole control rate block.
@@ -478,6 +561,10 @@ pub struct Voice {
     /// the oscillator's own are used.
     detune_factors: [[f32x8; UNISON_VECTORS]; 3],
     detune_modulated: [bool; 3],
+    /// Each oscillator's unison voices' left and right gains when its pan is modulated,
+    /// otherwise the oscillator's own are used.
+    pan_gains: [PanGains; 3],
+    pan_modulated: [bool; 3],
     /// Whether each oscillator's ramps were set up in the previous block.
     osc_ready: [bool; 3],
     /// The modulation of every target in the previous block.
@@ -487,6 +574,8 @@ pub struct Voice {
     gain_step: f32,
     /// Filter input gain.
     drive: f32,
+    /// The filter's cutoff at the end of the last block, for the GUI.
+    cutoff: f32,
 
     /// The current block's samples on their way from the oscillators through the filter to the
     /// output; `pre_filter_right` is only used in stereo.
@@ -498,6 +587,33 @@ pub struct Voice {
     /// The control values of each sample of the block, when the modulation runs at the sample
     /// rate (the ramps above are then left alone).
     samples: SampleControls,
+}
+
+/// The gains of oscillator `i`'s unison voices with its pan moved by `pan_mod`, or `None` when
+/// that doesn't change them (no modulation, or a mono output).
+fn modulated_pan_gains(context: &VoiceContext, i: usize, pan_mod: f32) -> Option<PanGains> {
+    (context.stereo && pan_mod != 0.0).then(|| {
+        let osc = &context.oscillators[i];
+        let (left, right) = osc.pan_gains_for(osc.pan + pan_mod * ModTarget::PAN_RANGE, context.stereo_width);
+        PanGains { left, right }
+    })
+}
+
+/// The left and right gains of an oscillator's unison voices, see
+/// [`OscillatorParams::pan_gains_for()`].
+#[derive(Clone, Copy)]
+struct PanGains {
+    left: [f32x8; UNISON_VECTORS],
+    right: [f32x8; UNISON_VECTORS],
+}
+
+impl Default for PanGains {
+    fn default() -> Self {
+        Self {
+            left: [f32x8::ZERO; UNISON_VECTORS],
+            right: [f32x8::ZERO; UNISON_VECTORS],
+        }
+    }
 }
 
 /// The buffers of a voice's oscillators modulating each other within a block.
@@ -541,11 +657,14 @@ impl Voice {
             osc_am: [0.0; 3],
             detune_factors: [[f32x8::splat(1.0); UNISON_VECTORS]; 3],
             detune_modulated: [false; 3],
+            pan_gains: [PanGains::default(); 3],
+            pan_modulated: [false; 3],
             osc_ready: [false; 3],
             mods: [0.0; modulation::N_TARGETS],
             gain: 0.0,
             gain_step: 0.0,
             drive: 1.0,
+            cutoff: 0.0,
             pre_filter: [0.0; CONTROL_BLOCK_SAMPLES],
             pre_filter_right: [0.0; CONTROL_BLOCK_SAMPLES],
             scratch: Scratch {
@@ -558,6 +677,24 @@ impl Voice {
     pub fn release(&mut self) {
         if self.release_time.is_none() {
             self.release_time = Some(self.runtime)
+        }
+    }
+    /// Sets oscillator `i` up for its pan's modulation, which (like the unison detune's) only
+    /// changes once per block.
+    fn update_pan(&mut self, context: &VoiceContext, i: usize, pan_mod: f32) {
+        let gains = modulated_pan_gains(context, i, pan_mod);
+        self.pan_modulated[i] = gains.is_some();
+        if let Some(gains) = gains {
+            self.pan_gains[i] = gains;
+        }
+    }
+    /// The modulation of every target at the end of the block just worked out (of `block_len`
+    /// samples), from the voice's sources.
+    fn modulation_now(&self, context: &VoiceContext, block_len: usize) -> Targets {
+        if context.per_sample {
+            apply_routes(context.routes, &self.samples.sources_at(block_len - 1))
+        } else {
+            self.mods
         }
     }
     /// The voice's base phase delta, in cycles per sample.
@@ -699,13 +836,14 @@ impl Voice {
             let position = osc.position + modulation(ModTarget::osc_position(i));
             self.osc_frames[i] = context.frames[i].frame_indices(position);
 
-            // Unison detune
+            // Unison detune and pan
             let detune_mod = modulation(ModTarget::osc_detune(i));
             self.detune_modulated[i] = detune_mod != 0.0;
             if detune_mod != 0.0 {
                 self.detune_factors[i] =
                     osc.detune_factors_for((osc.voices_detune + detune_mod).clamp(0.0, 1.0));
             }
+            self.update_pan(context, i, modulation(ModTarget::osc_pan(i)));
 
             // Modulation by the next oscillator (the amounts are squared for finer control at
             // the low end)
@@ -733,6 +871,7 @@ impl Voice {
             cutoff_mult *= fastmath::exp2(cutoff_mod * ModTarget::CUTOFF_OCTAVES);
         }
         let cutoff = controller.get_cutoff(cutoff_mult, filter_level, sample_rate);
+        self.cutoff = cutoff;
         let mut resonance = controller.resonance;
         let resonance_mod = modulation(ModTarget::Resonance);
         if resonance_mod != 0.0 {
@@ -833,6 +972,11 @@ impl Voice {
             } else {
                 &osc.detune_factors
             };
+            let (pan_left, pan_right) = if self.pan_modulated[i] {
+                (&self.pan_gains[i].left, &self.pan_gains[i].right)
+            } else {
+                (&osc.pan_left, &osc.pan_right)
+            };
 
             // The block in runs of samples with the same pair of frames: always one at the
             // control rate, and nearly always at the sample rate. Values that don't change
@@ -890,8 +1034,8 @@ impl Voice {
                     voices: osc.unison_voices(),
                     detune_factors,
                     mask: &osc.voice_mask,
-                    pan_left: &osc.pan_left,
-                    pan_right: &osc.pan_right,
+                    pan_left,
+                    pan_right,
                 };
                 let mut output = BlockOutput {
                     left: &mut self.pre_filter[start..end],
@@ -1196,7 +1340,9 @@ fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
     }
 }
 
+pub mod effects;
 pub mod fastmath;
+pub mod monitor;
 mod per_sample;
 pub mod wav;
 pub mod wavetable_file;

@@ -17,6 +17,9 @@ use crate::synth::oscillator::{OscWave, WavePreview};
 /// The colour of the oscillator and filter displays (the envelopes and LFOs, which are
 /// modulation sources, use the modulation colour).
 const SIGNAL_COLOR: Color32 = Color32::from_rgb(90, 180, 255);
+/// The colour of what moves with the notes that are playing: where each is in its envelopes,
+/// its LFOs' phases, its filter's cutoff.
+const LIVE_COLOR: Color32 = Color32::from_rgb(255, 238, 205);
 
 const WAVE_HEIGHT: f32 = 50.0;
 /// The LFO displays sit beside their two rows of controls.
@@ -36,6 +39,12 @@ fn frame(ui: &mut Ui, height: f32) -> (egui::Response, Painter, Rect) {
     painter.rect_stroke(rect, 3.0, visuals.widgets.noninteractive.bg_stroke, StrokeKind::Inside);
     let plot = rect.shrink2(egui::vec2(4.0, 5.0));
     (response, painter.with_clip_rect(rect.shrink(1.0)), plot)
+}
+
+/// A dot for a note that is playing, at a point of a display.
+fn live_dot(painter: &Painter, at: Pos2) {
+    painter.circle_filled(at, 3.5, LIVE_COLOR);
+    painter.circle_stroke(at, 3.5, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
 }
 
 /// A faint guide line across or down a display.
@@ -94,10 +103,13 @@ pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: Option<f32
     curve(&painter, points, centre, color, 1.5);
 }
 
-/// One cycle of an LFO's waveform.
-pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32) {
+/// One cycle of an LFO's waveform, with a dot where the newest note's copy of it is (`phase`, in
+/// cycles).
+pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>) {
     let (response, painter, rect) = frame(ui, LFO_HEIGHT);
-    response.on_hover_text("One cycle of the LFO, from -100% to 100%.");
+    response.on_hover_text(
+        "One cycle of the LFO, from -100% to 100%. The dot is where the newest note's copy of it is.",
+    );
     let centre = rect.center().y;
     guide(&painter, Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
     let steps = (rect.width() as usize).max(2) * 2;
@@ -110,6 +122,10 @@ pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32) {
         })
         .collect();
     curve(&painter, points, centre, color, 1.5);
+    if let Some(phase) = phase {
+        let phase = phase.rem_euclid(1.0);
+        live_dot(&painter, Pos2::new(x_at(rect, phase), centre - wave.generate(phase) * rect.height() / 2.0));
+    }
 }
 
 /// An envelope's shape as the envelope display draws it: attack, decay, a stretch of sustain,
@@ -140,6 +156,36 @@ impl<'a> EnvelopeShape<'a> {
         }
     }
 
+    /// Where a note is on the display, `time` seconds into it and released at `released`
+    /// seconds (if it has been): the fraction of the width and its level. A held note in the
+    /// sustain is at the sustain's start, and a released note runs through the release (from
+    /// its own level, which is below the drawn curve if it was released before the sustain).
+    /// `None` once the release is over.
+    fn locate(&self, time: f32, released: Option<f32>) -> Option<(f32, f32)> {
+        let envelope = self.envelope;
+        let (attack, decay) = (envelope.attack_time, envelope.decay_time);
+        let [decay_start, sustain_start, release_start] = self.boundaries;
+        match released {
+            None => {
+                let fraction = if time < attack {
+                    decay_start * time / attack
+                } else if time - attack < decay {
+                    decay_start + (sustain_start - decay_start) * (time - attack) / decay
+                } else {
+                    sustain_start
+                };
+                Some((fraction, envelope.sample_held(time)))
+            }
+            Some(released) => {
+                let since = time - released;
+                (since < envelope.release_time).then(|| {
+                    let fraction = release_start + self.release_width * since / envelope.release_time;
+                    (fraction, envelope.sample_released(released, time))
+                })
+            }
+        }
+    }
+
     /// The envelope's level at a fraction of the width, worked out by the synth's envelope.
     fn level(&self, fraction: f32) -> f32 {
         let envelope = self.envelope;
@@ -159,13 +205,14 @@ impl<'a> EnvelopeShape<'a> {
     }
 }
 
-/// An envelope's shape, see [`EnvelopeShape`].
-pub fn envelope(ui: &mut Ui, envelope: &AdsrEnvelope, color: Color32) {
+/// An envelope's shape, see [`EnvelopeShape`], with a dot for each note playing: its time into
+/// the note and the time it was released at (if it has been), in seconds.
+pub fn envelope(ui: &mut Ui, envelope: &AdsrEnvelope, color: Color32, notes: &[(f32, Option<f32>)]) {
     let (response, painter, rect) = frame(ui, ENVELOPE_HEIGHT);
     response.on_hover_text(
         "The envelope's shape: attack, decay, sustain (for as long as the note is held) and \
          release. The stages are drawn as wide as the square roots of their times, so that short \
-         ones stay visible next to long ones.",
+         ones stay visible next to long ones. The dots are the notes playing.",
     );
     let shape = EnvelopeShape::new(envelope);
     let bottom = rect.bottom();
@@ -183,6 +230,135 @@ pub fn envelope(ui: &mut Ui, envelope: &AdsrEnvelope, color: Color32) {
         .map(|fraction| Pos2::new(x_at(rect, fraction), bottom - shape.level(fraction) * rect.height()))
         .collect();
     curve(&painter, points, bottom, color, 1.5);
+    for &(time, released) in notes {
+        if let Some((fraction, level)) = shape.locate(time, released) {
+            live_dot(&painter, Pos2::new(x_at(rect, fraction), bottom - level * rect.height()));
+        }
+    }
+}
+
+/// The colour of an effect's display: dimmed while the effect is off.
+fn effect_color(on: bool) -> Color32 {
+    if on {
+        SIGNAL_COLOR
+    } else {
+        SIGNAL_COLOR.gamma_multiply(0.35)
+    }
+}
+
+/// The distortion's curve: the output level (up) for each input level (across), from -1 to 1,
+/// at the drive and mix, with the clean straight line for comparison.
+pub fn distortion(ui: &mut Ui, height: f32, drive_db: f32, mix: f32, on: bool) {
+    let (response, painter, rect) = frame(ui, height);
+    response.on_hover_text(
+        "The distortion's curve: the output level (up) for each input level (across), from -1 to \
+         1. The faint line is the clean sound.",
+    );
+    let centre = rect.center();
+    guide(&painter, Pos2::new(rect.left(), centre.y), Pos2::new(rect.right(), centre.y));
+    guide(&painter, Pos2::new(centre.x, rect.top()), Pos2::new(centre.x, rect.bottom()));
+    guide(&painter, rect.left_bottom(), rect.right_top());
+    let gain = 10.0_f32.powf(drive_db * 0.05);
+    let steps = (rect.width() as usize).max(2);
+    let points = (0..=steps)
+        .map(|step| {
+            let input = step as f32 / steps as f32 * 2.0 - 1.0;
+            let output = input + ((gain * input).tanh() - input) * mix;
+            Pos2::new(x_at(rect, step as f32 / steps as f32), centre.y - output * rect.height() / 2.0)
+        })
+        .collect();
+    painter.add(Shape::line(points, Stroke::new(1.5_f32, effect_color(on))));
+}
+
+/// One cycle of the chorus's sweep: how the delay of each channel's copy moves (left solid,
+/// right faint), at the depth.
+pub fn chorus(ui: &mut Ui, height: f32, depth: f32, on: bool) {
+    let (response, painter, rect) = frame(ui, height);
+    response.on_hover_text(
+        "One cycle of the chorus: how the delay of the left channel's copy (solid) and the \
+         right's (faint) sweeps, from 6 to 18 ms at full depth.",
+    );
+    let centre = rect.center().y;
+    guide(&painter, Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
+    let steps = (rect.width() as usize).max(2);
+    let sweep = |offset: f32| -> Vec<Pos2> {
+        (0..=steps)
+            .map(|step| {
+                let phase = step as f32 / steps as f32;
+                let value = depth * (std::f32::consts::TAU * (phase + offset)).sin();
+                Pos2::new(x_at(rect, phase), centre - value * rect.height() / 2.0)
+            })
+            .collect()
+    };
+    let color = effect_color(on);
+    painter.add(Shape::line(sweep(0.25), Stroke::new(1.0_f32, color.gamma_multiply(0.5))));
+    painter.add(Shape::line(sweep(0.0), Stroke::new(1.5_f32, color)));
+}
+
+/// The delay's echoes over the first seconds: a line for the sound itself and one for each
+/// echo, as high as its level. Ping-ponging, the left channel's go up and the right's down.
+pub fn delay(ui: &mut Ui, height: f32, time: f32, feedback: f32, mix: f32, ping_pong: bool, on: bool) {
+    let (response, painter, rect) = frame(ui, height);
+    // Long enough for a few echoes of the longest times
+    let span = (time * 6.0).max(1.0);
+    response.on_hover_text(format!(
+        "The sound (the first line) and its echoes over {span:.1} s, each as high as its level{}.",
+        if ping_pong { ", the left channel's up and the right's down" } else { "" }
+    ));
+    let color = effect_color(on);
+    let (top, bottom) = (rect.top(), rect.bottom());
+    let base = if ping_pong { rect.center().y } else { bottom };
+    let height = if ping_pong { rect.height() / 2.0 } else { rect.height() };
+    guide(&painter, Pos2::new(rect.left(), base), Pos2::new(rect.right(), base));
+    let tick = |painter: &Painter, at: f32, level: f32, up: bool, color: Color32| {
+        let x = x_at(rect, at / span);
+        let reach = level.clamp(0.0, 1.0) * height;
+        let end = if up { (base - reach).max(top) } else { (base + reach).min(bottom) };
+        painter.line_segment([Pos2::new(x, base), Pos2::new(x, end)], Stroke::new(2.0_f32, color));
+    };
+    tick(&painter, 0.0, 1.0 - mix, true, color.gamma_multiply(0.5));
+    let mut level = mix;
+    for echo in 1.. {
+        let at = echo as f32 * time;
+        if at > span || level < 1e-3 {
+            break;
+        }
+        tick(&painter, at, level, !ping_pong || echo % 2 == 1, color);
+        level *= feedback;
+    }
+}
+
+/// The reverb's decay after a short sound, in decibels from 0 at the top to -60 at the bottom:
+/// the lows (solid) and the highs (faint), which the damping makes die away sooner.
+pub fn reverb(ui: &mut Ui, height: f32, size: f32, damping: f32, on: bool) {
+    let (response, painter, rect) = frame(ui, height);
+    // Freeverb's loop gain for the lows (see `effects::Reverb`), and for the highs through the
+    // damping's lowpass at the Nyquist frequency, over the combs' average loop
+    let feedback = 0.7 + 0.28 * size;
+    let damp = 0.4 * damping;
+    let highs = feedback * (1.0 - damp) / (1.0 + damp);
+    let loop_seconds = 1366.0 / 44100.0;
+    let decay_time = |gain: f32| 3.0 * loop_seconds / -gain.log10();
+    let rt60 = decay_time(feedback);
+    let span = rt60.max(0.5) * 1.1;
+    response.on_hover_text(format!(
+        "How the reverb dies away after a short sound, over {span:.1} s, from 0 dB (top) to -60 dB \
+         (bottom): the lows (solid) take {rt60:.1} s, the highs (faint) {:.1} s.",
+        decay_time(highs)
+    ));
+    let color = effect_color(on);
+    let steps = (rect.width() as usize).max(2);
+    let curve_for = |gain: f32| -> Vec<Pos2> {
+        (0..=steps)
+            .map(|step| {
+                let t = step as f32 / steps as f32 * span;
+                let db = 20.0 * gain.log10() * t / loop_seconds;
+                Pos2::new(x_at(rect, step as f32 / steps as f32), rect.top() + (-db / 60.0).min(1.0) * rect.height())
+            })
+            .collect()
+    };
+    painter.add(Shape::line(curve_for(highs), Stroke::new(1.0_f32, color.gamma_multiply(0.5))));
+    painter.add(Shape::line(curve_for(feedback), Stroke::new(1.5_f32, color)));
 }
 
 /// What the filter display shows, and what it was measured for.
@@ -407,15 +583,16 @@ fn process_blocks(filters: &mut [FilterContainer], blocks: &mut [[f32; FilterRes
 
 /// The filter's frequency response, from 20 Hz to 20 kHz, with its cutoff marked, and the
 /// response at the peak of the filter envelope drawn more faintly when the envelope moves the
-/// cutoff.
-pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterResponse) {
+/// cutoff. `live_cutoff` is the newest note's cutoff, with its envelope and modulation.
+pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterResponse, live_cutoff: Option<f32>) {
     response.update(settings);
     let (hover, painter, rect) = frame(ui, FILTER_HEIGHT);
     hover.on_hover_text(
         "The filter's frequency response, from 20 Hz to 20 kHz (the line marks the cutoff), \
          measured from the filter itself with a quiet signal, so the drive's distortion doesn't \
          show. The fainter curve is the response at the peak of the filter envelope. With \
-         keytracking, the cutoff is for the note A4.",
+         keytracking, the cutoff is for the note A4. The dot is the newest note's cutoff, as \
+         its envelope, keytracking and modulation move it.",
     );
     let x_for = |hz: f32| x_at(rect, (hz / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln());
     let y_for = |db: f32| {
@@ -456,6 +633,14 @@ pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterRespon
         );
     }
     curve(&painter, points(&response.levels), rect.bottom(), SIGNAL_COLOR, 1.5);
+    if let Some(cutoff) = live_cutoff.filter(|_| !matches!(settings.model, FilterModel::None)) {
+        let x = x_for(cutoff.clamp(LOW_HZ, HIGH_HZ));
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0_f32, LIVE_COLOR.gamma_multiply(0.6)),
+        );
+        live_dot(&painter, Pos2::new(x, y_for(0.0)));
+    }
 }
 
 /// Sets the CPU to flush denormal results to zero while it exists, as audio threads run (nih-plug
@@ -647,7 +832,7 @@ mod tests {
         assert_eq!(sine.len(), WavePreview::LEN);
         assert!(sine[0].abs() < 1e-3 && (sine[WavePreview::LEN / 4].abs() - 1.0).abs() < 1e-3);
         // Halfway between two frames of the PW sweep is the average of the two
-        let sweep = previews.last().unwrap();
+        let sweep = &previews[crate::params::OscillatorWave::PwSweep.wavetable_index().unwrap()];
         let frames = sweep.frames.len();
         let position = 2.5 / (frames - 1) as f32;
         let mixed = sweep.cycle(position);

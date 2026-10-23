@@ -1,6 +1,7 @@
 use std::{
     convert::TryInto,
-    f32::consts::{FRAC_PI_4, PI, SQRT_2},
+    f32::consts::{PI, SQRT_2},
+    sync::Arc,
 };
 
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
@@ -254,10 +255,15 @@ pub struct OscillatorParams {
     pub voices_detune: f32,
     /// Amp to keep volume roughly equal across different voice counts
     pub unison_amp: f32,
+    /// Where the oscillator sits in the stereo field, from -1 (left) to 1 (right).
+    pub pan: f32,
     /// Left and right gain of each unison voice, zero for unused voices, see
     /// `update_pan_gains()`.
     pub pan_left: [f32x8; UNISON_VECTORS],
     pub pan_right: [f32x8; UNISON_VECTORS],
+    /// Each unison voice's place in the stereo spread, from -1 (left) to 1 (right), see
+    /// `update_pan_gains()`.
+    spread: [f32x8; UNISON_VECTORS],
     /// 1 for each unison voice in use and 0 for the rest, see `update_detune_factors()`.
     pub voice_mask: [f32x8; UNISON_VECTORS],
     /// Each unison voice's phase delta relative to the base delta, see `update_detune_factors()`.
@@ -344,26 +350,20 @@ impl OscillatorParams {
     pub fn clamp_wavetable(&mut self, set: &WavetableSet) {
         self.wavetable = self.wavetable.min(set.wavetables.len() - 1);
     }
-    /// Updates the left and right gain of each unison voice for the given stereo width, where 0
-    /// is mono and 1 spreads the voices across the whole stereo field.
+    /// Updates the left and right gain of each unison voice for the oscillator's pan and the
+    /// given stereo width, where 0 puts every voice where the pan says and 1 spreads the
+    /// voices across the stereo field (see [`pan_gains_for()`][Self::pan_gains_for()]).
     ///
     /// The voices are ordered by pitch and spread out from the centre, alternating sides as the
     /// pitch rises (the lowest voice is furthest left, the second lowest is on the right, ...),
     /// mirrored about the centre so that the highest voice is furthest right. Both sides thus get
-    /// an even mix of low and high voices, which keeps the bass end balanced. Gains follow a
-    /// constant power pan law scaled so that a centred voice has a gain of 1 on both channels.
-    /// That way a width of 0 is identical to a mono mix, and an oscillator with a single voice
-    /// always stays in the centre.
+    /// an even mix of low and high voices, which keeps the bass end balanced. An oscillator with
+    /// a single voice stays where its pan puts it.
     pub fn update_pan_gains(&mut self, stereo_width: f32) {
         let voice_count = self.unison_voices();
-        let mut left = [0.0_f32; MAX_UNISON];
-        let mut right = [0.0_f32; MAX_UNISON];
-
-        for (i, gains) in left.iter_mut().zip(right.iter_mut()).enumerate().take(voice_count) {
-            // Pan position between -1 (left) and 1 (right)
-            let pan = if voice_count == 1 {
-                0.0
-            } else {
+        let mut spread = [0.0_f32; MAX_UNISON];
+        if voice_count > 1 {
+            for (i, position) in spread.iter_mut().enumerate().take(voice_count) {
                 // The voice's rank when sorted by pitch (the detune indices are all distinct).
                 let detune = unison_detune_index(i);
                 let rank = (0..voice_count)
@@ -377,17 +377,35 @@ impl OscillatorParams {
                 if rank > mirrored_rank {
                     side = -side;
                 }
-
-                side * magnitude
-            };
-            let angle = (pan * stereo_width + 1.0) * FRAC_PI_4;
-            let (sin, cos) = angle.sin_cos();
-            *gains.0 = cos * SQRT_2;
-            *gains.1 = sin * SQRT_2;
+                *position = side * magnitude;
+            }
         }
-
-        self.pan_left = to_vectors(&left);
-        self.pan_right = to_vectors(&right);
+        self.spread = to_vectors(&spread);
+        (self.pan_left, self.pan_right) = self.pan_gains_for(self.pan, stereo_width);
+    }
+    /// The left and right gains of the unison voices (zero for the unused ones) with the
+    /// oscillator panned to `pan`, from -1 (left) to 1 (right), and spread by `stereo_width`.
+    /// The voices spread around the pan, by less the further it is to a side so that they stay
+    /// in the stereo field: fully panned, they are all on that side. The gains follow a
+    /// constant power pan law scaled so that a voice in the centre has a gain of 1 on both
+    /// channels, as in a mono mix. Needs the spread to be up to date (see
+    /// [`update_pan_gains()`][Self::update_pan_gains()]).
+    pub fn pan_gains_for(&self, pan: f32, stereo_width: f32) -> ([f32x8; UNISON_VECTORS], [f32x8; UNISON_VECTORS]) {
+        let pan = pan.clamp(-1.0, 1.0);
+        let width = f32x8::splat(stereo_width * (1.0 - pan.abs()));
+        let voices = self.unison_voices();
+        let mut left = [f32x8::ZERO; UNISON_VECTORS];
+        let mut right = [f32x8::ZERO; UNISON_VECTORS];
+        for vector in 0..UNISON_VECTORS {
+            let position = self.spread[vector] * width + f32x8::splat(pan);
+            // From 0 at the left to a quarter turn at the right, in cycles
+            let angle = (position + f32x8::splat(1.0)) * f32x8::splat(0.125);
+            let used = std::array::from_fn(|lane| if vector * UNISON_LANES + lane < voices { 1.0 } else { 0.0 });
+            let scale = f32x8::splat(SQRT_2) * f32x8::new(used);
+            left[vector] = fastmath::x8::cos_cycles(angle) * scale;
+            right[vector] = fastmath::x8::sin_cycles(angle) * scale;
+        }
+        (left, right)
     }
 }
 
@@ -409,8 +427,10 @@ impl Default for OscillatorParams {
             voice_count: 1,
             voices_detune: 0.21,
             unison_amp: 1.0,
+            pan: 0.0,
             pan_left: [f32x8::splat(1.0); UNISON_VECTORS],
             pan_right: [f32x8::splat(1.0); UNISON_VECTORS],
+            spread: [f32x8::ZERO; UNISON_VECTORS],
             voice_mask: [f32x8::splat(1.0); UNISON_VECTORS],
             detune_factors: [f32x8::splat(1.0); UNISON_VECTORS],
             wavetable: 0,
@@ -2265,13 +2285,19 @@ pub const WAVETABLE_MEMORY_BUDGET: usize = 24 << 20;
 
 /// Number of frames in the pulse width sweep wavetable.
 pub const PW_SWEEP_FRAMES: usize = 32;
+/// Number of single frame shapes, which the Basic Shapes wavetable has one frame of each of.
+pub const BASIC_SHAPES: usize = 9;
+/// The index of the Basic Shapes wavetable in the [`WavetableSet`]: after the single shapes and
+/// the pulse width sweep.
+pub const BASIC_SHAPES_WAVETABLE: usize = BASIC_SHAPES + 1;
 
 /// A wavetable in the wavetable synth sense: one or more frames (waveforms, each bandlimited per
 /// note) that an oscillator can morph between with its position control.
 pub struct WavetableFrames {
     /// Display name, which matches the oscillators' wave parameter for the built in ones.
     pub name: String,
-    pub frames: Vec<WavetableNotes>,
+    /// The frames' tables, which wavetables made of the same frames share.
+    pub frames: Vec<Arc<WavetableNotes>>,
     /// Which table of each frame a note reads.
     pub levels: NoteLevels,
 }
@@ -2302,11 +2328,23 @@ impl WavetableFrames {
             frames: spectra
                 .iter()
                 .map(|spectrum| {
-                    WavetableNotes::from_spectrum(spectrum, sample_rate, &levels, max_len, renderer)
+                    Arc::new(WavetableNotes::from_spectrum(spectrum, sample_rate, &levels, max_len, renderer))
                 })
                 .collect(),
             levels,
         }
+    }
+    /// A wavetable of the frames of single frame wavetables, one after the other, sharing their
+    /// tables. Only when they all read the same levels for each note, as a wavetable's frames
+    /// have to.
+    fn sharing_frames(name: impl Into<String>, singles: &[WavetableFrames]) -> Option<Self> {
+        let levels = singles.first()?.levels;
+        let fit = singles.iter().all(|single| single.frames.len() == 1 && single.levels == levels);
+        fit.then(|| Self {
+            name: name.into(),
+            frames: singles.iter().map(|single| single.frames[0].clone()).collect(),
+            levels,
+        })
     }
     /// Resolves a position (0 to 1) to the two frames to crossfade between and the mix amount
     /// between them.
@@ -2350,25 +2388,48 @@ impl WavetableSet {
     pub fn new(sample_rate: f32, max_len: usize) -> Self {
         // One renderer is shared by all tables; it caches an FFT plan per length.
         let mut renderer = CycleRenderer::new();
-        let wavetables = builtin_spectra()
-            .into_iter()
-            .map(|(name, spectra)| {
+        let mut wavetables: Vec<WavetableFrames> = Vec::new();
+        for (index, (name, spectra)) in builtin_spectra().into_iter().enumerate() {
+            // Basic Shapes is the single shapes one after the other, so it shares their tables
+            let shared = (index == BASIC_SHAPES_WAVETABLE)
+                .then(|| WavetableFrames::sharing_frames(name, &wavetables[..BASIC_SHAPES]))
+                .flatten();
+            wavetables.push(shared.unwrap_or_else(|| {
                 WavetableFrames::from_spectra(name, &spectra, sample_rate, max_len, &mut renderer)
-            })
-            .collect();
+            }));
+        }
         Self { wavetables }
     }
-    /// Total size of all wavetable sample data.
+    /// Total size of all wavetable sample data, counting shared frames once.
     #[allow(dead_code)] // used by the benchmarks
     pub fn memory_bytes(&self) -> usize {
-        self.wavetables.iter().map(WavetableFrames::memory_bytes).sum()
+        let mut seen = std::collections::HashSet::new();
+        self.wavetables
+            .iter()
+            .flat_map(|wavetable| &wavetable.frames)
+            .filter(|notes| seen.insert(Arc::as_ptr(notes)))
+            .flat_map(|notes| notes.tables.iter())
+            .map(|table| table.table.len() * std::mem::size_of::<f32>())
+            .sum()
     }
 }
 
 /// The spectra of the built in wavetables' frames, with their names, in the order of the
 /// oscillators' wave parameter.
 pub fn builtin_spectra() -> Vec<(&'static str, Vec<Spectrum>)> {
-    let single = |name, osc: AdditiveOsc| (name, vec![osc.spectrum()]);
+    // The single frame shapes, which are also the frames of Basic Shapes, in the same order
+    let shapes: [(&'static str, AdditiveOsc); BASIC_SHAPES] = [
+        ("Sine", AdditiveOsc::sine()),
+        ("Triangle", AdditiveOsc::triangle()),
+        ("Saw", AdditiveOsc::saw()),
+        ("Exponential", AdditiveOsc::fake_exp()),
+        ("Square", AdditiveOsc::square()),
+        ("Pulse 40%", AdditiveOsc::pulse(0.4)),
+        ("Pulse 30%", AdditiveOsc::pulse(0.3)),
+        ("Pulse 20%", AdditiveOsc::pulse(0.2)),
+        ("Pulse 10%", AdditiveOsc::pulse(0.1)),
+    ];
+    let shapes = shapes.map(|(name, osc)| (name, osc.spectrum()));
     // From a square wave down to a very narrow pulse
     let sweep = (0..PW_SWEEP_FRAMES)
         .map(|frame| {
@@ -2376,18 +2437,11 @@ pub fn builtin_spectra() -> Vec<(&'static str, Vec<Spectrum>)> {
             AdditiveOsc::<2048>::pulse(duty).spectrum()
         })
         .collect();
-    vec![
-        single("Sine", AdditiveOsc::sine()),
-        single("Triangle", AdditiveOsc::triangle()),
-        single("Saw", AdditiveOsc::saw()),
-        single("Exponential", AdditiveOsc::fake_exp()),
-        single("Square", AdditiveOsc::square()),
-        single("Pulse 40%", AdditiveOsc::pulse(0.4)),
-        single("Pulse 30%", AdditiveOsc::pulse(0.3)),
-        single("Pulse 20%", AdditiveOsc::pulse(0.2)),
-        single("Pulse 10%", AdditiveOsc::pulse(0.1)),
-        ("PW Sweep", sweep),
-    ]
+    let mut wavetables: Vec<(&'static str, Vec<Spectrum>)> =
+        shapes.iter().map(|(name, spectrum)| (*name, vec![spectrum.clone()])).collect();
+    wavetables.push(("PW Sweep", sweep));
+    wavetables.push(("Basic Shapes", shapes.into_iter().map(|(_, spectrum)| spectrum).collect()));
+    wavetables
 }
 
 /// Resolves a position (0 to 1) in a wavetable of `frames` frames to the two frames to crossfade
@@ -2691,9 +2745,46 @@ mod tests {
         assert!(WavetableNotes::frequency_to_note(415.0) == 68);
     }
 
-    /// Recovers the pan position (-1 to 1) of a voice from its gains at a stereo width of 1.
+    /// Recovers the pan position (-1 to 1) of a voice from its gains.
     fn pan_from_gains((left, right): (f32, f32)) -> f32 {
-        right.atan2(left) / FRAC_PI_4 - 1.0
+        right.atan2(left) / std::f32::consts::FRAC_PI_4 - 1.0
+    }
+
+    /// The pan moves the oscillator, its unison voices spread around it and stay within the
+    /// stereo field, and the gains keep a constant power.
+    #[test]
+    fn pan_moves_the_voices() {
+        let mut osc = OscillatorParams {
+            voice_count: 5,
+            ..Default::default()
+        };
+        // At no width the voices are all where the pan is
+        osc.pan = -0.5;
+        osc.update_pan_gains(0.0);
+        for i in 0..5 {
+            assert!((pan_from_gains(osc.pan_gain(i)) + 0.5).abs() < 1e-5, "{i}");
+        }
+        // Hard left at full width: all of them on the left
+        osc.pan = -1.0;
+        osc.update_pan_gains(1.0);
+        for i in 0..5 {
+            let (left, right) = osc.pan_gain(i);
+            assert!(right.abs() < 1e-6 && (left - SQRT_2).abs() < 1e-5, "{i}: {left} {right}");
+        }
+        // Half right at full width: spread half as far, around the pan
+        osc.pan = 0.5;
+        osc.update_pan_gains(1.0);
+        let pans: Vec<f32> = (0..5).map(|i| pan_from_gains(osc.pan_gain(i))).collect();
+        let (low, high) = pans.iter().fold((1.0_f32, -1.0_f32), |(low, high), pan| (low.min(*pan), high.max(*pan)));
+        assert!((low - 0.0).abs() < 1e-5 && (high - 1.0).abs() < 1e-5, "{pans:?}");
+        for i in 0..5 {
+            let (left, right) = osc.pan_gain(i);
+            assert!((left * left + right * right - 2.0).abs() < 1e-5, "{i}");
+        }
+        assert_eq!(osc.pan_gain(5), (0.0, 0.0));
+        // Modulated pans past the ends stay at the ends
+        let (left, right) = osc.pan_gains_for(3.0, 1.0);
+        assert!(left[0].as_array()[0].abs() < 1e-6 && (right[0].as_array()[0] - SQRT_2).abs() < 1e-5);
     }
 
     #[test]
@@ -3104,13 +3195,34 @@ mod tests {
         let set = WavetableSet::new(44100.0, 64);
         let single = &set.wavetables[0];
         assert_eq!(single.frame_indices(0.7), (0, 0, 0.0));
-        let sweep = set.wavetables.last().unwrap();
+        let sweep = set.wavetables.iter().find(|wavetable| wavetable.name == "PW Sweep").unwrap();
         assert_eq!(sweep.frames.len(), PW_SWEEP_FRAMES);
         assert_eq!(sweep.frame_indices(0.0), (0, 1, 0.0));
         let (a, b, mix) = sweep.frame_indices(0.5);
         assert_eq!((a, b), (15, 16));
         assert!((mix - 0.5).abs() < 1e-5);
         assert_eq!(sweep.frame_indices(1.0), (31, 31, 0.0));
+    }
+
+    /// Basic Shapes plays the single frame shapes, one frame each in order: its tables are
+    /// exactly theirs.
+    #[test]
+    fn basic_shapes_are_the_single_frame_shapes() {
+        let set = WavetableSet::new(44100.0, 256);
+        let shapes = set.wavetables.iter().find(|wavetable| wavetable.name == "Basic Shapes").unwrap();
+        assert_eq!(shapes.frames.len(), BASIC_SHAPES);
+        for (frame, single) in shapes.frames.iter().zip(&set.wavetables[..BASIC_SHAPES]) {
+            assert_eq!(single.frames.len(), 1, "{}", single.name);
+            for note in [0, 60, 100, 137] {
+                let level = shapes.levels.level(note);
+                assert_eq!(frame.tables[level].table, single.table(0, note).table, "{} note {note}", single.name);
+            }
+        }
+        // Halfway through the position is the fifth shape, the square
+        assert_eq!(shapes.frame_indices(0.5), (4, 5, 0.0));
+        // The tables are shared rather than generated again
+        assert!(shapes.frames.iter().zip(&set.wavetables[..BASIC_SHAPES]).all(|(frame, single)| Arc::ptr_eq(frame, &single.frames[0])));
+        assert_eq!(set.wavetables[BASIC_SHAPES_WAVETABLE].name, "Basic Shapes");
     }
 
     /// A cycle's spectrum renders the cycle back (minus its DC offset), at any length that holds

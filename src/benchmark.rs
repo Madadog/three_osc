@@ -53,6 +53,9 @@ struct Timing {
 fn render_time(notes: &[u8], setup: impl Fn(&mut ThreeOscPlugin)) -> Timing {
     let mut plugin = ThreeOscPlugin::default();
     plugin.apply_params();
+    // The patches are measured in mono (the stereo ones say so), as they always have been,
+    // although the default stereo width spreads unison voices out
+    plugin.synth.stereo_width = 0.0;
     setup(&mut plugin);
     for note in notes {
         plugin.synth.note_on(*note, 100);
@@ -135,6 +138,13 @@ fn benchmark_synth() {
     measure("default patch (1 saw, 8 notes)", |_| {});
     measure("default patch, no filter", |plugin| {
         plugin.synth.filter_controller.filter_model = FilterModel::None;
+    });
+    measure("default patch, all effects on", |plugin| {
+        let effects = &mut plugin.synth.effect_settings;
+        effects.distortion.enabled = true;
+        effects.chorus.enabled = true;
+        effects.delay.enabled = true;
+        effects.reverb.enabled = true;
     });
     measure("3 silent oscs (control rate + SVF only)", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(|osc| osc.amp = 0.0);
@@ -288,6 +298,36 @@ fn benchmark_modulation_rate() {
             sample.ns_per_sample / block.ns_per_sample,
             sample.realtime,
         );
+    }
+}
+
+/// Each effect on its own, on a stereo signal, in control rate blocks as the synth runs them.
+#[test]
+#[ignore]
+fn benchmark_effects() {
+    use crate::synth::effects::{EffectSettings, Effects};
+    let len = SAMPLE_RATE as usize * 2;
+    let signal: Vec<f32> = (0..len).map(|n| (n as f32 * 0.031).sin() * 0.6 + (n as f32 * 0.17).sin() * 0.3).collect();
+    type Enable = fn(&mut EffectSettings);
+    let cases: [(&str, Enable); 4] = [
+        ("distortion", |s| s.distortion.enabled = true),
+        ("chorus", |s| s.chorus.enabled = true),
+        ("delay", |s| s.delay.enabled = true),
+        ("reverb", |s| s.reverb.enabled = true),
+    ];
+    println!();
+    for (name, enable) in cases {
+        let mut settings = EffectSettings::default();
+        enable(&mut settings);
+        let mut effects = Effects::new(SAMPLE_RATE as f32);
+        let (mut left, mut right) = (signal.clone(), signal.clone());
+        let start = Instant::now();
+        for (left, right) in left.chunks_mut(32).zip(right.chunks_mut(32)) {
+            effects.process(&settings, left, right);
+        }
+        let elapsed = start.elapsed();
+        assert!(left.iter().all(|sample| sample.is_finite()));
+        println!("{name:<12} {:>6.1} ns/sample", elapsed.as_nanos() as f64 / len as f64);
     }
 }
 

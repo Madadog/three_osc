@@ -14,6 +14,7 @@ use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 
+use crate::synth::effects::{self, EffectSettings};
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
 use crate::synth::oscillator::{Interpolation, OscWave, WavePreview};
@@ -75,6 +76,10 @@ pub enum OscillatorWave {
     #[id = "pw_sweep"]
     #[name = "PW Sweep"]
     PwSweep,
+    /// The nine shapes above (sine to the 10% pulse), one frame each, in that order.
+    #[id = "basic_shapes"]
+    #[name = "Basic Shapes"]
+    BasicShapes,
     /// The wavetable loaded from the oscillator's file (see [`WavetableFile`]).
     #[id = "file"]
     #[name = "File"]
@@ -313,6 +318,10 @@ pub struct ThreeOscParams {
 
     #[nested(group = "Global")]
     pub global: GlobalParams,
+
+    /// The effects after the voices.
+    #[nested(group = "FX")]
+    pub fx: FxParams,
 }
 
 impl Default for ThreeOscParams {
@@ -340,6 +349,7 @@ impl Default for ThreeOscParams {
             mod_slots: std::array::from_fn(|_| ModSlotParams::new()),
 
             global: GlobalParams::new(),
+            fx: FxParams::new(),
         }
     }
 }
@@ -366,6 +376,9 @@ pub struct OscParams {
     /// Oscillator output volume, in percent.
     #[id = "amp"]
     pub amp: FloatParam,
+    /// Where the oscillator sits in the stereo field, from -1 (left) to 1 (right).
+    #[id = "pan"]
+    pub pan: FloatParam,
     /// Detune in semitones.
     #[id = "semitone"]
     pub semitone: FloatParam,
@@ -404,6 +417,9 @@ impl OscParams {
             )
             .with_unit(" %")
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            pan: FloatParam::new("Pan", 0.0, FloatRange::Linear { min: -1.0, max: 1.0 })
+                .with_value_to_string(formatters::v2s_f32_panning())
+                .with_string_to_value(formatters::s2v_f32_panning()),
             semitone: FloatParam::new(
                 "Detune",
                 0.0,
@@ -722,7 +738,8 @@ pub struct GlobalParams {
     /// Master output gain in dB.
     #[id = "output_gain"]
     pub output_gain: FloatParam,
-    /// How far unison voices are spread across the stereo field, 0 (mono) to 1.
+    /// How far unison voices are spread across the stereo field, 0 (all where their
+    /// oscillator's pan puts them) to 1.
     #[id = "stereo_width"]
     pub stereo_width: FloatParam,
     /// Global pitch offset in semitones.
@@ -782,7 +799,7 @@ impl GlobalParams {
             )
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
-            stereo_width: amount_param("Stereo Width", 0.0),
+            stereo_width: amount_param("Stereo Width", 1.0),
             global_pitch: IntParam::new("Output Pitch", 0, IntRange::Linear { min: -24, max: 24 })
                 .with_unit(" st"),
             bend_range: IntParam::new("Bend Range", 2, IntRange::Linear { min: -24, max: 24 })
@@ -797,6 +814,182 @@ impl Default for GlobalParams {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The effects after the voices, see [`crate::synth::effects`].
+#[derive(Params)]
+pub struct FxParams {
+    #[nested(id_prefix = "dist", group = "Distortion")]
+    pub distortion: DistortionParams,
+    #[nested(id_prefix = "chorus", group = "Chorus")]
+    pub chorus: ChorusParams,
+    #[nested(id_prefix = "delay", group = "Delay")]
+    pub delay: DelayParams,
+    #[nested(id_prefix = "reverb", group = "Reverb")]
+    pub reverb: ReverbParams,
+}
+
+impl FxParams {
+    pub fn new() -> Self {
+        let defaults = EffectSettings::default();
+        Self {
+            distortion: DistortionParams {
+                enabled: BoolParam::new("Distortion", defaults.distortion.enabled),
+                drive: FloatParam::new(
+                    "Drive",
+                    defaults.distortion.drive_db,
+                    FloatRange::Linear {
+                        min: 0.0,
+                        max: effects::DRIVE_MAX_DB,
+                    },
+                )
+                .with_unit(" dB")
+                .with_value_to_string(formatters::v2s_f32_rounded(1)),
+                mix: amount_param("Mix", defaults.distortion.mix),
+            },
+            chorus: ChorusParams {
+                enabled: BoolParam::new("Chorus", defaults.chorus.enabled),
+                rate: FloatParam::new(
+                    "Rate",
+                    defaults.chorus.rate,
+                    FloatRange::Skewed {
+                        min: effects::CHORUS_MIN_RATE,
+                        max: effects::CHORUS_MAX_RATE,
+                        factor: FloatRange::skew_factor(-1.5),
+                    },
+                )
+                .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
+                .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+                depth: amount_param("Depth", defaults.chorus.depth),
+                mix: amount_param("Mix", defaults.chorus.mix),
+            },
+            delay: DelayParams {
+                enabled: BoolParam::new("Delay", defaults.delay.enabled),
+                time: FloatParam::new(
+                    "Time",
+                    defaults.delay.time,
+                    FloatRange::Skewed {
+                        min: effects::DELAY_MIN_SECONDS,
+                        max: effects::DELAY_MAX_SECONDS,
+                        factor: FloatRange::skew_factor(-1.5),
+                    },
+                )
+                .with_value_to_string(v2s_seconds())
+                .with_string_to_value(s2v_seconds()),
+                feedback: FloatParam::new(
+                    "Feedback",
+                    defaults.delay.feedback,
+                    FloatRange::Linear {
+                        min: 0.0,
+                        max: effects::FEEDBACK_MAX,
+                    },
+                )
+                .with_unit(" %")
+                .with_value_to_string(formatters::v2s_f32_percentage(1))
+                .with_string_to_value(formatters::s2v_f32_percentage()),
+                mix: amount_param("Mix", defaults.delay.mix),
+                ping_pong: BoolParam::new("Ping-Pong", defaults.delay.ping_pong),
+            },
+            reverb: ReverbParams {
+                enabled: BoolParam::new("Reverb", defaults.reverb.enabled),
+                size: amount_param("Size", defaults.reverb.size),
+                damping: amount_param("Damping", defaults.reverb.damping),
+                mix: amount_param("Mix", defaults.reverb.mix),
+            },
+        }
+    }
+
+    /// The effects' settings, for the synth.
+    pub fn settings(&self) -> EffectSettings {
+        let (distortion, chorus, delay, reverb) = (&self.distortion, &self.chorus, &self.delay, &self.reverb);
+        EffectSettings {
+            distortion: effects::DistortionSettings {
+                enabled: distortion.enabled.value(),
+                drive_db: distortion.drive.value(),
+                mix: distortion.mix.value(),
+            },
+            chorus: effects::ChorusSettings {
+                enabled: chorus.enabled.value(),
+                rate: chorus.rate.value(),
+                depth: chorus.depth.value(),
+                mix: chorus.mix.value(),
+            },
+            delay: effects::DelaySettings {
+                enabled: delay.enabled.value(),
+                time: delay.time.value(),
+                feedback: delay.feedback.value(),
+                mix: delay.mix.value(),
+                ping_pong: delay.ping_pong.value(),
+            },
+            reverb: effects::ReverbSettings {
+                enabled: reverb.enabled.value(),
+                size: reverb.size.value(),
+                damping: reverb.damping.value(),
+                mix: reverb.mix.value(),
+            },
+        }
+    }
+}
+
+impl Default for FxParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Soft clipping, see [`effects::DistortionSettings`].
+#[derive(Params)]
+pub struct DistortionParams {
+    #[id = "on"]
+    pub enabled: BoolParam,
+    /// In decibels.
+    #[id = "drive"]
+    pub drive: FloatParam,
+    #[id = "mix"]
+    pub mix: FloatParam,
+}
+
+/// See [`effects::ChorusSettings`].
+#[derive(Params)]
+pub struct ChorusParams {
+    #[id = "on"]
+    pub enabled: BoolParam,
+    /// In Hz.
+    #[id = "rate"]
+    pub rate: FloatParam,
+    #[id = "depth"]
+    pub depth: FloatParam,
+    #[id = "mix"]
+    pub mix: FloatParam,
+}
+
+/// See [`effects::DelaySettings`].
+#[derive(Params)]
+pub struct DelayParams {
+    #[id = "on"]
+    pub enabled: BoolParam,
+    /// In seconds.
+    #[id = "time"]
+    pub time: FloatParam,
+    #[id = "feedback"]
+    pub feedback: FloatParam,
+    #[id = "mix"]
+    pub mix: FloatParam,
+    #[id = "ping_pong"]
+    pub ping_pong: BoolParam,
+}
+
+/// See [`effects::ReverbSettings`].
+#[derive(Params)]
+pub struct ReverbParams {
+    #[id = "on"]
+    pub enabled: BoolParam,
+    #[id = "size"]
+    pub size: FloatParam,
+    #[id = "damping"]
+    pub damping: FloatParam,
+    #[id = "mix"]
+    pub mix: FloatParam,
 }
 
 /// A linear `0.0..=1.0` parameter displayed as a percentage.

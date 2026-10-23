@@ -15,9 +15,9 @@ use wide::{f32x8, i32x8};
 use super::envelopes::AdsrEnvelope;
 use super::fastmath::{self, x8};
 use super::filter::{Filter, FilterContainer, FilterModel, SvfSimper};
-use super::modulation::{ModSource, ModTarget, Route, N_LFOS, N_SLOTS, N_SOURCES, N_TARGETS};
+use super::modulation::{ModSource, ModTarget, Route, Sources, N_LFOS, N_SLOTS, N_SOURCES, N_TARGETS};
 use super::oscillator::{frame_indices, WavetableNotes};
-use super::{Voice, VoiceContext, CONTROL_BLOCK_SAMPLES, FM_DEPTH, PM_DEPTH_CYCLES};
+use super::{modulated_pan_gains, Voice, VoiceContext, CONTROL_BLOCK_SAMPLES, FM_DEPTH, PM_DEPTH_CYCLES};
 
 /// Vectors of eight samples in a control rate block.
 const BLOCK_VECTORS: usize = CONTROL_BLOCK_SAMPLES / 8;
@@ -73,6 +73,11 @@ pub(super) struct SampleControls {
 }
 
 impl SampleControls {
+    /// Every source's value at sample `n` of the block just worked out.
+    pub fn sources_at(&self, n: usize) -> Sources {
+        std::array::from_fn(|source| sample(&self.sources[source], n))
+    }
+
     pub fn new() -> Self {
         Self {
             osc_delta: [[0.0; CONTROL_BLOCK_SAMPLES]; 3],
@@ -405,6 +410,7 @@ impl Voice {
 
         // The filter itself, set up for the block, and its coefficients for every sample
         let first_cutoff = first(cutoff[0]);
+        self.cutoff = if coefficients_vary { sample(&cutoff, last) } else { first_cutoff };
         let first_resonance = first(resonance[0]);
         let configure = |filter: &mut FilterContainer| {
             filter.set(
@@ -646,15 +652,23 @@ impl Voice {
             }
             samples.osc_varies[i] = changes;
 
-            // Unison detune, which only changes once per block: its first sample's
-            let detune_mod = routes
-                .get(ModTarget::osc_detune(i))
-                .iter()
-                .fold(0.0, |sum, route| sum + first(sources[route.source.to_index()][0]) * route.amount);
+            // Unison detune and pan, which only change once per block: their first sample's
+            let first_sample = |target: ModTarget| {
+                routes
+                    .get(target)
+                    .iter()
+                    .fold(0.0, |sum, route| sum + first(sources[route.source.to_index()][0]) * route.amount)
+            };
+            let detune_mod = first_sample(ModTarget::osc_detune(i));
             self.detune_modulated[i] = detune_mod != 0.0;
             if detune_mod != 0.0 {
                 self.detune_factors[i] =
                     osc.detune_factors_for((osc.voices_detune + detune_mod).clamp(0.0, 1.0));
+            }
+            let pan_gains = modulated_pan_gains(context, i, first_sample(ModTarget::osc_pan(i)));
+            self.pan_modulated[i] = pan_gains.is_some();
+            if let Some(gains) = pan_gains {
+                self.pan_gains[i] = gains;
             }
 
             // Modulation by the next oscillator (the amounts are squared for finer control at

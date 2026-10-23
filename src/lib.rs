@@ -23,6 +23,7 @@ use params::{
 };
 use synth::envelopes::AdsrEnvelope;
 use synth::modulation::{ModSource, ModTarget, Route};
+use synth::monitor::Monitor;
 use synth::oscillator::{OscillatorParams, WavetableFrames};
 use synth::wavetable_file::{self, LoadedSpectra};
 use synth::ThreeOsc;
@@ -35,6 +36,8 @@ pub struct ThreeOscPlugin {
     params: Arc<ThreeOscParams>,
     synth: ThreeOsc,
     loader: Loader,
+    /// What the GUI shows of the notes that are playing.
+    monitor: Arc<Monitor>,
 }
 
 /// Work the plugin does off the audio thread, see [`Plugin::task_executor()`].
@@ -90,6 +93,7 @@ impl Default for ThreeOscPlugin {
                 sample_rate: Arc::new(AtomicU32::new((DEFAULT_SAMPLE_RATE as f32).to_bits())),
                 spectra: [None, None, None],
             },
+            monitor: Arc::new(Monitor::default()),
         }
     }
 }
@@ -187,6 +191,7 @@ impl ThreeOscPlugin {
         // multiplies delta: smaller = higher pitch
         synth.octave_detune = 1.0 - global.octave_detune.value();
         synth.stereo_width = global.stereo_width.value();
+        synth.effect_settings = params.fx.settings();
         synth.interpolation = global.interpolation.value().to_interpolation();
         synth.modulation_rate = global.modulation_rate.value().to_modulation_rate();
 
@@ -320,6 +325,7 @@ fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch
     osc.wavetable = wave.wavetable_index().unwrap_or(0);
     osc.position = params.position.value();
     osc.amp = params.amp.value() / 100.0;
+    osc.pan = params.pan.value();
     osc.semitone = params.semitone.value() + global_pitch;
     osc.octave = params.octave.value();
     osc.pitch_multiplier = multiplier_to_pitch_multiplier(params.multiplier.value());
@@ -420,7 +426,12 @@ impl Plugin for ThreeOscPlugin {
     }
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone(), self.loader.sample_rate.clone(), async_executor)
+        editor::create(
+            self.params.clone(),
+            self.loader.sample_rate.clone(),
+            self.monitor.clone(),
+            async_executor,
+        )
     }
 
     fn initialize(
@@ -474,6 +485,9 @@ impl Plugin for ThreeOscPlugin {
             _ => return ProcessStatus::Error("expected a stereo output"),
         };
         self.render(std::iter::from_fn(|| context.next_event()), out_l, out_r);
+        if self.params.editor_state.is_open() {
+            self.synth.publish(&self.monitor);
+        }
 
         ProcessStatus::KeepAlive
     }
@@ -555,6 +569,10 @@ mod tests {
         assert_eq!(variants.last(), Some(&"File"));
         assert_eq!(OscillatorWave::File.wavetable_index(), None);
         assert_eq!(OscillatorWave::Saw.wavetable_index(), Some(2));
+        assert_eq!(
+            OscillatorWave::BasicShapes.wavetable_index(),
+            Some(synth::oscillator::BASIC_SHAPES_WAVETABLE)
+        );
     }
 
     /// Silent oscillators are skipped, unless they modulate an audible oscillator.
@@ -1106,6 +1124,107 @@ mod tests {
         let (left, right) = render_stereo(&mut plugin, 8, 1e-6);
         assert!(max_abs_diff(&left, &mono_left) < 1e-3);
         assert!(max_abs_diff(&right, &mono_right) < 1e-3);
+    }
+
+    /// The stereo width defaults to the widest, but the default patch (one voice per
+    /// oscillator, nothing panned) stays in the centre on the cheaper mono path: both channels
+    /// are the same to the bit.
+    #[test]
+    fn default_patch_stays_centred() {
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.apply_params();
+        assert_eq!(plugin.synth.stereo_width, 1.0);
+        plugin.synth.note_on(60, 100);
+        let mut left = vec![0.0; 2048];
+        let mut right = vec![0.0; 2048];
+        plugin.synth.run(&mut left, &mut right);
+        assert!(left.iter().any(|sample| sample.abs() > 0.01));
+        assert_eq!(left, right);
+    }
+
+    /// Renders a note with the first oscillator panned to `pan`, and its pan modulated by
+    /// `pan_mod` through a square LFO slow enough to stay high throughout.
+    fn render_panned(plugin: &mut ThreeOscPlugin, rate: synth::ModulationRate, pan: f32, pan_mod: Option<f32>) -> (Vec<f32>, Vec<f32>) {
+        plugin.synth.reset();
+        plugin.apply_params();
+        plugin.synth.modulation_rate = rate;
+        plugin.synth.routes.clear();
+        plugin.synth.oscillators[0].pan = pan;
+        plugin.synth.oscillators[0].phase_rand = 0.0;
+        if let Some(amount) = pan_mod {
+            plugin.synth.lfos[0].wave = synth::oscillator::OscWave::Square;
+            plugin.synth.lfos[0].freq = 0.01;
+            plugin.synth.routes.push(Route {
+                source: ModSource::Lfo1,
+                target: ModTarget::Osc1Pan,
+                amount,
+            });
+        }
+        plugin.synth.note_on(60, 100);
+        let mut left = vec![0.0; 2048];
+        let mut right = vec![0.0; 2048];
+        plugin.synth.run(&mut left, &mut right);
+        (left, right)
+    }
+
+    /// An oscillator's pan moves it between the channels, and so does modulating the pan, at
+    /// both modulation rates.
+    #[test]
+    fn pan_moves_oscillators() {
+        let mut plugin = ThreeOscPlugin::default();
+        let level = |samples: &[f32]| samples.iter().map(|sample| sample * sample).sum::<f32>().sqrt();
+        for rate in [synth::ModulationRate::Block, synth::ModulationRate::Sample] {
+            let (left, right) = render_panned(&mut plugin, rate, -1.0, None);
+            assert!(level(&left) > 1.0 && level(&right) < 1e-3 * level(&left), "{rate:?}");
+            // Halfway right: louder on the right, and still on the left
+            let (left, right) = render_panned(&mut plugin, rate, 0.5, None);
+            assert!(level(&right) > 1.5 * level(&left) && level(&left) > 0.1 * level(&right), "{rate:?}");
+            // Modulated from the centre all the way right
+            let (left, right) = render_panned(&mut plugin, rate, 0.0, Some(0.5));
+            assert!(level(&right) > 1.0 && level(&left) < 1e-3 * level(&right), "{rate:?}");
+        }
+    }
+
+    /// The effects process the synth's output when they are switched on: a reverb rings on
+    /// after the note has stopped. A route from a source that holds still (the mod wheel) that
+    /// turns its mix down to nothing gives exactly the dry output.
+    #[test]
+    fn effects_process_the_output() {
+        let mut plugin = ThreeOscPlugin::default();
+        let render = |plugin: &mut ThreeOscPlugin, rate: synth::ModulationRate, reverb: bool, routes: &[Route]| {
+            plugin.synth.reset();
+            plugin.apply_params();
+            plugin.synth.modulation_rate = rate;
+            plugin.synth.routes.clear();
+            plugin.synth.routes.extend_from_slice(routes);
+            plugin.synth.mod_wheel = 1.0;
+            plugin.synth.oscillators[0].phase_rand = 0.0;
+            plugin.synth.effect_settings.reverb.enabled = reverb;
+            plugin.synth.effect_settings.reverb.mix = 0.5;
+            plugin.synth.note_on(60, 100);
+            let mut left = vec![0.0; 8192];
+            let mut right = vec![0.0; 8192];
+            plugin.synth.run(&mut left[..2048], &mut right[..2048]);
+            plugin.synth.note_off(60, 0);
+            plugin.synth.run(&mut left[2048..], &mut right[2048..]);
+            (left, right)
+        };
+        let level = |samples: &[f32]| samples.iter().map(|sample| sample * sample).sum::<f32>().sqrt();
+        for rate in [synth::ModulationRate::Block, synth::ModulationRate::Sample] {
+            let (dry, _) = render(&mut plugin, rate, false, &[]);
+            let (wet, wet_right) = render(&mut plugin, rate, true, &[]);
+            // The dry note has finished well before the end; the reverb hasn't
+            assert!(level(&dry[6000..]) < 1e-6, "{rate:?}");
+            assert!(level(&wet[6000..]) > 1e-3, "{rate:?}");
+            assert!(max_abs_diff(&wet, &wet_right) > 1e-4, "{rate:?}");
+            let silenced = [Route {
+                source: ModSource::ModWheel,
+                target: ModTarget::ReverbMix,
+                amount: -1.0,
+            }];
+            let (modulated, _) = render(&mut plugin, rate, true, &silenced);
+            assert_eq!(modulated, dry, "{rate:?}");
+        }
     }
 
     /// Feeds a deterministic stream of random notes, note offs, chokes and pitch bends through
