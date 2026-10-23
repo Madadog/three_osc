@@ -131,6 +131,10 @@ const CUBIC: u8 = 2;
 /// a few voices that saves summing the lanes of a vector at every sample, and from about 8
 /// voices on the two cost the same.
 const TIMEWISE_VOICE_LIMIT: usize = 8;
+/// Blocks shorter than this always run their vectors across voices: across time they would
+/// leave most of a vector empty, and the time-wise kernels' setup is only worth it for longer
+/// blocks. Mostly for the single sample blocks of sample rate modulation.
+const TIMEWISE_MIN_BLOCK: usize = UNISON_LANES;
 
 /// Maximum number of unison voices per oscillator.
 pub const MAX_UNISON: usize = 32;
@@ -171,13 +175,24 @@ pub fn wrap_cycles_signed(phase: f32) -> f32 {
 /// A single instance of a playing oscillator (the LFO), with its phase in cycles.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OscVoice {
-    pub phase: f32,
+    /// In `[0, 1)`. Double precision, since a slow LFO updated at every sample advances by
+    /// steps too small for single precision to add up exactly: at 0.01 Hz it would run 3% fast.
+    pub phase: f64,
 }
 impl OscVoice {
-    /// Advances the phase by `delta` cycles and returns the new phase, wrapped to `[0, 1)`.
+    /// Advances the phase by `delta` cycles and returns the new phase, wrapped to `[0, 1]` (the
+    /// conversion to single precision can round up to 1).
     pub fn add_phase(&mut self, delta: f32) -> f32 {
-        self.phase = wrap_cycles_signed(self.phase + delta);
-        self.phase
+        let mut phase = self.phase + delta as f64;
+        // Usually the phase is still in its cycle (the comparisons are cheaper than wrapping)
+        if !(0.0..1.0).contains(&phase) {
+            phase -= (phase as i64) as f64;
+            if phase < 0.0 {
+                phase += 1.0;
+            }
+        }
+        self.phase = phase;
+        phase as f32
     }
 }
 
@@ -814,7 +829,7 @@ impl FramePair<'_> {
         output: &mut BlockOutput,
         simd: SimdLevel,
     ) {
-        if params.voices < TIMEWISE_VOICE_LIMIT {
+        if params.voices < TIMEWISE_VOICE_LIMIT && output.left.len() >= TIMEWISE_MIN_BLOCK {
             return match simd {
                 SimdLevel::Portable => {
                     lookup::portable::render_block_timewise::<INTERP>(self, voice, params, output)
@@ -970,12 +985,27 @@ mod lookup {
             ((c3 * t + c2) * t + c1) * t + y1
         }
 
-        /// [`cycles_to_fixed()`] for 8 lanes. Exact: the fraction of a cycle is converted in
-        /// two halves of 16 bits, each of which fits a float's mantissa.
+        /// The floor of 8 lanes below 2^31 in magnitude. On x86-64 without SSE4.1 (the
+        /// baseline the portable path is built for) `wide` calls the library's `floorf()` for
+        /// every lane, so the floor comes from the truncation there instead.
+        #[inline]
+        fn floor8(x: f32x8) -> f32x8 {
+            #[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.1")))]
+            {
+                let truncated = x.trunc_int().round_float();
+                truncated - (truncated.simd_gt(x) & f32x8::ONE)
+            }
+            #[cfg(not(all(target_arch = "x86_64", not(target_feature = "sse4.1"))))]
+            x.floor()
+        }
+
+        /// [`cycles_to_fixed()`] for 8 lanes below 2^31 cycles in magnitude. Exact: the
+        /// fraction of a cycle is converted in two halves of 16 bits, each of which fits a
+        /// float's mantissa.
         #[inline]
         pub fn cycles_to_fixed8(cycles: f32x8) -> u32x8 {
             let scale = f32x8::splat(65536.0);
-            let scaled = (cycles - cycles.floor()) * scale;
+            let scaled = (cycles - floor8(cycles)) * scale;
             let high = scaled.trunc_int();
             let low = ((scaled - high.round_float()) * scale).trunc_int();
             (cast::<i32x8, u32x8>(high) << 16) | cast::<i32x8, u32x8>(low)
@@ -1294,6 +1324,19 @@ mod lookup {
                 _mm256_permute2f128_ps::<0x20>(quads0123, quads4567),
                 _mm256_permute2f128_ps::<0x31>(quads0123, quads4567),
             )
+        }
+
+        /// The sum of a vector's lanes, added up in the same order as
+        /// [`horizontal_sums8()`] adds up each of its vectors.
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn horizontal_sum(vector: __m256) -> f32 {
+            let pairs = _mm256_hadd_ps(vector, vector);
+            let quads = _mm256_hadd_ps(pairs, pairs);
+            _mm_cvtss_f32(_mm_add_ss(
+                _mm256_castps256_ps128(quads),
+                _mm256_extractf128_ps::<1>(quads),
+            ))
         }
 
         /// Adds `values * gains` to `out` (at most 8 samples) sample by sample.
@@ -1714,6 +1757,9 @@ mod lookup {
             params: &BlockParams,
             output: &mut BlockOutput,
         ) {
+            if output.left.len() == 1 {
+                return render_sample::<GATHER, INTERP>(frames, voice, params, output);
+            }
             let table_a = Table::new(frames.a);
             let table_b = Table::new(frames.b);
             let vectors = params.voices.div_ceil(UNISON_LANES).min(UNISON_VECTORS);
@@ -1799,6 +1845,67 @@ mod lookup {
             }
             for (vector, phase) in phases.iter().enumerate() {
                 store_u32(&mut voice.voice_phases[vector], *phase);
+            }
+        }
+
+        /// [`render_block()`] for a block of one sample, as the modulation at the sample rate
+        /// renders them: without the groups of eight samples, whose setup and sums would cost
+        /// more than the sample itself. The voices are summed in the same order as in a
+        /// group, so the sample comes out exactly the same.
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn render_sample<const GATHER: bool, const INTERP: u8>(
+            frames: &FramePair,
+            voice: &mut SuperVoice,
+            params: &BlockParams,
+            output: &mut BlockOutput,
+        ) {
+            let table_a = Table::new(frames.a);
+            let table_b = Table::new(frames.b);
+            let vectors = params.voices.div_ceil(UNISON_LANES).min(UNISON_VECTORS);
+            let stereo = output.right.is_some();
+            let needs_mono = !stereo || output.mono.is_some();
+
+            let sample = Controls::new(params).next(0);
+            let delta = sample.fm_delta.unwrap_or(params.delta);
+            let offset = _mm256_set1_epi32(sample.phase_offset as i32);
+            let mut mono = _mm256_setzero_ps();
+            let mut left = _mm256_setzero_ps();
+            let mut right = _mm256_setzero_ps();
+            for vector in 0..vectors {
+                // Unused voices get a delta of zero, so they stay where they are
+                let factors = params.detune_factors[vector] * params.mask[vector];
+                let phases = _mm256_add_epi32(
+                    load_u32(&voice.voice_phases[vector]),
+                    voice_deltas(delta, &factors),
+                );
+                store_u32(&mut voice.voice_phases[vector], phases);
+                let samples = read_frames8::<GATHER, INTERP>(
+                    &table_a,
+                    &table_b,
+                    frames.mix,
+                    _mm256_add_epi32(phases, offset),
+                );
+                if needs_mono {
+                    mono = _mm256_fmadd_ps(samples, load(&params.mask[vector]), mono);
+                }
+                if stereo {
+                    left = _mm256_fmadd_ps(samples, load(&params.pan_left[vector]), left);
+                    right = _mm256_fmadd_ps(samples, load(&params.pan_right[vector]), right);
+                }
+            }
+
+            if let Some(right_out) = output.right.as_deref_mut() {
+                output.left[0] += horizontal_sum(left) * sample.gain;
+                right_out[0] += horizontal_sum(right) * sample.gain;
+            }
+            if needs_mono {
+                let mono = horizontal_sum(mono);
+                if !stereo {
+                    output.left[0] += mono * sample.gain;
+                }
+                if let Some((mono_out, scale)) = &mut output.mono {
+                    mono_out[0] = mono * *scale;
+                }
             }
         }
     }
@@ -2373,6 +2480,22 @@ impl<const N: usize> AdditiveOsc<N> {
 mod tests {
     use super::*;
 
+    /// A slow LFO updated at every sample advances its phase by steps far smaller than the
+    /// phase, which still add up to the right time.
+    #[test]
+    fn lfo_phase_keeps_time_in_tiny_steps() {
+        let mut lfo = OscVoice::default();
+        let delta = 0.01 / 44100.0;
+        let mut phase = 0.0;
+        // Half a cycle at 0.01 Hz
+        for _ in 0..44100 * 50 {
+            phase = lfo.add_phase(delta);
+        }
+        assert!((phase - 0.5).abs() < 1e-5, "{phase}");
+        // A step of more than a cycle (a fast LFO at the block rate) wraps too
+        assert!((lfo.add_phase(2.25) - 0.75).abs() < 1e-5);
+    }
+
     #[test]
     fn test_simple_sin() {
         let mut simple_sin = CoupledFormQuad::new(0.0, 1.0 / 100_000.0);
@@ -2565,6 +2688,10 @@ mod tests {
             }
             assert_eq!(got.to_vec(), want);
         }
+        // Whole numbers, negative zero and large values, for the portable floor
+        let values = [-0.0_f32, -1.0, -2.5e6, 3.0e7, 0.375, 1.5, -0.5, 2.0];
+        let want: Vec<u32> = values.iter().map(|v| cycles_to_fixed(*v)).collect();
+        assert_eq!(lookup::portable::cycles_to_fixed8(f32x8::new(values)).to_array().to_vec(), want);
     }
 
     /// A one voice at a time version of [`FramePair::render_block()`], for checking the

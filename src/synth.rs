@@ -32,11 +32,33 @@ use self::oscillator::WavetableSet;
 use self::oscillator::UNISON_VECTORS;
 
 /// Samples per control rate block. Envelopes, pitch, the LFOs, the modulation matrix,
-/// keytracking and the filter coefficients are only recalculated this often; gains and pitch are
-/// ramped linearly in between (and so are the SVF's coefficients). Smaller is more accurate,
-/// larger is cheaper. The trade-off mostly shows in fast envelopes, and in the LFOs, which can't
-/// go faster than half the control rate (a few hundred Hz).
+/// keytracking and the filter coefficients are only recalculated this often (unless the
+/// modulation runs at the sample rate, see [`ModulationRate`]); gains and pitch are ramped
+/// linearly in between (and so are the SVF's coefficients). Smaller is more accurate, larger is
+/// cheaper. The trade-off mostly shows in fast envelopes, and in the LFOs, which can't go faster
+/// than half the control rate (a few hundred Hz).
 pub const CONTROL_BLOCK_SAMPLES: usize = 32;
+
+/// How often the control rate state (see [`CONTROL_BLOCK_SAMPLES`]) is recalculated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModulationRate {
+    /// Once per block of [`CONTROL_BLOCK_SAMPLES`] samples, ramping in between.
+    #[default]
+    Block,
+    /// At every sample, for the fastest envelopes and LFOs. The synth then takes 5 to 20 times
+    /// the CPU, depending on the patch (see `benchmark_modulation_rate`).
+    Sample,
+}
+
+impl ModulationRate {
+    /// Samples per control rate block.
+    pub fn block_samples(self) -> usize {
+        match self {
+            ModulationRate::Block => CONTROL_BLOCK_SAMPLES,
+            ModulationRate::Sample => 1,
+        }
+    }
+}
 
 /// Phase modulation depth, in cycles per unit of modulator output (150 radians).
 const PM_DEPTH_CYCLES: f32 = 150.0 / (2.0 * PI);
@@ -77,6 +99,8 @@ pub struct ThreeOsc {
     pub simd: SimdLevel,
     /// How the wavetables are read in between their samples.
     pub interpolation: Interpolation,
+    /// How often the modulation and the rest of the control rate state are recalculated.
+    pub modulation_rate: ModulationRate,
     /// Draws each note's random modulation source.
     rng: fastrand::Rng,
 }
@@ -110,6 +134,7 @@ impl ThreeOsc {
             stereo_width: 0.0,
             simd: SimdLevel::detect(),
             interpolation: Interpolation::default(),
+            modulation_rate: ModulationRate::default(),
             rng: fastrand::Rng::new(),
         }
     }
@@ -252,6 +277,7 @@ impl ThreeOsc {
                 .iter()
                 .any(|route| route.source.to_index() == source)
         });
+        let control_block = self.modulation_rate.block_samples();
 
         VoiceContext {
             oscillators: &self.oscillators,
@@ -268,7 +294,8 @@ impl ThreeOsc {
             stereo,
             octave_detune: self.octave_detune,
             portamento_rate: self.portamento_rate,
-            portamento_block: (1.0 - self.portamento_rate).powi(CONTROL_BLOCK_SAMPLES as i32),
+            portamento_block: (1.0 - self.portamento_rate).powi(control_block as i32),
+            control_block,
             active,
             simd: self.simd,
             interpolation: self.interpolation,
@@ -305,7 +332,7 @@ impl ThreeOsc {
         let len = output_left.len().min(output_right.len());
         let mut start = 0;
         while start < len {
-            let end = (start + CONTROL_BLOCK_SAMPLES).min(len);
+            let end = (start + context.control_block).min(len);
             let block_len = end - start;
             for voice in voices.iter_mut() {
                 voice.update_controls(&context, block_len);
@@ -330,7 +357,8 @@ impl ThreeOsc {
             *out_r *= self.output_volume;
         }
     }
-    /// Runs only the control rate update of every voice for `blocks` blocks, for the benchmarks.
+    /// Runs only the control rate update of every voice for `blocks` blocks (of the modulation
+    /// rate's length), for the benchmarks.
     #[cfg(test)]
     pub(crate) fn run_control_updates_only(&mut self, blocks: usize) {
         self.release_voices();
@@ -345,7 +373,7 @@ impl ThreeOsc {
         let context = self.voice_context(stereo);
         for _ in 0..blocks {
             for voice in voices.iter_mut() {
-                voice.update_controls(&context, CONTROL_BLOCK_SAMPLES);
+                voice.update_controls(&context, context.control_block);
             }
         }
         self.voices = voices;
@@ -386,6 +414,8 @@ struct VoiceContext<'a> {
     portamento_rate: f32,
     /// The portamento rate applied over a whole control rate block.
     portamento_block: f32,
+    /// Samples per control rate block, see [`ModulationRate`].
+    control_block: usize,
     /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
     /// modulate anything are skipped.
     active: [bool; 3],
@@ -565,7 +595,7 @@ impl Voice {
         let first_block = block_start == 0;
 
         // Portamento, applied for the whole block at once
-        self.semitone_detune *= if block_len == CONTROL_BLOCK_SAMPLES {
+        self.semitone_detune *= if block_len == context.control_block {
             context.portamento_block
         } else {
             partial_block_portamento(context.portamento_rate, block_len)
@@ -573,10 +603,17 @@ impl Voice {
         self.pitch_multiply = context.octave_detune;
         let delta = self.delta(sample_rate);
 
-        // The envelopes, sampled at the end of the block, and the modulation matrix
+        // The envelopes, sampled at the end of the block, and the modulation matrix. The filter
+        // envelope is only needed when it moves the cutoff or a route uses it.
         let controller = context.filter_controller;
         let gain_level = self.envelope(context.gain_envelope, self.runtime, sample_rate);
-        let filter_level = self.envelope(&controller.cutoff_envelope, self.runtime, sample_rate);
+        let filter_level = if controller.envelope_amount != 0.0
+            || context.sources_used[ModSource::FilterEnv.to_index()]
+        {
+            self.envelope(&controller.cutoff_envelope, self.runtime, sample_rate)
+        } else {
+            0.0
+        };
         let sources = self.modulation_sources(context, block_len, gain_level, filter_level);
         let mods = apply_routes(context.routes, &sources);
         self.mods = mods;
@@ -585,9 +622,11 @@ impl Voice {
         let pitch_all = modulation(ModTarget::Pitch) * ModTarget::PITCH_SEMITONES
             + modulation(ModTarget::FinePitch) * ModTarget::FINE_PITCH_SEMITONES;
 
-        let keytrack_freq = fastmath::exp2(
-            (self.id as f32 - 69.0 + self.semitone_detune) / 12.0 * controller.keytrack,
-        );
+        let keytrack_freq = if controller.keytrack != 0.0 {
+            fastmath::exp2((self.id as f32 - 69.0 + self.semitone_detune) / 12.0 * controller.keytrack)
+        } else {
+            1.0
+        };
 
         for (i, osc) in context.oscillators.iter().enumerate() {
             if !context.active[i] {
@@ -705,15 +744,19 @@ impl Voice {
         let block_len = block_len.min(CONTROL_BLOCK_SAMPLES);
         let stereo = context.stereo;
         let oscillators = context.oscillators;
-        self.pre_filter[..block_len].fill(0.0);
+        // The whole buffers, which is no dearer than a block's worth and saves a call for
+        // short blocks
+        self.pre_filter = [0.0; CONTROL_BLOCK_SAMPLES];
         if stereo {
-            self.pre_filter_right[..block_len].fill(0.0);
+            self.pre_filter_right = [0.0; CONTROL_BLOCK_SAMPLES];
         }
 
         // The block of output of the oscillator after the current one (its modulator), and
-        // the current oscillator's output when the oscillator before it is modulated.
-        let mut modulator = [0.0_f32; CONTROL_BLOCK_SAMPLES];
-        let mut modulator_next = [0.0_f32; CONTROL_BLOCK_SAMPLES];
+        // the current oscillator's output when the oscillator before it is modulated. The two
+        // buffers take turns, by swapping the references to them.
+        let mut buffers = [[0.0_f32; CONTROL_BLOCK_SAMPLES]; 2];
+        let [modulator, modulator_next] = &mut buffers;
+        let (mut modulator, mut modulator_next) = (modulator, modulator_next);
         let mut have_modulator = false;
         for i in (0..3).rev() {
             let modulates_next = i > 0
@@ -827,13 +870,19 @@ impl Voice {
     }
 }
 
-/// The portamento over a block shorter than a control rate block (at the end of a buffer). Out
-/// of line, so that the compiler doesn't work it out for every block just in case.
+/// The portamento over a block shorter than a control rate block (at the end of a buffer, or
+/// before an event). Out of line, so that the compiler doesn't work it out for every block just
+/// in case.
 #[cold]
 #[inline(never)]
 fn partial_block_portamento(rate: f32, block_len: usize) -> f32 {
     (1.0 - rate).powi(block_len as i32)
 }
+
+/// Blocks shorter than this run the Digital filter one voice at a time rather than in lockstep.
+/// The ladder's one voice path is so much slower than its lockstep kernel that the ladder stays
+/// in lockstep even for a single sample.
+const SVF_LOCKSTEP_MIN_BLOCK: usize = 4;
 
 /// Runs every voice's filter over the current block. The Digital (SVF) and Ladder filters are
 /// processed several voices at a time, in lockstep.
@@ -842,7 +891,9 @@ fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: Sim
     // use the same filter model and the first voice's picks the lockstep kernel. Any voice that
     // doesn't match it is filtered one sample at a time.
     match voices.first().map(|voice| &voice.filter) {
-        Some(FilterContainer::SvfSimperFilter(_)) => {
+        // Too short a block to be worth moving into lockstep (a single sample, when the
+        // modulation runs at the sample rate): one voice at a time gives the same output.
+        Some(FilterContainer::SvfSimperFilter(_)) if block_len >= SVF_LOCKSTEP_MIN_BLOCK => {
             for chunk in voices.chunks_mut(SVF_LANES) {
                 filter_chunk_lockstep::<SvfSimper, SVF_LANES>(
                     chunk,

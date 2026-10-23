@@ -723,6 +723,16 @@ fn global(ui: &mut Ui, title: &str, global: &GlobalParams, matrix: &Matrix, sett
              samples, which is clearly audible on all but the lowest notes.",
             setter,
         );
+        combo(
+            ui,
+            &global.modulation_rate,
+            "How often the envelopes, LFOs, modulation routes, pitch and filter settings are \
+             worked out. Block works them out every 32 samples and glides gains, pitch and the \
+             Digital filter in between, which is plenty for most sounds. Sample works them out at \
+             every sample, for the snappiest envelopes and LFOs fast enough to be heard as \
+             tones, but takes 5 to 20 times the CPU, depending on the patch.",
+            setter,
+        );
     });
 }
 

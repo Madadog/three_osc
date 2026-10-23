@@ -17,7 +17,7 @@ use nih_plug_egui::EguiState;
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
 use crate::synth::oscillator::{Interpolation, OscWave, WavePreview};
-use crate::synth::Polyphony;
+use crate::synth::{ModulationRate, Polyphony};
 
 /// Waveforms available to the LFO.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +219,26 @@ impl InterpolationParam {
             InterpolationParam::None => Interpolation::None,
             InterpolationParam::Linear => Interpolation::Linear,
             InterpolationParam::Cubic => Interpolation::Cubic,
+        }
+    }
+}
+
+/// How often the modulation is recalculated, see [`ModulationRate`].
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModulationRateParam {
+    #[id = "block"]
+    #[name = "Block"]
+    Block,
+    #[id = "sample"]
+    #[name = "Sample"]
+    Sample,
+}
+
+impl ModulationRateParam {
+    pub fn to_modulation_rate(self) -> ModulationRate {
+        match self {
+            ModulationRateParam::Block => ModulationRate::Block,
+            ModulationRateParam::Sample => ModulationRate::Sample,
         }
     }
 }
@@ -714,6 +734,10 @@ pub struct GlobalParams {
     /// How the oscillators read their wavetables in between samples.
     #[id = "interpolation"]
     pub interpolation: EnumParam<InterpolationParam>,
+    /// Whether the envelopes, LFOs and modulation are recalculated per control rate block or
+    /// at every sample.
+    #[id = "mod_rate"]
+    pub modulation_rate: EnumParam<ModulationRateParam>,
 }
 
 impl GlobalParams {
@@ -764,6 +788,7 @@ impl GlobalParams {
             bend_range: IntParam::new("Bend Range", 2, IntRange::Linear { min: -24, max: 24 })
                 .with_unit(" st"),
             interpolation: EnumParam::new("Interpolation", InterpolationParam::Cubic),
+            modulation_rate: EnumParam::new("Modulation Rate", ModulationRateParam::Block),
         }
     }
 }

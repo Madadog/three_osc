@@ -15,7 +15,7 @@ use crate::synth::oscillator::{
     BlockOutput, BlockParams, FramePair, Interpolation, OscillatorParams, SimdLevel, SuperVoice,
     Wavetable, WavetableSet,
 };
-use crate::synth::ThreeOsc;
+use crate::synth::{ModulationRate, ThreeOsc};
 use crate::ThreeOscPlugin;
 
 const SAMPLE_RATE: f64 = 44100.0;
@@ -31,6 +31,26 @@ fn measure(name: &str, setup: impl Fn(&mut ThreeOscPlugin)) {
 
 /// Like [`measure()`], holding down the given notes instead of the usual chord.
 fn measure_notes(name: &str, notes: &[u8], setup: impl Fn(&mut ThreeOscPlugin)) {
+    let timing = render_time(notes, setup);
+    println!(
+        "{name:<34} {:>8.1} ns/sample {:>6.1} ns/sample/unison voice {:>7.1}x realtime",
+        timing.ns_per_sample,
+        timing.ns_per_sample / timing.unison_voices as f64,
+        timing.realtime,
+    );
+}
+
+/// How long a patch takes to render, see [`render_time()`].
+struct Timing {
+    ns_per_sample: f64,
+    /// The number of unison voices rendered per sample, across all notes and oscillators.
+    unison_voices: usize,
+    /// How many times faster than real time the patch renders.
+    realtime: f64,
+}
+
+/// Renders `SECONDS` of audio with the given patch and notes, and times it.
+fn render_time(notes: &[u8], setup: impl Fn(&mut ThreeOscPlugin)) -> Timing {
     let mut plugin = ThreeOscPlugin::default();
     plugin.apply_params();
     setup(&mut plugin);
@@ -61,13 +81,12 @@ fn measure_notes(name: &str, notes: &[u8], setup: impl Fn(&mut ThreeOscPlugin)) 
     let elapsed = start.elapsed();
 
     let samples = blocks * BLOCK_SIZE;
-    let ns_per_sample = elapsed.as_nanos() as f64 / samples as f64;
-    let realtime = (samples as f64 / SAMPLE_RATE) / elapsed.as_secs_f64();
-    println!(
-        "{name:<34} {ns_per_sample:>8.1} ns/sample {:>6.1} ns/sample/unison voice {realtime:>7.1}x realtime",
-        ns_per_sample / unison_voices as f64,
-    );
     assert!(left.iter().all(|sample| sample.is_finite()));
+    Timing {
+        ns_per_sample: elapsed.as_nanos() as f64 / samples as f64,
+        unison_voices,
+        realtime: (samples as f64 / SAMPLE_RATE) / elapsed.as_secs_f64(),
+    }
 }
 
 /// Three audible saw oscillators with 8 unison voices each.
@@ -91,6 +110,22 @@ fn select_pulse(osc: &mut OscillatorParams) {
 fn select_sweep(osc: &mut OscillatorParams) {
     osc.wavetable = OscillatorWave::PwSweep.wavetable_index().unwrap();
     osc.position = 0.37;
+}
+
+/// Two LFOs, an envelope and velocity modulating pitch, cutoff, position and amplitude.
+fn four_routes(plugin: &mut ThreeOscPlugin) {
+    use crate::synth::modulation::{ModSource, ModTarget, Route};
+    let route = |source, target, amount| Route {
+        source,
+        target,
+        amount,
+    };
+    plugin.synth.routes.extend_from_slice(&[
+        route(ModSource::Lfo1, ModTarget::FinePitch, 0.2),
+        route(ModSource::Env1, ModTarget::Cutoff, 0.6),
+        route(ModSource::Lfo2, ModTarget::Osc1Position, 0.5),
+        route(ModSource::Velocity, ModTarget::Osc1Amp, -0.3),
+    ]);
 }
 
 #[test]
@@ -167,20 +202,7 @@ fn benchmark_synth() {
     measure("default patch, ladder filter", |plugin| {
         plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
     });
-    measure("default patch, 4 modulation routes", |plugin| {
-        use crate::synth::modulation::{ModSource, ModTarget, Route};
-        let route = |source, target, amount| Route {
-            source,
-            target,
-            amount,
-        };
-        plugin.synth.routes.extend_from_slice(&[
-            route(ModSource::Lfo1, ModTarget::FinePitch, 0.2),
-            route(ModSource::Env1, ModTarget::Cutoff, 0.6),
-            route(ModSource::Lfo2, ModTarget::Osc1Position, 0.5),
-            route(ModSource::Velocity, ModTarget::Osc1Amp, -0.3),
-        ]);
-    });
+    measure("default patch, 4 modulation routes", four_routes);
     measure("3 x saw, unison 8, PM + FM", |plugin| {
         plugin.synth.oscillators.iter_mut().for_each(|osc| {
             supersaw(osc);
@@ -191,31 +213,78 @@ fn benchmark_synth() {
 }
 
 /// The control rate update on its own: pitch, envelopes, LFO and filter coefficients for 8
-/// voices, per block of `CONTROL_BLOCK_SAMPLES` samples.
+/// voices, per block of `CONTROL_BLOCK_SAMPLES` samples, and at every sample.
 #[test]
 #[ignore]
 fn benchmark_control_rate() {
-    use crate::synth::CONTROL_BLOCK_SAMPLES;
-    for (name, model) in [
-        ("digital filter", FilterModel::SvfSimperFilter),
-        ("ladder filter", FilterModel::LadderFilter),
-        ("no filter", FilterModel::None),
-    ] {
-        let mut plugin = ThreeOscPlugin::default();
-        plugin.apply_params();
-        plugin.synth.filter_controller.filter_model = model;
-        for note in CHORD {
-            plugin.synth.note_on(note, 100);
+    for rate in [ModulationRate::Block, ModulationRate::Sample] {
+        for (name, model) in [
+            ("digital filter", FilterModel::SvfSimperFilter),
+            ("ladder filter", FilterModel::LadderFilter),
+            ("no filter", FilterModel::None),
+        ] {
+            let mut plugin = ThreeOscPlugin::default();
+            plugin.apply_params();
+            plugin.synth.filter_controller.filter_model = model;
+            plugin.synth.modulation_rate = rate;
+            for note in CHORD {
+                plugin.synth.note_on(note, 100);
+            }
+            plugin.synth.run_control_updates_only(100);
+            let updates = 20_000;
+            let start = Instant::now();
+            plugin.synth.run_control_updates_only(updates);
+            let elapsed = start.elapsed();
+            let per_voice_update = elapsed.as_nanos() as f64 / (updates * CHORD.len()) as f64;
+            println!(
+                "control update, {rate:?} rate, {name:<16} {per_voice_update:>7.1} ns per voice per update ({:.1} ns/sample for 8 notes)",
+                per_voice_update * CHORD.len() as f64 / rate.block_samples() as f64
+            );
         }
-        plugin.synth.run_control_updates_only(100);
-        let blocks = 20_000;
-        let start = Instant::now();
-        plugin.synth.run_control_updates_only(blocks);
-        let elapsed = start.elapsed();
-        let per_voice_block = elapsed.as_nanos() as f64 / (blocks * CHORD.len()) as f64;
+    }
+}
+
+/// Both modulation rates on a few patches: the block rate, and the sample rate with how many
+/// times more that costs.
+#[test]
+#[ignore]
+fn benchmark_modulation_rate() {
+    type Setup = fn(&mut ThreeOscPlugin);
+    let patches: [(&str, Setup); 7] = [
+        ("default patch (1 saw, 8 notes)", |_| {}),
+        ("default patch, no filter", |plugin| {
+            plugin.synth.filter_controller.filter_model = FilterModel::None;
+        }),
+        ("default patch, ladder filter", |plugin| {
+            plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
+        }),
+        ("default patch, 4 modulation routes", four_routes),
+        ("3 x saw, unison 8", |plugin| plugin.synth.oscillators.iter_mut().for_each(supersaw)),
+        ("3 x saw, unison 8, ladder filter", |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
+        }),
+        ("3 x saw, unison 8, 4 modulation routes", |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            four_routes(plugin);
+        }),
+    ];
+    println!();
+    for (name, setup) in patches {
+        let time = |rate: ModulationRate| {
+            render_time(&CHORD, |plugin| {
+                setup(plugin);
+                plugin.synth.modulation_rate = rate;
+            })
+        };
+        let block = time(ModulationRate::Block);
+        let sample = time(ModulationRate::Sample);
         println!(
-            "control rate update, {name:<16} {per_voice_block:>7.1} ns per voice per block ({:.1} ns/sample for 8 notes)",
-            per_voice_block * CHORD.len() as f64 / CONTROL_BLOCK_SAMPLES as f64
+            "{name:<40} {:>7.1} ns/sample block rate {:>7.1} ns/sample sample rate ({:.1}x, {:.0}x realtime)",
+            block.ns_per_sample,
+            sample.ns_per_sample,
+            sample.ns_per_sample / block.ns_per_sample,
+            sample.realtime,
         );
     }
 }

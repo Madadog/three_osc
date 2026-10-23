@@ -188,6 +188,7 @@ impl ThreeOscPlugin {
         synth.octave_detune = 1.0 - global.octave_detune.value();
         synth.stereo_width = global.stereo_width.value();
         synth.interpolation = global.interpolation.value().to_interpolation();
+        synth.modulation_rate = global.modulation_rate.value().to_modulation_rate();
 
         // Master gain envelope
         apply_envelope_params(&mut synth.gain_envelope, &params.vol_env);
@@ -901,6 +902,71 @@ mod tests {
         assert!(ids.contains(&String::from("env_attack_2")));
     }
 
+    /// Renders a note whose pitch and cutoff are modulated by LFOs (one of them faster than
+    /// half the block rate's control rate), with a short attack and a pitch slide, at the given
+    /// modulation rate and in buffers of `buffer_len` samples.
+    fn render_fast_modulation(
+        plugin: &mut ThreeOscPlugin,
+        rate: synth::ModulationRate,
+        buffer_len: usize,
+    ) -> Vec<f32> {
+        plugin.synth.reset();
+        plugin.apply_params();
+        plugin.synth.modulation_rate = rate;
+        plugin.synth.routes.clear();
+        plugin.synth.routes.extend_from_slice(&[
+            Route {
+                source: ModSource::Lfo1,
+                target: ModTarget::Pitch,
+                amount: 0.1,
+            },
+            Route {
+                source: ModSource::Lfo2,
+                target: ModTarget::Cutoff,
+                amount: 0.3,
+            },
+        ]);
+        plugin.synth.lfos[0].freq = 900.0;
+        plugin.synth.lfos[1].freq = 30.0;
+        plugin.synth.gain_envelope.attack_time = 0.002;
+        plugin.synth.portamento_offset = 12.0;
+        plugin.synth.filter_controller.filter_model = synth::filter::FilterModel::SvfSimperFilter;
+        for osc in plugin.synth.oscillators.iter_mut() {
+            osc.phase_rand = 0.0;
+        }
+        plugin.synth.note_on(60, 100);
+
+        let mut left = vec![0.0; 2048];
+        let mut right = vec![0.0; 2048];
+        for (left, right) in left.chunks_mut(buffer_len).zip(right.chunks_mut(buffer_len)) {
+            plugin.synth.run(left, right);
+        }
+        assert!(left.iter().all(|sample| sample.is_finite()), "{rate:?}");
+        left
+    }
+
+    /// At the sample rate, the modulation is worked out afresh for every sample: exactly what
+    /// the block rate does when the buffers are a sample long. That is audibly different from
+    /// the block rate for fast modulation.
+    #[test]
+    fn sample_rate_modulation_updates_every_sample() {
+        use synth::ModulationRate;
+
+        let mut plugin = ThreeOscPlugin::default();
+        assert_eq!(
+            plugin.params.global.modulation_rate.value().to_modulation_rate(),
+            ModulationRate::Block
+        );
+        let sample_rate = render_fast_modulation(&mut plugin, ModulationRate::Sample, 2048);
+        let one_at_a_time = render_fast_modulation(&mut plugin, ModulationRate::Block, 1);
+        assert_eq!(sample_rate, one_at_a_time);
+        let block_rate = render_fast_modulation(&mut plugin, ModulationRate::Block, 2048);
+        assert!(max_abs_diff(&sample_rate, &block_rate) > 1e-2);
+        // Buffer sizes still don't matter at the sample rate
+        let odd_buffers = render_fast_modulation(&mut plugin, ModulationRate::Sample, 37);
+        assert_eq!(sample_rate, odd_buffers);
+    }
+
     /// Renders one note with the default patch, the given number of unison voices on every
     /// oscillator, and the given stereo width.
     fn render_stereo(plugin: &mut ThreeOscPlugin, voices: u8, width: f32) -> (Vec<f32>, Vec<f32>) {
@@ -971,6 +1037,12 @@ mod tests {
                 1 => synth::filter::FilterModel::RcFilter,
                 2 => synth::filter::FilterModel::LadderFilter,
                 _ => synth::filter::FilterModel::SvfSimperFilter,
+            };
+            // Now and then a block at the sample rate, which is much slower
+            plugin.synth.modulation_rate = if rng.usize(0..8) == 0 {
+                synth::ModulationRate::Sample
+            } else {
+                synth::ModulationRate::Block
             };
             let mut events = Vec::new();
             for _ in 0..rng.usize(0..8) {

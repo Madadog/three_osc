@@ -19,7 +19,7 @@ Currently a work in progress, but usable nevertheless.
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic, linear or no interpolation (a global control, for trading quality against CPU)
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control that spreads the voices across the stereo field
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
-* A modulation matrix: three LFOs, two spare envelopes, the volume and filter envelopes, velocity, key position, mod wheel, aftertouch and a per-note random value can each modulate pitch, wavetable position, amplitude, unison detune, PM/FM/AM amounts, filter cutoff, resonance and drive, note volume and the LFO rates, through 16 routes. Drag a source's handle onto a slider in the GUI to route it.
+* A modulation matrix: three LFOs, two spare envelopes, the volume and filter envelopes, velocity, key position, mod wheel, aftertouch and a per-note random value can each modulate pitch, wavetable position, amplitude, unison detune, PM/FM/AM amounts, filter cutoff, resonance and drive, note volume and the LFO rates, through 16 routes. Drag a source's handle onto a slider in the GUI to route it. Modulation is worked out every 32 samples, or at every sample with the Modulation Rate control.
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
 * MIDI pitch bend with an adjustable range
 * A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page, and displays of each oscillator's wave, the LFOs, the envelopes and the filter's frequency response. Hover a control's label (or a display) for a description of what it does.
@@ -52,7 +52,7 @@ cargo run --release --features standalone -- --help
 ```
 
 ### Benchmarks
-Rough throughput numbers for the synth engine (time per sample for a few patches, and wavetable generation time and memory):
+Rough throughput numbers for the synth engine (time per sample for a few patches, at both modulation rates, and wavetable generation time and memory):
 
 ```shell
 cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
@@ -74,7 +74,23 @@ Each note's table is only as long as its harmonics need (a power of two of at le
 The displays are drawn with the synth's own code, so they show what is played. An oscillator's display is one cycle of its wavetable at the current position (rendered from the same spectra as the tables it plays, loaded files included), with a line where the wave starts when Phase Rand is below 100%; it is dimmed while the oscillator's amplitude is 0. The LFO displays show one cycle. The envelope displays draw attack, decay, a stretch of sustain and release, each stage as wide as the square root of its time, so that a 2 ms attack is still visible next to a 2 second release. The filter display is the frequency response from 20 Hz to 20 kHz, measured by running an impulse through the filter model itself at the host's sample rate (a quiet one, so the nonlinear models show their small-signal response; the drive's distortion doesn't show), with the response at the peak of the filter envelope drawn more faintly.
 
 ### Control rate
-Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate. Change the constant to try other sizes.
+Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate (689 Hz at 44.1 kHz). Change the constant to try other sizes.
+
+The global Modulation Rate control switches between that (Block, the default) and recalculating everything at every sample (Sample), where a 2 ms attack follows its curve rather than a few straight lines and an LFO can run at audio rates. The whole control update then runs for every sample of every voice, and the oscillators, filters and mixing handle a sample at a time (with single sample paths in the oscillator kernels, and the Digital filter running one voice at a time, which beats transposing a single sample into lockstep). The LFOs keep their phase in double precision, since at the sample rate a slow LFO's steps are too small for single precision to add up: a 0.01 Hz LFO would run 3% fast.
+
+The cost, from `benchmark_modulation_rate` (8 notes at 44.1 kHz on a 2.1 GHz Xeon, time per sample of output):
+
+| Patch | Block | Sample | |
+|---|---|---|---|
+| Default (1 saw, Digital filter) | 50 ns | 990 ns | 20x |
+| Default, no filter | 40 ns | 830 ns | 21x |
+| Default, Ladder filter | 170 ns | 1360 ns | 8x |
+| Default, 4 modulation routes | 58 ns | 1240 ns | 21x |
+| 3 x saw, unison 8 | 300 ns | 1880 ns | 6x |
+| 3 x saw, unison 8, Ladder filter | 410 ns | 2290 ns | 6x |
+| 3 x saw, unison 8, 4 modulation routes | 310 ns | 2350 ns | 8x |
+
+The control update takes around 900 instructions per voice, while the block rate gets a voice's sample of the default patch out in about 75 all told, so the sample rate costs the most, relatively, on the cheapest patches. Eight notes of the supersaw take 8% of a core at the sample rate rather than 1.3%. Making it much cheaper would take vectorising the control update across voices or samples, and kernels that take a value per sample for pitch, gains, wavetable position and filter coefficients instead of ramps.
 
 The control rate code uses polynomial approximations of `2^x`, `log2`, `x^y`, `sin` and `tan` (in `src/synth/fastmath.rs`), accurate to around single precision, instead of the standard library's functions, which cost more than rendering the block's samples.
 
