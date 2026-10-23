@@ -213,10 +213,12 @@ fn benchmark_synth() {
 }
 
 /// The control rate update on its own: pitch, envelopes, LFO and filter coefficients for 8
-/// voices, per block of `CONTROL_BLOCK_SAMPLES` samples, and at every sample.
+/// voices, per block of `CONTROL_BLOCK_SAMPLES` samples, for the end of the block or (at the
+/// sample rate) for every sample of it.
 #[test]
 #[ignore]
 fn benchmark_control_rate() {
+    use crate::synth::CONTROL_BLOCK_SAMPLES;
     for rate in [ModulationRate::Block, ModulationRate::Sample] {
         for (name, model) in [
             ("digital filter", FilterModel::SvfSimperFilter),
@@ -237,8 +239,8 @@ fn benchmark_control_rate() {
             let elapsed = start.elapsed();
             let per_voice_update = elapsed.as_nanos() as f64 / (updates * CHORD.len()) as f64;
             println!(
-                "control update, {rate:?} rate, {name:<16} {per_voice_update:>7.1} ns per voice per update ({:.1} ns/sample for 8 notes)",
-                per_voice_update * CHORD.len() as f64 / rate.block_samples() as f64
+                "control update, {rate:?} rate, {name:<16} {per_voice_update:>7.1} ns per voice per block ({:.1} ns/sample for 8 notes)",
+                per_voice_update * CHORD.len() as f64 / CONTROL_BLOCK_SAMPLES as f64
             );
         }
     }
@@ -336,6 +338,7 @@ fn benchmark_lookup_kernel() {
         delta_step: 0.0,
         gain: 1.0,
         gain_step: 0.0,
+        per_sample: None,
         modulation: None,
         voices: 8,
         detune_factors: &osc.detune_factors,
@@ -402,6 +405,7 @@ fn benchmark_lookup_kernel() {
             delta_step: 0.0,
             gain: 1.0,
             gain_step: 0.0,
+            per_sample: None,
             modulation: None,
             voices,
             detune_factors: &osc.detune_factors,

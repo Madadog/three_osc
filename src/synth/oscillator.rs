@@ -66,6 +66,7 @@ impl SimdLevel {
             delta_step: 0.0,
             gain: 1.0,
             gain_step: 0.0,
+            per_sample: None,
             modulation: None,
             voices: UNISON_LANES,
             detune_factors: &factors,
@@ -436,6 +437,23 @@ pub enum OscWave {
 }
 
 impl OscWave {
+    /// [`generate()`][Self::generate()] for eight phases at once, with exactly the same
+    /// results.
+    pub fn generate8(&self, phase: f32x8) -> f32x8 {
+        use OscWave::*;
+
+        let half = phase.simd_le(f32x8::splat(0.5));
+        match self {
+            Sine => fastmath::x8::sin_cycles(phase),
+            Tri => half.select(
+                phase * f32x8::splat(4.0) - f32x8::splat(1.0),
+                f32x8::splat(3.0) - phase * f32x8::splat(4.0),
+            ),
+            Saw => phase * f32x8::splat(2.0) - f32x8::splat(1.0),
+            Exp => fastmath::x8::sin_cycles(phase).abs() * f32x8::splat(2.0) - f32x8::splat(1.0),
+            Square => half.select(f32x8::splat(1.0), f32x8::splat(-1.0)),
+        }
+    }
     /// Generates the waveform at the given phase in cycles (`[0, 1)`), with all values ranging
     /// from -1 to +1 peak to peak.
     pub fn generate(&self, phase: f32) -> f32 {
@@ -713,6 +731,9 @@ pub struct BlockParams<'a> {
     /// The output gain at the first sample of the block, and how much it changes per sample.
     pub gain: f32,
     pub gain_step: f32,
+    /// The delta, gain and frame mix of every sample, instead of the ramps above (and the frame
+    /// pair's mix), when the modulation runs at the sample rate.
+    pub per_sample: Option<SampleValues<'a>>,
     /// Modulation by the output of another oscillator, if any.
     pub modulation: Option<Modulation<'a>>,
     /// Number of unison voices in use.
@@ -728,18 +749,46 @@ pub struct BlockParams<'a> {
     pub pan_right: &'a [f32x8; UNISON_VECTORS],
 }
 
-/// One oscillator's output modulating another's over a block, see [`BlockParams`]. The depths
-/// are in the units the kernels use; a depth of zero switches that modulation off.
+/// The control values of every sample of a block, see [`BlockParams`].
+#[derive(Clone, Copy)]
+pub struct SampleValues<'a> {
+    /// The base phase delta in cycles per sample.
+    pub delta: &'a [f32],
+    /// The output gain.
+    pub gain: &'a [f32],
+    /// The crossfade from the first frame to the second. The frame pair's `mix` then only says
+    /// whether the second frame is read at all (it must be above zero if any of these is).
+    pub mix: &'a [f32],
+}
+
+/// One oscillator's output modulating another's over a block, see [`BlockParams`]: for each
+/// kind of modulation, the modulator's output at every sample already scaled by the depth, in
+/// the units the kernels use. A kind that is off is `None`. [`Modulation::scale()`] works the
+/// amounts out.
 pub struct Modulation<'a> {
-    /// The modulator's output, one sample per sample of the block.
-    pub input: &'a [f32],
-    /// Frequency modulation: the phase delta is multiplied by `1 + input * fm`.
-    pub fm: f32,
-    /// Phase modulation: `input * pm` cycles are added to the phase that is read.
-    pub pm: f32,
-    /// Amplitude modulation: the gain is scaled by the unipolar input, `(input + 1) / 2`, fully
-    /// at `am = 1` and not at all at `am = 0`.
-    pub am: f32,
+    /// Frequency modulation: the phase delta is multiplied by `1 + fm[n]`.
+    pub fm: Option<&'a [f32]>,
+    /// Phase modulation: `pm[n]` cycles are added to the phase that is read.
+    pub pm: Option<&'a [f32]>,
+    /// Amplitude modulation: the gain is multiplied by `1 + am[n]`.
+    pub am: Option<&'a [f32]>,
+}
+
+impl Modulation<'_> {
+    /// The amounts of each kind of modulation for a modulator's output, given the FM, PM and AM
+    /// depths of each sample: `input * fm` (FM), `input * pm` (PM), and the unipolar input
+    /// `(input + 1) / 2` faded in by `am`, minus one (AM, which so scales the gain fully at
+    /// `am = 1` and not at all at `am = 0`).
+    #[inline]
+    pub fn scale(input: &[f32], depths: impl Fn(usize) -> [f32; 3], amounts: [&mut [f32]; 3]) {
+        let [fm_out, pm_out, am_out] = amounts;
+        for (n, &input) in input.iter().enumerate() {
+            let [fm, pm, am] = depths(n);
+            fm_out[n] = input * fm;
+            pm_out[n] = input * pm;
+            am_out[n] = ((input + 1.0) * 0.5 - 1.0) * am;
+        }
+    }
 }
 
 /// Where [`FramePair::render_block()`] puts its samples. The oscillator's output is added to
@@ -812,17 +861,28 @@ impl FramePair<'_> {
             assert!(mono.len() >= block_len);
         }
         if let Some(modulation) = &params.modulation {
-            assert!(modulation.input.len() >= block_len);
+            for amounts in [modulation.fm, modulation.pm, modulation.am].into_iter().flatten() {
+                assert!(amounts.len() >= block_len);
+            }
+        }
+        if let Some(values) = &params.per_sample {
+            assert!(values.delta.len() >= block_len);
+            assert!(values.gain.len() >= block_len);
+            assert!(values.mix.len() >= block_len);
         }
         debug_assert_eq!(self.a.cycle_len(), self.b.cycle_len());
-        match interpolation {
-            Interpolation::None => self.render_block_with::<NONE>(voice, params, output, simd),
-            Interpolation::Linear => self.render_block_with::<LINEAR>(voice, params, output, simd),
-            Interpolation::Cubic => self.render_block_with::<CUBIC>(voice, params, output, simd),
+        match (interpolation, params.per_sample.is_some()) {
+            (Interpolation::None, false) => self.render_block_with::<NONE, false>(voice, params, output, simd),
+            (Interpolation::Linear, false) => self.render_block_with::<LINEAR, false>(voice, params, output, simd),
+            (Interpolation::Cubic, false) => self.render_block_with::<CUBIC, false>(voice, params, output, simd),
+            (Interpolation::None, true) => self.render_block_with::<NONE, true>(voice, params, output, simd),
+            (Interpolation::Linear, true) => self.render_block_with::<LINEAR, true>(voice, params, output, simd),
+            (Interpolation::Cubic, true) => self.render_block_with::<CUBIC, true>(voice, params, output, simd),
         }
     }
-    /// [`render_block()`][Self::render_block()] specialised for one interpolation mode.
-    fn render_block_with<const INTERP: u8>(
+    /// [`render_block()`][Self::render_block()] specialised for one interpolation mode, and
+    /// for values given for every sample or not.
+    fn render_block_with<const INTERP: u8, const PER_SAMPLE: bool>(
         &self,
         voice: &mut SuperVoice,
         params: &BlockParams,
@@ -832,33 +892,33 @@ impl FramePair<'_> {
         if params.voices < TIMEWISE_VOICE_LIMIT && output.left.len() >= TIMEWISE_MIN_BLOCK {
             return match simd {
                 SimdLevel::Portable => {
-                    lookup::portable::render_block_timewise::<INTERP>(self, voice, params, output)
+                    lookup::portable::render_block_timewise::<INTERP, PER_SAMPLE>(self, voice, params, output)
                 }
                 // SAFETY: the AVX2 levels are only produced by `SimdLevel::detect()` when the
                 // CPU supports AVX2 and FMA.
                 #[cfg(target_arch = "x86_64")]
                 SimdLevel::Avx2 => unsafe {
-                    lookup::avx2::render_block_timewise::<false, INTERP>(self, voice, params, output)
+                    lookup::avx2::render_block_timewise::<false, INTERP, PER_SAMPLE>(self, voice, params, output)
                 },
                 #[cfg(target_arch = "x86_64")]
                 SimdLevel::Avx2Gather => unsafe {
-                    lookup::avx2::render_block_timewise::<true, INTERP>(self, voice, params, output)
+                    lookup::avx2::render_block_timewise::<true, INTERP, PER_SAMPLE>(self, voice, params, output)
                 },
             };
         }
         match simd {
             SimdLevel::Portable => {
-                lookup::portable::render_block::<INTERP>(self, voice, params, output)
+                lookup::portable::render_block::<INTERP, PER_SAMPLE>(self, voice, params, output)
             }
             // SAFETY: the AVX2 levels are only produced by `SimdLevel::detect()` when the CPU
             // supports AVX2 and FMA.
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2 => unsafe {
-                lookup::avx2::render_block::<false, INTERP>(self, voice, params, output)
+                lookup::avx2::render_block::<false, INTERP, PER_SAMPLE>(self, voice, params, output)
             },
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2Gather => unsafe {
-                lookup::avx2::render_block::<true, INTERP>(self, voice, params, output)
+                lookup::avx2::render_block::<true, INTERP, PER_SAMPLE>(self, voice, params, output)
             },
         }
     }
@@ -889,56 +949,104 @@ fn lane_u32_mut(vectors: &mut [u32x8; UNISON_VECTORS], voice: usize) -> &mut u32
 mod lookup {
     use super::*;
 
-    /// The control values of a block that are shared by all the voices: the ramped gain and
-    /// base delta, and the modulation of each sample.
-    pub struct Controls<'a> {
+    /// The control values of a block that are shared by all the voices: the gain and base
+    /// delta, ramped or (with `PER_SAMPLE`) given for every sample, and the modulation of each
+    /// sample. The kernels are specialised on `PER_SAMPLE`, so that the ramps' path has no
+    /// checks for the values given per sample.
+    pub struct Controls<'a, const PER_SAMPLE: bool> {
         params: &'a BlockParams<'a>,
         delta: f32,
         gain: f32,
+        /// The deltas, gains and frame mixes given for each sample, empty without `PER_SAMPLE`.
+        deltas: &'a [f32],
+        gains: &'a [f32],
+        mixes: &'a [f32],
     }
 
     /// One sample's control values.
     pub struct SampleControls {
-        /// The base phase delta in cycles when frequency modulation changed it this sample.
-        /// Otherwise the per voice deltas just ramp.
+        /// The base phase delta in cycles when it was given for this sample or frequency
+        /// modulation changed it. Otherwise the per voice deltas just ramp.
         pub fm_delta: Option<f32>,
         /// Added to the phases that are read (phase modulation).
         pub phase_offset: u32,
         pub gain: f32,
     }
 
-    impl<'a> Controls<'a> {
+    impl<'a, const PER_SAMPLE: bool> Controls<'a, PER_SAMPLE> {
         pub fn new(params: &'a BlockParams<'a>) -> Self {
+            let (deltas, gains, mixes) = match &params.per_sample {
+                Some(values) if PER_SAMPLE => (values.delta, values.gain, values.mix),
+                _ => (&[][..], &[][..], &[][..]),
+            };
             Self {
                 params,
                 delta: params.delta,
                 gain: params.gain,
+                deltas,
+                gains,
+                mixes,
             }
         }
         /// The control values of sample `n` of the block.
-        #[inline]
+        #[inline(always)]
         pub fn next(&mut self, n: usize) -> SampleControls {
+            let (delta, gain) = if PER_SAMPLE {
+                (self.deltas[n], self.gains[n])
+            } else {
+                (self.delta, self.gain)
+            };
             let mut controls = SampleControls {
-                fm_delta: None,
+                fm_delta: PER_SAMPLE.then_some(delta),
                 phase_offset: 0,
-                gain: self.gain,
+                gain,
             };
             if let Some(modulation) = &self.params.modulation {
-                let input = modulation.input[n];
-                if modulation.fm > 0.0 {
-                    controls.fm_delta =
-                        Some(wrap_cycles_signed(self.delta * (1.0 + input * modulation.fm)));
+                if let Some(fm) = modulation.fm {
+                    controls.fm_delta = Some(wrap_cycles_signed(delta * (1.0 + fm[n])));
                 }
-                if modulation.pm > 0.0 {
-                    controls.phase_offset = cycles_to_fixed(input * modulation.pm);
+                if let Some(pm) = modulation.pm {
+                    controls.phase_offset = cycles_to_fixed(pm[n]);
                 }
-                if modulation.am > 0.0 {
-                    controls.gain *= lerp(1.0, (input + 1.0) / 2.0, modulation.am);
+                if let Some(am) = modulation.am {
+                    controls.gain *= 1.0 + am[n];
                 }
             }
-            self.delta += self.params.delta_step;
-            self.gain += self.params.gain_step;
+            if !PER_SAMPLE {
+                self.delta += self.params.delta_step;
+                self.gain += self.params.gain_step;
+            }
             controls
+        }
+        /// Whether every sample needs its controls worked out one by one, rather than the
+        /// gain ramping on its own.
+        pub fn per_sample(&self) -> bool {
+            PER_SAMPLE || self.params.modulation.is_some()
+        }
+        /// Whether every sample has its own base delta, so the phases are added up one sample
+        /// at a time rather than following the ramp's closed form.
+        pub fn stepped(&self) -> bool {
+            PER_SAMPLE || self.params.modulation.as_ref().is_some_and(|m| m.fm.is_some())
+        }
+        /// The frame mix of sample `n`: its own with `PER_SAMPLE`, otherwise the pair's.
+        #[inline(always)]
+        pub fn mix(&self, frames: &FramePair, n: usize) -> f32 {
+            if PER_SAMPLE {
+                self.mixes[n]
+            } else {
+                frames.mix
+            }
+        }
+        /// The frame mixes of samples `start..end`, with `PER_SAMPLE`.
+        #[inline(always)]
+        pub fn mixes(&self, start: usize, end: usize) -> &'a [f32] {
+            &self.mixes[start..end]
+        }
+        /// The base deltas and gains of samples `start..end` as given, with `PER_SAMPLE` and
+        /// without modulation (when they are each sample's controls as they are), or `None`.
+        #[inline(always)]
+        pub fn plain_samples(&self, start: usize, end: usize) -> Option<(&'a [f32], &'a [f32])> {
+            (PER_SAMPLE && self.params.modulation.is_none()).then(|| (&self.deltas[start..end], &self.gains[start..end]))
         }
     }
 
@@ -1063,13 +1171,18 @@ mod lookup {
             }
         }
 
-        /// Reads 8 voices from the frame pair.
+        /// Reads 8 voices (or samples) from the frame pair, crossfading by `mix()` when the
+        /// pair's mix says the second frame is used. The crossfade is only worked out then.
         #[inline]
-        fn read_frames8<const INTERP: u8>(frames: &FramePair, phases: u32x8) -> f32x8 {
+        fn read_frames8<const INTERP: u8>(
+            frames: &FramePair,
+            mix: impl FnOnce() -> f32x8,
+            phases: u32x8,
+        ) -> f32x8 {
             let a = read8::<INTERP>(frames.a, phases);
             if frames.mix > 0.0 {
                 let b = read8::<INTERP>(frames.b, phases);
-                a + (b - a) * f32x8::splat(frames.mix)
+                a + (b - a) * mix()
             } else {
                 a
             }
@@ -1100,7 +1213,7 @@ mod lookup {
         /// Renders a block with the vectors running across time rather than across voices,
         /// for a few voices: the portable version of the AVX2
         /// [`render_block_timewise()`][super::avx2::render_block_timewise()], see there.
-        pub fn render_block_timewise<const INTERP: u8>(
+        pub fn render_block_timewise<const INTERP: u8, const PER_SAMPLE: bool>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             params: &BlockParams,
@@ -1109,7 +1222,8 @@ mod lookup {
             let voices = params.voices.min(MAX_UNISON);
             let stereo = output.right.is_some();
             let needs_mono = !stereo || output.mono.is_some();
-            let fm = params.modulation.as_ref().is_some_and(|modulation| modulation.fm > 0.0);
+            let mut controls = Controls::<PER_SAMPLE>::new(params);
+            let stepped = controls.stepped();
             let len = output.left.len();
 
             let mut phases = [0_u32; MAX_UNISON];
@@ -1135,7 +1249,6 @@ mod lookup {
                 }))
             });
 
-            let mut controls = Controls::new(params);
             let mut start = 0;
             while start < len {
                 let end = (start + CHUNK).min(len);
@@ -1144,8 +1257,16 @@ mod lookup {
 
                 let mut gains = [f32x8::ZERO; CHUNK_VECTORS];
                 let mut offsets = [u32x8::ZERO; CHUNK_VECTORS];
+                let mut mixes = [f32x8::splat(frames.mix); CHUNK_VECTORS];
                 let mut fm_deltas = [0.0_f32; CHUNK];
-                if params.modulation.is_some() {
+                if PER_SAMPLE {
+                    let mut sample_mixes = [0.0_f32; CHUNK];
+                    sample_mixes[..chunk_len].copy_from_slice(controls.mixes(start, end));
+                    for (vector, mixes) in mixes.iter_mut().enumerate() {
+                        *mixes = f32x8::new(sample_mixes[vector * UNISON_LANES..][..UNISON_LANES].try_into().unwrap());
+                    }
+                }
+                if controls.per_sample() {
                     let mut sample_gains = [0.0_f32; CHUNK];
                     let mut sample_offsets = [0_u32; CHUNK];
                     for n in 0..chunk_len {
@@ -1175,7 +1296,7 @@ mod lookup {
                 let mut right = [f32x8::ZERO; CHUNK_VECTORS];
                 for i in 0..voices {
                     let mut voice_phases = [u32x8::ZERO; CHUNK_VECTORS];
-                    if fm {
+                    if stepped {
                         let factor = lane(params.detune_factors, i);
                         let mut stepped = [0_u32; CHUNK];
                         let (mut phase, mut delta) = (phases[i], deltas[i]);
@@ -1209,8 +1330,11 @@ mod lookup {
                     let pan_left = f32x8::splat(lane(params.pan_left, i));
                     let pan_right = f32x8::splat(lane(params.pan_right, i));
                     for vector in 0..vectors {
-                        let samples =
-                            read_frames8::<INTERP>(frames, voice_phases[vector] + offsets[vector]);
+                        let samples = read_frames8::<INTERP>(
+                            frames,
+                            || mixes[vector],
+                            voice_phases[vector] + offsets[vector],
+                        );
                         if needs_mono {
                             mono[vector] += samples * mask;
                         }
@@ -1242,7 +1366,7 @@ mod lookup {
             }
         }
 
-        pub fn render_block<const INTERP: u8>(
+        pub fn render_block<const INTERP: u8, const PER_SAMPLE: bool>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             params: &BlockParams,
@@ -1262,7 +1386,7 @@ mod lookup {
             let stereo = output.right.is_some();
             let needs_mono = !stereo || output.mono.is_some();
 
-            let mut controls = Controls::new(params);
+            let mut controls = Controls::<PER_SAMPLE>::new(params);
             for n in 0..output.left.len() {
                 let sample = controls.next(n);
                 if let Some(delta) = sample.fm_delta {
@@ -1277,7 +1401,8 @@ mod lookup {
                     if sample.fm_delta.is_none() {
                         deltas[vector] += delta_steps[vector];
                     }
-                    let samples = read_frames8::<INTERP>(frames, phases[vector] + offset);
+                    let mix = || f32x8::splat(controls.mix(frames, n));
+                    let samples = read_frames8::<INTERP>(frames, mix, phases[vector] + offset);
                     if needs_mono {
                         mono += samples * params.mask[vector];
                     }
@@ -1385,6 +1510,18 @@ mod lookup {
                 scale,
             ));
             _mm256_or_si256(_mm256_slli_epi32::<16>(high), low)
+        }
+
+        /// The running sums of eight lanes, in wrapping arithmetic: lane `n` is the sum of
+        /// lanes `0..=n`.
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn running_sums(x: __m256i) -> __m256i {
+            // Within each half, then the low half's total added to the high half
+            let x = _mm256_add_epi32(x, _mm256_slli_si256::<4>(x));
+            let x = _mm256_add_epi32(x, _mm256_slli_si256::<8>(x));
+            let low_total = _mm256_shuffle_epi32::<0xFF>(x);
+            _mm256_add_epi32(x, _mm256_permute2x128_si256::<0x08>(low_total, low_total))
         }
 
         /// The fixed point phase deltas of one vector of voices.
@@ -1530,19 +1667,21 @@ mod lookup {
             }
         }
 
-        /// Reads 8 voices from the frame pair.
+        /// Reads 8 voices (or samples) from the frame pair, crossfading by `mix()` when
+        /// `blend` says the second frame is used. The crossfade is only worked out then.
         #[inline]
         #[target_feature(enable = "avx2,fma")]
         unsafe fn read_frames8<const GATHER: bool, const INTERP: u8>(
             a: &Table,
             b: &Table,
-            mix: f32,
+            blend: bool,
+            mix: impl FnOnce() -> __m256,
             phases: __m256i,
         ) -> __m256 {
             let a = read8::<GATHER, INTERP>(a, phases);
-            if mix > 0.0 {
+            if blend {
                 let b = read8::<GATHER, INTERP>(b, phases);
-                _mm256_fmadd_ps(_mm256_sub_ps(b, a), _mm256_set1_ps(mix), a)
+                _mm256_fmadd_ps(_mm256_sub_ps(b, a), mix(), a)
             } else {
                 a
             }
@@ -1583,7 +1722,7 @@ mod lookup {
         /// exactly what adding up the deltas one sample at a time gives. With frequency
         /// modulation every sample has its own delta, so they are added up one at a time.
         #[target_feature(enable = "avx2,fma")]
-        pub unsafe fn render_block_timewise<const GATHER: bool, const INTERP: u8>(
+        pub unsafe fn render_block_timewise<const GATHER: bool, const INTERP: u8, const PER_SAMPLE: bool>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             params: &BlockParams,
@@ -1594,7 +1733,9 @@ mod lookup {
             let voices = params.voices.min(MAX_UNISON);
             let stereo = output.right.is_some();
             let needs_mono = !stereo || output.mono.is_some();
-            let fm = params.modulation.as_ref().is_some_and(|modulation| modulation.fm > 0.0);
+            let mut controls = Controls::<PER_SAMPLE>::new(params);
+            let stepped = controls.stepped();
+            let blend = frames.mix > 0.0;
             let len = output.left.len();
 
             // Per voice phase state, as in the reference (one voice and sample at a time)
@@ -1622,7 +1763,6 @@ mod lookup {
                 _mm256_setr_epi32(t(0), t(1), t(2), t(3), t(4), t(5), t(6), t(7))
             });
 
-            let mut controls = Controls::new(params);
             let mut start = 0;
             while start < len {
                 let end = (start + CHUNK).min(len);
@@ -1635,8 +1775,25 @@ mod lookup {
                 // with the same rounding as `gain + n as f32 * gain_step`.
                 let mut gains = [_mm256_setzero_ps(); CHUNK_VECTORS];
                 let mut offsets = [_mm256_setzero_si256(); CHUNK_VECTORS];
+                let mut mixes = [_mm256_set1_ps(frames.mix); CHUNK_VECTORS];
                 let mut fm_deltas = [0.0_f32; CHUNK];
-                if params.modulation.is_some() {
+                if PER_SAMPLE {
+                    let mut sample_mixes = [0.0_f32; CHUNK];
+                    sample_mixes[..chunk_len].copy_from_slice(controls.mixes(start, end));
+                    for (vector, mixes) in mixes.iter_mut().enumerate() {
+                        *mixes = _mm256_loadu_ps(sample_mixes.as_ptr().add(vector * UNISON_LANES));
+                    }
+                }
+                let plain = controls.plain_samples(start, end);
+                if let Some((sample_deltas, sample_gains)) = plain {
+                    // Each sample's delta and gain as they are, with no phase offsets
+                    let mut padded_gains = [0.0_f32; CHUNK];
+                    padded_gains[..chunk_len].copy_from_slice(sample_gains);
+                    fm_deltas[..chunk_len].copy_from_slice(sample_deltas);
+                    for (vector, gains) in gains.iter_mut().enumerate() {
+                        *gains = _mm256_loadu_ps(padded_gains.as_ptr().add(vector * UNISON_LANES));
+                    }
+                } else if controls.per_sample() {
                     let mut sample_gains = [0.0_f32; CHUNK];
                     let mut sample_offsets = [0_u32; CHUNK];
                     for n in 0..chunk_len {
@@ -1667,7 +1824,22 @@ mod lookup {
                 for i in 0..voices {
                     // The phases of the voice at each sample of the chunk
                     let mut voice_phases = [_mm256_setzero_si256(); CHUNK_VECTORS];
-                    if fm {
+                    if stepped && plain.is_some() {
+                        // The deltas are all positive, which `cycles_to_fixed8()` converts
+                        // exactly, and adding them up in any order wraps the same: each
+                        // sample's phase is the last chunk's plus a running sum of the deltas.
+                        // (The deltas past the chunk are zero, so the last lane is where the
+                        // chunk leaves the phase.)
+                        let factor = _mm256_set1_ps(lane(params.detune_factors, i));
+                        let mut phase = _mm256_set1_epi32(phases[i] as i32);
+                        for (vector, phases_out) in voice_phases.iter_mut().enumerate().take(vectors) {
+                            let deltas = _mm256_loadu_ps(fm_deltas.as_ptr().add(vector * UNISON_LANES));
+                            *phases_out = _mm256_add_epi32(phase, running_sums(cycles_to_fixed8(_mm256_mul_ps(deltas, factor))));
+                            phase = _mm256_permutevar8x32_epi32(*phases_out, _mm256_set1_epi32(7));
+                        }
+                        phases[i] = _mm256_extract_epi32::<7>(phase) as u32;
+                        deltas[i] = cycles_to_fixed(fm_deltas[chunk_len - 1] * lane(params.detune_factors, i));
+                    } else if stepped {
                         let factor = lane(params.detune_factors, i);
                         let mut stepped = [0_u32; CHUNK];
                         let (mut phase, mut delta) = (phases[i], deltas[i]);
@@ -1715,7 +1887,8 @@ mod lookup {
                         let samples = read_frames8::<GATHER, INTERP>(
                             &table_a,
                             &table_b,
-                            frames.mix,
+                            blend,
+                            || mixes[vector],
                             _mm256_add_epi32(voice_phases[vector], offsets[vector]),
                         );
                         if needs_mono {
@@ -1751,14 +1924,14 @@ mod lookup {
         }
 
         #[target_feature(enable = "avx2,fma")]
-        pub unsafe fn render_block<const GATHER: bool, const INTERP: u8>(
+        pub unsafe fn render_block<const GATHER: bool, const INTERP: u8, const PER_SAMPLE: bool>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             params: &BlockParams,
             output: &mut BlockOutput,
         ) {
             if output.left.len() == 1 {
-                return render_sample::<GATHER, INTERP>(frames, voice, params, output);
+                return render_sample::<GATHER, INTERP, PER_SAMPLE>(frames, voice, params, output);
             }
             let table_a = Table::new(frames.a);
             let table_b = Table::new(frames.b);
@@ -1777,7 +1950,8 @@ mod lookup {
             let stereo = output.right.is_some();
             let needs_mono = !stereo || output.mono.is_some();
 
-            let mut controls = Controls::new(params);
+            let blend = frames.mix > 0.0;
+            let mut controls = Controls::<PER_SAMPLE>::new(params);
             let len = output.left.len();
             let mut start = 0;
             while start < len {
@@ -1809,7 +1983,8 @@ mod lookup {
                         let samples = read_frames8::<GATHER, INTERP>(
                             &table_a,
                             &table_b,
-                            frames.mix,
+                            blend,
+                            || _mm256_set1_ps(controls.mix(frames, start + k)),
                             _mm256_add_epi32(phases[vector], offset),
                         );
                         if needs_mono {
@@ -1853,7 +2028,7 @@ mod lookup {
         /// more than the sample itself. The voices are summed in the same order as in a
         /// group, so the sample comes out exactly the same.
         #[target_feature(enable = "avx2,fma")]
-        unsafe fn render_sample<const GATHER: bool, const INTERP: u8>(
+        unsafe fn render_sample<const GATHER: bool, const INTERP: u8, const PER_SAMPLE: bool>(
             frames: &FramePair,
             voice: &mut SuperVoice,
             params: &BlockParams,
@@ -1865,7 +2040,8 @@ mod lookup {
             let stereo = output.right.is_some();
             let needs_mono = !stereo || output.mono.is_some();
 
-            let sample = Controls::new(params).next(0);
+            let mut controls = Controls::<PER_SAMPLE>::new(params);
+            let sample = controls.next(0);
             let delta = sample.fm_delta.unwrap_or(params.delta);
             let offset = _mm256_set1_epi32(sample.phase_offset as i32);
             let mut mono = _mm256_setzero_ps();
@@ -1882,7 +2058,8 @@ mod lookup {
                 let samples = read_frames8::<GATHER, INTERP>(
                     &table_a,
                     &table_b,
-                    frames.mix,
+                    frames.mix > 0.0,
+                    || _mm256_set1_ps(controls.mix(frames, 0)),
                     _mm256_add_epi32(phases, offset),
                 );
                 if needs_mono {
@@ -2713,17 +2890,22 @@ mod tests {
             .map(|i| cycles_to_fixed(params.delta_step * factor(i)))
             .collect();
         for n in 0..output.left.len() {
-            let (mut fm_delta, mut offset, mut sample_gain) = (None, 0_u32, gain);
+            let (base_delta, base_gain, mix) = match &params.per_sample {
+                Some(values) => (values.delta[n], values.gain[n], values.mix[n]),
+                None => (delta, gain, frames.mix),
+            };
+            let frames = &FramePair { mix, ..*frames };
+            let mut fm_delta = params.per_sample.is_some().then_some(base_delta);
+            let (mut offset, mut sample_gain) = (0_u32, base_gain);
             if let Some(modulation) = &params.modulation {
-                let input = modulation.input[n];
-                if modulation.fm > 0.0 {
-                    fm_delta = Some(wrap_cycles_signed(delta * (1.0 + input * modulation.fm)));
+                if let Some(fm) = modulation.fm {
+                    fm_delta = Some(wrap_cycles_signed(base_delta * (1.0 + fm[n])));
                 }
-                if modulation.pm > 0.0 {
-                    offset = cycles_to_fixed(input * modulation.pm);
+                if let Some(pm) = modulation.pm {
+                    offset = cycles_to_fixed(pm[n]);
                 }
-                if modulation.am > 0.0 {
-                    sample_gain *= lerp(1.0, (input + 1.0) / 2.0, modulation.am);
+                if let Some(am) = modulation.am {
+                    sample_gain *= 1.0 + am[n];
                 }
             }
             let (mut mono, mut left, mut right) = (0.0, 0.0, 0.0);
@@ -2769,8 +2951,21 @@ mod tests {
         let saw = Wavetable::new((0..len).map(|i| i as f32 / len as f32 * 2.0 - 1.0).collect());
         let rng = fastrand::Rng::with_seed(42);
         let modulator: Vec<f32> = (0..80).map(|_| rng.f32() * 2.0 - 1.0).collect();
-        // Blocks of different lengths, to check that a short block works too
-        let blocks = [(0, 32), (32, 49), (49, 80)];
+        let mut amounts = [vec![0.0; 80], vec![0.0; 80], vec![0.0; 80]];
+        {
+            let [fm, pm, am] = &mut amounts;
+            Modulation::scale(&modulator, |_| [0.4, 0.3, 0.5], [fm, pm, am]);
+        }
+        // Values for every sample: a pitch that wobbles, a gain going up and down, and a
+        // crossfade sweeping between the frames
+        let deltas: Vec<f32> = (0..80).map(|n| 0.013 + 0.004 * (n as f32 * 0.3).sin()).collect();
+        let gains: Vec<f32> = (0..80).map(|n| 0.5 + 0.3 * (n as f32 * 0.17).cos()).collect();
+        let mixes: Vec<f32> = (0..80).map(|n| (n as f32 * 0.1).sin().abs()).collect();
+        // With a frame pair whose mix says the second frame isn't read
+        let no_mixes = vec![0.0; 80];
+        // Blocks of different lengths, to check that short blocks work too (a single sample's
+        // and those shorter than a vector have paths of their own)
+        let blocks = [(0, 32), (32, 49), (49, 50), (50, 55), (55, 80)];
 
         let mut levels = vec![SimdLevel::Portable];
         #[cfg(target_arch = "x86_64")]
@@ -2796,9 +2991,16 @@ mod tests {
                     osc.update_pan_gains(0.8);
                     let start = SuperVoice::new(0.1, 0.7);
 
-                    for (stereo, modulated, with_mono) in
-                        [(false, false, false), (true, false, true), (false, true, true), (true, true, false)]
-                    {
+                    for (stereo, modulated, with_mono, per_sample) in [
+                        (false, false, false, false),
+                        (true, false, true, false),
+                        (false, true, true, false),
+                        (true, true, false, false),
+                        (false, false, false, true),
+                        (true, false, true, true),
+                        (false, true, true, true),
+                        (true, true, false, true),
+                    ] {
                         let render = |simd: Option<SimdLevel>| -> Rendered {
                             let mut voice = start.clone();
                             // The outputs start non-zero to check that the kernels add to them
@@ -2811,11 +3013,15 @@ mod tests {
                                     delta_step: 0.0001,
                                     gain: 0.5,
                                     gain_step: 0.01,
+                                    per_sample: per_sample.then(|| SampleValues {
+                                        delta: &deltas[begin..end],
+                                        gain: &gains[begin..end],
+                                        mix: if mix > 0.0 { &mixes[begin..end] } else { &no_mixes[begin..end] },
+                                    }),
                                     modulation: modulated.then(|| Modulation {
-                                        input: &modulator[begin..end],
-                                        fm: 0.4,
-                                        pm: 0.3,
-                                        am: 0.5,
+                                        fm: Some(&amounts[0][begin..end]),
+                                        pm: Some(&amounts[1][begin..end]),
+                                        am: Some(&amounts[2][begin..end]),
                                     }),
                                     voices,
                                     detune_factors: &osc.detune_factors,
@@ -2841,7 +3047,7 @@ mod tests {
                         let mut kernel_phases: Option<Vec<u32>> = None;
                         for simd in &levels {
                             let (got_left, got_right, got_mono, got_voice) = render(Some(*simd));
-                            let case = format!("{simd:?} {mode:?} mix {mix} voices {voices} stereo {stereo} modulated {modulated}");
+                            let case = format!("{simd:?} {mode:?} mix {mix} voices {voices} stereo {stereo} modulated {modulated} per sample {per_sample}");
                             for n in 0..80 {
                                 assert!((got_left[n] - left[n]).abs() < tolerance, "{case}: left {n}: {} vs {}", got_left[n], left[n]);
                                 assert!((got_right[n] - right[n]).abs() < tolerance, "{case}: right {n}: {} vs {}", got_right[n], right[n]);

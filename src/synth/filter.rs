@@ -1,6 +1,6 @@
 use self::ladder::tanh_pade32_f32;
-pub(crate) use self::ladder::{LadderFilter, LADDER_LANES};
-pub(crate) use self::svf_simper::{SvfSimper, SVF_LANES};
+pub(crate) use self::ladder::{LadderFilter, LadderSamples, LADDER_LANES};
+pub(crate) use self::svf_simper::{SvfSamples, SvfSimper, SVF_LANES};
 
 use super::lerp;
 

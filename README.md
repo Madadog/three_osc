@@ -76,21 +76,21 @@ The displays are drawn with the synth's own code, so they show what is played. A
 ### Control rate
 Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate (689 Hz at 44.1 kHz). Change the constant to try other sizes.
 
-The global Modulation Rate control switches between that (Block, the default) and recalculating everything at every sample (Sample), where a 2 ms attack follows its curve rather than a few straight lines and an LFO can run at audio rates. The whole control update then runs for every sample of every voice, and the oscillators, filters and mixing handle a sample at a time (with single sample paths in the oscillator kernels, and the Digital filter running one voice at a time, which beats transposing a single sample into lockstep). The LFOs keep their phase in double precision, since at the sample rate a slow LFO's steps are too small for single precision to add up: a 0.01 Hz LFO would run 3% fast.
+The global Modulation Rate control switches between that (Block, the default) and working everything out for every sample (Sample), where a 2 ms attack follows its curve rather than a few straight lines and an LFO can run at audio rates. The control update then works a whole block's values out at once, eight samples at a time (in `src/synth/per_sample.rs`): the envelopes, LFOs and matrix, then every sample's pitch, gains, wavetable position, modulation depths and filter coefficients, with 8-lane versions of the fast math below that give exactly the same results as one value at a time. The oscillator kernels, the filters (the Digital and Ladder filters still in lockstep across voices) and the mixing take each sample's values instead of ramps, and still render the block in one go. Whatever doesn't change within a block (an envelope in its sustain, a route from velocity or the mod wheel, an oscillator nothing modulates, filter coefficients) is only worked out once and rendered as at the block rate without a ramp, which gives exactly what working out every sample's values would. Two things still change once per block: the bandlimited table an oscillator plays (picked for the highest pitch in the block) and the unison detune. The LFOs keep their phase in double precision, since at the sample rate a slow LFO's steps are too small for single precision to add up: a 0.01 Hz LFO would run 3% fast.
 
-The cost, from `benchmark_modulation_rate` (8 notes at 44.1 kHz on a 2.1 GHz Xeon, time per sample of output):
+The cost, from `benchmark_modulation_rate` (8 notes at 44.1 kHz on a 2.1 GHz Xeon, time per sample of output, mostly with the envelopes in their sustain):
 
 | Patch | Block | Sample | |
 |---|---|---|---|
-| Default (1 saw, Digital filter) | 50 ns | 990 ns | 20x |
-| Default, no filter | 40 ns | 830 ns | 21x |
-| Default, Ladder filter | 170 ns | 1360 ns | 8x |
-| Default, 4 modulation routes | 58 ns | 1240 ns | 21x |
-| 3 x saw, unison 8 | 300 ns | 1880 ns | 6x |
-| 3 x saw, unison 8, Ladder filter | 410 ns | 2290 ns | 6x |
-| 3 x saw, unison 8, 4 modulation routes | 310 ns | 2350 ns | 8x |
+| Default (1 saw, Digital filter) | 60 ns | 63 ns | 1.1x |
+| Default, no filter | 46 ns | 55 ns | 1.2x |
+| Default, Ladder filter | 180 ns | 192 ns | 1.1x |
+| Default, 4 modulation routes | 65 ns | 124 ns | 1.9x |
+| 3 x saw, unison 8 | 327 ns | 343 ns | 1.05x |
+| 3 x saw, unison 8, Ladder filter | 451 ns | 468 ns | 1.04x |
+| 3 x saw, unison 8, 4 modulation routes | 382 ns | 565 ns | 1.5x |
 
-The control update takes around 900 instructions per voice, while the block rate gets a voice's sample of the default patch out in about 75 all told, so the sample rate costs the most, relatively, on the cheapest patches. Eight notes of the supersaw take 8% of a core at the sample rate rather than 1.3%. Making it much cheaper would take vectorising the control update across voices or samples, and kernels that take a value per sample for pitch, gains, wavetable position and filter coefficients instead of ramps.
+What moves within a block costs more: each sample's LFO values, pitch factors (`2^x`), envelope levels (`x^y`) and, with a moving cutoff, filter coefficients, under SSE2 on x86-64 (the baseline, so two 4-lane halves per vector). Over the first quarter second of the notes, while their envelopes decay, the default patch takes about 1.6 times the block rate's instructions and the one with 4 routes about 2.6 times.
 
 The control rate code uses polynomial approximations of `2^x`, `log2`, `x^y`, `sin` and `tan` (in `src/synth/fastmath.rs`), accurate to around single precision, instead of the standard library's functions, which cost more than rendering the block's samples.
 

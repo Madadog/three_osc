@@ -165,6 +165,15 @@ impl Default for LadderFilter {
 /// Number of filters [`LadderFilter::process_block_x8()`] runs in lockstep.
 pub const LADDER_LANES: usize = 8;
 
+/// The integration rate and resonance (as the filter keeps them, see
+/// [`LadderFilter::coefficients8()`]) of every sample of a block, for running a filter whose
+/// cutoff or resonance changes at every sample (see [`LadderFilter::process_samples()`]).
+#[derive(Debug, Clone, Copy)]
+pub struct LadderSamples<'a> {
+    pub dt: &'a [f32],
+    pub resonance: &'a [f32],
+}
+
 #[allow(dead_code)]
 impl LadderFilter {
     pub fn new() -> Self {
@@ -176,6 +185,31 @@ impl LadderFilter {
         Self {
             noise_position: fastrand::Rng::with_seed(seed).usize(..NOISE_LEN),
             ..Self::default()
+        }
+    }
+    /// The integration rate and the resonance the filter keeps for eight cutoffs and
+    /// resonances, as [`set_params()`][Filter::set_params()] works them out (in single rather
+    /// than double precision, which makes a difference of a few parts in ten million).
+    pub fn coefficients8(&self, cutoff: wide::f32x8, resonance: wide::f32x8, sample_rate: f32) -> [wide::f32x8; 2] {
+        use wide::f32x8;
+        let cutoff_frequency = cutoff / f32x8::splat(7000.0) + f32x8::splat(0.0001);
+        let scale = 44100.0 / (sample_rate * self.oversampling_factor as f32);
+        let dt = (f32x8::splat(scale) * cutoff_frequency).fast_max(f32x8::ZERO).fast_min(f32x8::splat(0.6));
+        [dt, resonance / f32x8::splat(16.6)]
+    }
+    /// Sets the integration rate and resonance directly, as
+    /// [`process_samples()`][Self::process_samples()] takes them.
+    pub fn set_coefficients(&mut self, dt: f32, resonance: f32) {
+        self.dt = dt;
+        self.resonance = resonance;
+    }
+    /// Runs the filter over a block of samples in place, with the integration rate and
+    /// resonance given for every sample. The filter keeps the last sample's.
+    pub fn process_samples(&mut self, samples: &mut [f32], coefficients: LadderSamples) {
+        for (n, sample) in samples.iter_mut().enumerate() {
+            self.dt = coefficients.dt[n];
+            self.resonance = coefficients.resonance[n];
+            *sample = self.process(*sample);
         }
     }
     /// Whether [`process_block_x8()`][Self::process_block_x8()] supports this filter's settings.
@@ -198,7 +232,22 @@ impl LadderFilter {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx")]
     pub unsafe fn process_block_x8(lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
-        Self::process_lanes::<Separate>(lanes)
+        Self::process_lanes::<Separate, false>(lanes, &[None; LADDER_LANES])
+    }
+    /// [`process_block_x8()`][Self::process_block_x8()] with the integration rate and
+    /// resonance of every sample given for each lane, with exactly the same results as
+    /// [`process_samples()`][Self::process_samples()].
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    pub unsafe fn process_block_x8_samples(
+        lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES],
+        coefficients: &[Option<LadderSamples>; LADDER_LANES],
+    ) {
+        Self::process_lanes::<Separate, true>(lanes, coefficients)
     }
     /// [`process_block_x8()`][Self::process_block_x8()] with fused multiply-adds, which are
     /// fewer instructions and shorten the chains of dependent operations. Rounding once rather
@@ -210,13 +259,31 @@ impl LadderFilter {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn process_block_x8_fma(lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
-        Self::process_lanes::<Fused>(lanes)
+        Self::process_lanes::<Fused, false>(lanes, &[None; LADDER_LANES])
     }
-    /// The lockstep kernel, with its multiply-adds done by `M`. Inlined into the functions
-    /// above, which enable the instructions it needs.
+    /// [`process_block_x8_samples()`][Self::process_block_x8_samples()] with fused
+    /// multiply-adds, see [`process_block_x8_fma()`][Self::process_block_x8_fma()].
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 and FMA.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn process_block_x8_samples_fma(
+        lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES],
+        coefficients: &[Option<LadderSamples>; LADDER_LANES],
+    ) {
+        Self::process_lanes::<Fused, true>(lanes, coefficients)
+    }
+    /// The lockstep kernel, with its multiply-adds done by `M`, and with the integration rate
+    /// and resonance of every sample given in `samples` with `PER_SAMPLE` (otherwise the
+    /// filters' own). Inlined into the functions above, which enable the instructions it needs.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn process_lanes<M: MulAdd>(mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES]) {
+    unsafe fn process_lanes<M: MulAdd, const PER_SAMPLE: bool>(
+        mut lanes: [Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES],
+        samples: &[Option<LadderSamples>; LADDER_LANES],
+    ) {
         use std::arch::x86_64::*;
 
         use super::simd::transpose8;
@@ -248,7 +315,7 @@ impl LadderFilter {
             None => _mm256_setzero_ps(),
         });
         // (`out` is the last output, before the output gain)
-        let [mut p0, mut p1, mut p2, mut p3, mut ut_1, dt, feedback, mut out] = transpose8(rows);
+        let [mut p0, mut p1, mut p2, mut p3, mut ut_1, mut dt, mut feedback, mut out] = transpose8(rows);
         // The resampling filters' delays the cascades use, transposed eight at a time
         let delay_groups = (2 * biquads).div_ceil(LADDER_LANES);
         let mut z = [_mm256_setzero_ps(); IIR_MAX_ORDER];
@@ -264,8 +331,25 @@ impl LadderFilter {
             z[at..at + LADDER_LANES].copy_from_slice(&transpose8(rows(|filter| &filter.iir_lowpass.z)));
             zu[at..at + LADDER_LANES].copy_from_slice(&transpose8(rows(|filter| &filter.iir_upsampler.z)));
         }
-        let half_dt = _mm256_mul_ps(_mm256_set1_ps(0.5), dt);
+        let mut half_dt = _mm256_mul_ps(_mm256_set1_ps(0.5), dt);
         let upsampling_gain = _mm256_set1_ps(oversampling_factor as f32);
+
+        // Eight values of every lane from `start` on (fewer at the end of the block, padded
+        // with zeros), transposed into one vector per sample, for the coefficients given per
+        // sample. Missing lanes are zero.
+        let transposed = |resonance: bool, start: usize, len: usize| {
+            let rows = std::array::from_fn(|lane| match &samples[lane] {
+                Some(samples) => {
+                    let values = if resonance { samples.resonance } else { samples.dt };
+                    let values = &values[start..start + len];
+                    let mut padded = [0.0_f32; LADDER_LANES];
+                    padded[..len].copy_from_slice(values);
+                    _mm256_loadu_ps(padded.as_ptr())
+                }
+                None => _mm256_setzero_ps(),
+            });
+            transpose8(rows)
+        };
 
         // One sample through a resampling filter's cascade. The synth's design has a version
         // of its own, unrolled, which saves the loop's bookkeeping in every biquad.
@@ -289,8 +373,8 @@ impl LadderFilter {
             )
         };
         // The predictor's step `p + dt (a - b)` and the corrector's
-        let predict = |p: __m256, a: __m256, b: __m256| M::mul_add(dt, _mm256_sub_ps(a, b), p);
-        let correct = |p: __m256, a: __m256, b: __m256, a_prime: __m256, b_prime: __m256| {
+        let predict = |dt: __m256, p: __m256, a: __m256, b: __m256| M::mul_add(dt, _mm256_sub_ps(a, b), p);
+        let correct = |half_dt: __m256, p: __m256, a: __m256, b: __m256, a_prime: __m256, b_prime: __m256| {
             M::mul_add(
                 half_dt,
                 _mm256_add_ps(_mm256_sub_ps(a, b), _mm256_sub_ps(a_prime, b_prime)),
@@ -322,9 +406,21 @@ impl LadderFilter {
                 }
             }
             let mut frames = transpose8(rows);
+            // The integration rate and feedback (eight times the resonance, as the one-filter
+            // path works it out) of each sample, when they are given per sample
+            let (dts, resonances) = if PER_SAMPLE {
+                (transposed(false, start, len), transposed(true, start, len))
+            } else {
+                ([dt; LADDER_LANES], [feedback; LADDER_LANES])
+            };
 
-            for frame in frames[..len].iter_mut() {
+            for (n, frame) in frames[..len].iter_mut().enumerate() {
                 let input_sample = *frame;
+                if PER_SAMPLE {
+                    dt = dts[n];
+                    half_dt = _mm256_mul_ps(_mm256_set1_ps(0.5), dt);
+                    feedback = _mm256_mul_ps(_mm256_set1_ps(8.0), resonances[n]);
+                }
 
                 // Predictor-corrector integration with full tanh stages, see `process_sample()`
                 for step in 0..oversampling_factor {
@@ -347,20 +443,20 @@ impl LadderFilter {
                     let tanh_p2 = tanh(p2);
                     let tanh_p3 = tanh(p3);
 
-                    let p0_prime = predict(p0, tanh_in, tanh_p0);
-                    let p1_prime = predict(p1, tanh_p0, tanh_p1);
-                    let p2_prime = predict(p2, tanh_p1, tanh_p2);
-                    let p3_prime = predict(p3, tanh_p2, tanh_p3);
+                    let p0_prime = predict(dt, p0, tanh_in, tanh_p0);
+                    let p1_prime = predict(dt, p1, tanh_p0, tanh_p1);
+                    let p2_prime = predict(dt, p2, tanh_p1, tanh_p2);
+                    let p3_prime = predict(dt, p3, tanh_p2, tanh_p3);
                     let tanh_p0_prime = tanh(p0_prime);
                     let tanh_p1_prime = tanh(p1_prime);
                     let tanh_p2_prime = tanh(p2_prime);
                     let tanh_p3_prime = tanh(p3_prime);
 
-                    p3 = correct(p3, tanh_p2, tanh_p3, tanh_p2_prime, tanh_p3_prime);
-                    p2 = correct(p2, tanh_p1, tanh_p2, tanh_p1_prime, tanh_p2_prime);
-                    p1 = correct(p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
+                    p3 = correct(half_dt, p3, tanh_p2, tanh_p3, tanh_p2_prime, tanh_p3_prime);
+                    p2 = correct(half_dt, p2, tanh_p1, tanh_p2, tanh_p1_prime, tanh_p2_prime);
+                    p1 = correct(half_dt, p1, tanh_p0, tanh_p1, tanh_p0_prime, tanh_p1_prime);
                     let tanh_new_in = tanh(M::neg_mul_add(feedback, p3, input));
-                    p0 = correct(p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
+                    p0 = correct(half_dt, p0, tanh_in, tanh_p0, tanh_new_in, tanh_p0_prime);
 
                     // The input at the previous oversampled step
                     ut_1 = input;
@@ -405,6 +501,15 @@ impl LadderFilter {
                 [filter.p0, filter.p1, filter.p2, filter.p3, filter.ut_1] =
                     [values[0], values[1], values[2], values[3], values[4]];
                 filter.out = values[7];
+            }
+        }
+        if PER_SAMPLE && block_len > 0 {
+            // The filters keep the last sample's integration rate and resonance
+            for (entry, samples) in lanes.iter_mut().zip(samples) {
+                if let (Some((filter, _)), Some(samples)) = (entry, samples) {
+                    filter.dt = samples.dt[block_len - 1];
+                    filter.resonance = samples.resonance[block_len - 1];
+                }
             }
         }
         for group in 0..delay_groups {
@@ -1145,6 +1250,87 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    /// With the integration rate and resonance given for every sample, the lockstep kernel
+    /// (without fused multiply-adds) produces exactly what the one-filter path does, and the
+    /// fused one stays close.
+    #[test]
+    fn lockstep_with_sample_coefficients_matches_scalar_processing() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let len = 300;
+        let input = signal(len);
+        let lanes = [0, 1, 2, 4, 7];
+        let template = LadderFilter::default();
+        // Each filter's cutoff sweeps differently, and its resonance wobbles
+        let coefficients: Vec<[Vec<f32>; 2]> = (0..LADDER_LANES)
+            .map(|lane| {
+                let mut dt = vec![0.0; len];
+                let mut resonance = vec![0.0; len];
+                for start in (0..len).step_by(8) {
+                    let cutoffs = wide::f32x8::new(std::array::from_fn(|i| {
+                        let n = (start + i) as f32;
+                        300.0 * (1.0 + lane as f32) * (1.0 + 6.0 * (n * 0.03 * (lane + 1) as f32).sin().abs())
+                    }));
+                    let resonances = wide::f32x8::new(std::array::from_fn(|i| 4.0 + 4.0 * ((start + i) as f32 * 0.07).cos()));
+                    let [d, r] = template.coefficients8(cutoffs, resonances, 44100.0);
+                    let end = (start + 8).min(len);
+                    dt[start..end].copy_from_slice(&d.to_array()[..end - start]);
+                    resonance[start..end].copy_from_slice(&r.to_array()[..end - start]);
+                }
+                [dt, resonance]
+            })
+            .collect();
+        type Kernel = unsafe fn([Option<(&mut LadderFilter, &mut [f32])>; LADDER_LANES], &[Option<LadderSamples>; LADDER_LANES]);
+        let kernels: [(&str, Kernel, f32); 2] = [
+            ("separate", LadderFilter::process_block_x8_samples, 0.0),
+            ("fused", LadderFilter::process_block_x8_samples_fma, 1e-4),
+        ];
+        for (name, kernel, tolerance) in kernels {
+            for block in [32, 1, 13] {
+                let make = |lane: usize| {
+                    let mut filter = LadderFilter::with_seed(lane as u64);
+                    filter.set_params(44100.0, 1000.0, 2.0);
+                    filter
+                };
+                let mut scalar: Vec<LadderFilter> = (0..LADDER_LANES).map(make).collect();
+                let mut lockstep: Vec<LadderFilter> = (0..LADDER_LANES).map(make).collect();
+                let mut expected = vec![input.clone(); LADDER_LANES];
+                let mut buffers = vec![input.clone(); LADDER_LANES];
+                let samples = |lane: usize, start: usize, end: usize| LadderSamples {
+                    dt: &coefficients[lane][0][start..end],
+                    resonance: &coefficients[lane][1][start..end],
+                };
+                for start in (0..len).step_by(block) {
+                    let end = (start + block).min(len);
+                    for &lane in &lanes {
+                        scalar[lane].process_samples(&mut expected[lane][start..end], samples(lane, start, end));
+                    }
+                    let entries: Vec<Option<(&mut LadderFilter, &mut [f32])>> = lockstep
+                        .iter_mut()
+                        .zip(buffers.iter_mut())
+                        .enumerate()
+                        .map(|(lane, (filter, buffer))| lanes.contains(&lane).then(|| (filter, &mut buffer[start..end])))
+                        .collect();
+                    let lane_coefficients: [Option<LadderSamples>; LADDER_LANES] =
+                        std::array::from_fn(|lane| lanes.contains(&lane).then(|| samples(lane, start, end)));
+                    unsafe { kernel(entries.try_into().ok().unwrap(), &lane_coefficients) };
+                }
+                for &lane in &lanes {
+                    let case = format!("{name}, lane {lane}, blocks of {block}");
+                    let worst = (0..len).map(|i| (buffers[lane][i] - expected[lane][i]).abs()).fold(0.0_f32, f32::max);
+                    assert!(worst <= tolerance, "{case}: differs by up to {worst}");
+                    assert!(expected[lane].iter().any(|sample| sample.abs() > 1e-3), "{case}");
+                    assert_eq!(scalar[lane].dt, lockstep[lane].dt, "{case}");
+                    assert_eq!(scalar[lane].resonance, lockstep[lane].resonance, "{case}");
+                    if tolerance == 0.0 {
+                        assert_eq!(scalar[lane].process(0.25), lockstep[lane].process(0.25), "{case}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn lockstep_matches_scalar_processing_exactly() {
         if !is_x86_feature_detected!("avx") {

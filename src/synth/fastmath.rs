@@ -124,9 +124,133 @@ const SIN_C5: f32 = 81.601_004;
 const SIN_C7: f32 = -76.549_78;
 const SIN_C9: f32 = 39.536_706;
 
+/// The same approximations for eight values at a time. They do the same operations in the same
+/// order (with no fused multiply-adds), so every lane comes out exactly as the one-value
+/// version would.
+pub mod x8 {
+    use wide::{bytemuck::cast, f32x8, i32x8, u32x8};
+
+    use super::{
+        EXP2_C0, EXP2_C1, EXP2_C2, EXP2_C3, EXP2_C4, EXP2_C5, LOG2_C1, LOG2_C3, LOG2_C5, LOG2_C7,
+        LOG2_C9, ROUND_MAGIC, ROUND_MAGIC_BITS, SIN_C1, SIN_C3, SIN_C5, SIN_C7, SIN_C9,
+    };
+
+    #[inline(always)]
+    fn splat(value: f32) -> f32x8 {
+        f32x8::splat(value)
+    }
+
+    /// [`exp2()`][super::exp2()] of each lane.
+    #[inline]
+    pub fn exp2(x: f32x8) -> f32x8 {
+        let underflow = x.simd_lt(splat(-126.0));
+        // (`min()` only adds a check for a NaN bound)
+        let x = x.fast_min(splat(127.0));
+        let shifted = x + splat(ROUND_MAGIC);
+        let integer = cast::<f32x8, u32x8>(shifted) - u32x8::splat(ROUND_MAGIC_BITS);
+        let fraction = x - (shifted - splat(ROUND_MAGIC));
+        let poly = exp2_fraction(fraction);
+        let result = cast::<u32x8, f32x8>(cast::<f32x8, u32x8>(poly) + (integer << 23));
+        underflow.select(f32x8::ZERO, result)
+    }
+
+    /// [`log2()`][super::log2()] of each lane.
+    #[inline]
+    pub fn log2(x: f32x8) -> f32x8 {
+        let bits = cast::<f32x8, u32x8>(x);
+        let exponent =
+            cast::<u32x8, i32x8>((bits >> 23) & u32x8::splat(0xff)) - i32x8::splat(127);
+        let mantissa =
+            cast::<u32x8, f32x8>((bits & u32x8::splat(0x007f_ffff)) | u32x8::splat(0x3f80_0000));
+        let big = mantissa.simd_gt(splat(std::f32::consts::SQRT_2));
+        let mantissa = big.select(mantissa * splat(0.5), mantissa);
+        // The mask's lanes are all ones, -1 as integers
+        let exponent = exponent - cast::<f32x8, i32x8>(big);
+        let t = (mantissa - splat(1.0)) / (mantissa + splat(1.0));
+        let t2 = t * t;
+        let series = t
+            * (splat(LOG2_C1)
+                + t2 * (splat(LOG2_C3)
+                    + t2 * (splat(LOG2_C5) + t2 * (splat(LOG2_C7) + t2 * splat(LOG2_C9)))));
+        exponent.round_float() + series
+    }
+
+    /// [`pow()`][super::pow()] of each lane.
+    #[inline]
+    pub fn pow(base: f32x8, exponent: f32x8) -> f32x8 {
+        base.simd_gt(f32x8::ZERO).select(exp2(exponent * log2(base)), f32x8::ZERO)
+    }
+
+    /// [`sin_cycles()`][super::sin_cycles()] of each lane.
+    #[inline]
+    pub fn sin_cycles(phase: f32x8) -> f32x8 {
+        let shifted = phase + splat(ROUND_MAGIC);
+        let x = phase - (shifted - splat(ROUND_MAGIC));
+        let x = x.simd_gt(splat(0.25)).select(splat(0.5) - x, x);
+        let x = x.simd_lt(splat(-0.25)).select(splat(-0.5) - x, x);
+        let x2 = x * x;
+        x * (splat(SIN_C1)
+            + x2 * (splat(SIN_C3) + x2 * (splat(SIN_C5) + x2 * (splat(SIN_C7) + x2 * splat(SIN_C9)))))
+    }
+
+    /// [`cos_cycles()`][super::cos_cycles()] of each lane.
+    #[inline]
+    pub fn cos_cycles(phase: f32x8) -> f32x8 {
+        let shifted = phase + splat(ROUND_MAGIC);
+        sin_cycles(phase - (shifted - splat(ROUND_MAGIC)) + splat(0.25))
+    }
+
+    /// [`tan_cycles()`][super::tan_cycles()] of each lane.
+    #[inline]
+    pub fn tan_cycles(phase: f32x8) -> f32x8 {
+        sin_cycles(phase) / cos_cycles(phase)
+    }
+
+    #[inline]
+    fn exp2_fraction(f: f32x8) -> f32x8 {
+        let f2 = f * f;
+        (f * splat(EXP2_C1)
+            + f2 * (splat(EXP2_C2) + f * splat(EXP2_C3))
+            + f2 * f2 * (splat(EXP2_C4) + f * splat(EXP2_C5)))
+            + splat(EXP2_C0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks an eight lane function against its one-value version, to the bit, on the inputs
+    /// eight at a time.
+    fn assert_lanes_match(inputs: &[f32], lanes: impl Fn(wide::f32x8) -> wide::f32x8, one: impl Fn(f32) -> f32) {
+        for chunk in inputs.chunks_exact(8) {
+            let got = lanes(wide::f32x8::new(chunk.try_into().unwrap())).to_array();
+            for (input, got) in chunk.iter().zip(got) {
+                assert_eq!(got.to_bits(), one(*input).to_bits(), "{input}: {got} vs {}", one(*input));
+            }
+        }
+    }
+
+    #[test]
+    fn eight_lane_versions_match_exactly() {
+        let wide: Vec<f32> = (-13_000..13_000).map(|i| i as f32 / 97.0 + 0.000_31).collect();
+        assert_lanes_match(&wide, x8::exp2, exp2);
+        assert_lanes_match(&[-300.0, -127.0, -126.0, -125.9, 126.9, 127.0, 128.0, 300.0], x8::exp2, exp2);
+        let positive: Vec<f32> = (1..=80_000).map(|i| i as f32 * 0.003_7).collect();
+        assert_lanes_match(&positive, x8::log2, log2);
+        let tiny: Vec<f32> = (0..64).map(|i| (i as f32 - 120.0).exp2() * 1.37).collect();
+        assert_lanes_match(&tiny, x8::log2, log2);
+        let phases: Vec<f32> = (-40_000..40_000).map(|i| i as f32 * 0.000_13).collect();
+        assert_lanes_match(&phases, x8::sin_cycles, sin_cycles);
+        assert_lanes_match(&phases, x8::cos_cycles, cos_cycles);
+        let tangents: Vec<f32> = (0..24_496).map(|i| i as f32 * 0.000_01).collect();
+        assert_lanes_match(&tangents[..24_496 / 8 * 8], x8::tan_cycles, tan_cycles);
+        for exponent in [1.0 / 256.0, 0.3, 1.0, 7.3, 256.0] {
+            let bases: Vec<f32> = (-8..1000).map(|i| i as f32 / 997.0).collect();
+            let bases = &bases[..bases.len() / 8 * 8];
+            assert_lanes_match(bases, |b| x8::pow(b, wide::f32x8::splat(exponent)), |b| pow(b, exponent));
+        }
+    }
 
     fn max_relative_error(inputs: impl Iterator<Item = f32>, f: impl Fn(f32) -> f32, g: impl Fn(f32) -> f32) -> f32 {
         inputs

@@ -11,7 +11,7 @@ use self::filter::FilterContainer;
 use self::filter::FilterController;
 #[cfg(target_arch = "x86_64")]
 use self::filter::{LadderFilter, LADDER_LANES};
-use self::filter::{SvfSimper, SVF_LANES};
+use self::filter::{LadderSamples, SvfSamples, SvfSimper, SVF_LANES};
 use self::modulation::{
     apply_routes, ModSource, ModTarget, Route, Sources, Targets, N_LFOS, N_MOD_ENVELOPES,
     N_SOURCES,
@@ -24,12 +24,14 @@ use self::oscillator::Modulation;
 use self::oscillator::OscVoice;
 use self::oscillator::OscWave;
 use self::oscillator::OscillatorParams;
+use self::oscillator::SampleValues;
 use self::oscillator::SimdLevel;
 use self::oscillator::SuperVoice;
 use self::oscillator::WavetableFrames;
 use self::oscillator::WavetableNotes;
 use self::oscillator::WavetableSet;
 use self::oscillator::UNISON_VECTORS;
+use self::per_sample::{RoutesByTarget, SampleControls};
 
 /// Samples per control rate block. Envelopes, pitch, the LFOs, the modulation matrix,
 /// keytracking and the filter coefficients are only recalculated this often (unless the
@@ -45,19 +47,10 @@ pub enum ModulationRate {
     /// Once per block of [`CONTROL_BLOCK_SAMPLES`] samples, ramping in between.
     #[default]
     Block,
-    /// At every sample, for the fastest envelopes and LFOs. The synth then takes 5 to 20 times
-    /// the CPU, depending on the patch (see `benchmark_modulation_rate`).
+    /// At every sample, for the fastest envelopes and LFOs: the values of each sample of a
+    /// block are worked out together, eight samples at a time, and those that don't change
+    /// within the block only once (see [`per_sample`]).
     Sample,
-}
-
-impl ModulationRate {
-    /// Samples per control rate block.
-    pub fn block_samples(self) -> usize {
-        match self {
-            ModulationRate::Block => CONTROL_BLOCK_SAMPLES,
-            ModulationRate::Sample => 1,
-        }
-    }
 }
 
 /// Phase modulation depth, in cycles per unit of modulator output (150 radians).
@@ -277,7 +270,12 @@ impl ThreeOsc {
                 .iter()
                 .any(|route| route.source.to_index() == source)
         });
-        let control_block = self.modulation_rate.block_samples();
+        let per_sample = self.modulation_rate == ModulationRate::Sample;
+        // The portamento after each number of samples within a block
+        let mut portamento_powers = [1.0; CONTROL_BLOCK_SAMPLES + 1];
+        for n in 1..=CONTROL_BLOCK_SAMPLES {
+            portamento_powers[n] = portamento_powers[n - 1] * (1.0 - self.portamento_rate);
+        }
 
         VoiceContext {
             oscillators: &self.oscillators,
@@ -294,8 +292,10 @@ impl ThreeOsc {
             stereo,
             octave_detune: self.octave_detune,
             portamento_rate: self.portamento_rate,
-            portamento_block: (1.0 - self.portamento_rate).powi(control_block as i32),
-            control_block,
+            portamento_block: (1.0 - self.portamento_rate).powi(CONTROL_BLOCK_SAMPLES as i32),
+            portamento_powers,
+            per_sample,
+            routes_by_target: RoutesByTarget::new(&self.routes),
             active,
             simd: self.simd,
             interpolation: self.interpolation,
@@ -330,19 +330,26 @@ impl ThreeOsc {
         // through three stages: the oscillators of every voice, then the filters (which can run
         // several voices in lockstep), then the amplitude envelopes mixing into the output.
         let len = output_left.len().min(output_right.len());
+        let per_sample = context.per_sample;
         let mut start = 0;
         while start < len {
-            let end = (start + context.control_block).min(len);
+            let end = (start + CONTROL_BLOCK_SAMPLES).min(len);
             let block_len = end - start;
             for voice in voices.iter_mut() {
-                voice.update_controls(&context, block_len);
+                if per_sample {
+                    voice.update_controls_per_sample(&context, block_len);
+                } else {
+                    voice.update_controls(&context, block_len);
+                }
                 voice.render_oscillators(&context, block_len);
             }
-            filter_voices(&mut voices, block_len, stereo, self.simd);
+            let filter_rate = per_sample.then_some(self.sample_rate as f32);
+            filter_voices(&mut voices, block_len, stereo, self.simd, filter_rate);
             for voice in voices.iter_mut() {
                 voice.mix_output(
                     block_len,
                     stereo,
+                    per_sample,
                     &mut output_left[start..end],
                     &mut output_right[start..end],
                 );
@@ -357,8 +364,8 @@ impl ThreeOsc {
             *out_r *= self.output_volume;
         }
     }
-    /// Runs only the control rate update of every voice for `blocks` blocks (of the modulation
-    /// rate's length), for the benchmarks.
+    /// Runs only the control rate update of every voice for `blocks` blocks, at the modulation
+    /// rate, for the benchmarks.
     #[cfg(test)]
     pub(crate) fn run_control_updates_only(&mut self, blocks: usize) {
         self.release_voices();
@@ -373,7 +380,11 @@ impl ThreeOsc {
         let context = self.voice_context(stereo);
         for _ in 0..blocks {
             for voice in voices.iter_mut() {
-                voice.update_controls(&context, context.control_block);
+                if context.per_sample {
+                    voice.update_controls_per_sample(&context, CONTROL_BLOCK_SAMPLES);
+                } else {
+                    voice.update_controls(&context, CONTROL_BLOCK_SAMPLES);
+                }
             }
         }
         self.voices = voices;
@@ -414,8 +425,12 @@ struct VoiceContext<'a> {
     portamento_rate: f32,
     /// The portamento rate applied over a whole control rate block.
     portamento_block: f32,
-    /// Samples per control rate block, see [`ModulationRate`].
-    control_block: usize,
+    /// The portamento applied over each number of samples within a block.
+    portamento_powers: [f32; CONTROL_BLOCK_SAMPLES + 1],
+    /// Whether the modulation runs at the sample rate, see [`ModulationRate`].
+    per_sample: bool,
+    /// The routes grouped by target, for the modulation at the sample rate.
+    routes_by_target: RoutesByTarget,
     /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
     /// modulate anything are skipped.
     active: [bool; 3],
@@ -477,6 +492,22 @@ pub struct Voice {
     /// output; `pre_filter_right` is only used in stereo.
     pre_filter: [f32; CONTROL_BLOCK_SAMPLES],
     pre_filter_right: [f32; CONTROL_BLOCK_SAMPLES],
+    /// Buffers for the oscillators modulating each other, kept here so that they aren't
+    /// cleared for every block.
+    scratch: Scratch,
+    /// The control values of each sample of the block, when the modulation runs at the sample
+    /// rate (the ramps above are then left alone).
+    samples: SampleControls,
+}
+
+/// The buffers of a voice's oscillators modulating each other within a block.
+struct Scratch {
+    /// The output of the oscillator after the current one (its modulator), and of the current
+    /// one when it modulates the oscillator before it. The two take turns.
+    modulators: [[f32; CONTROL_BLOCK_SAMPLES]; 2],
+    /// The modulator's output scaled by the depth of each kind of modulation (FM, PM and AM,
+    /// see [`Modulation`]).
+    amounts: [[f32; CONTROL_BLOCK_SAMPLES]; 3],
 }
 impl Voice {
     pub fn from_midi_note(index: u8, velocity: u8, osc: &[OscillatorParams], random: f32) -> Self {
@@ -517,6 +548,11 @@ impl Voice {
             drive: 1.0,
             pre_filter: [0.0; CONTROL_BLOCK_SAMPLES],
             pre_filter_right: [0.0; CONTROL_BLOCK_SAMPLES],
+            scratch: Scratch {
+                modulators: [[0.0; CONTROL_BLOCK_SAMPLES]; 2],
+                amounts: [[0.0; CONTROL_BLOCK_SAMPLES]; 3],
+            },
+            samples: SampleControls::new(),
         }
     }
     pub fn release(&mut self) {
@@ -595,7 +631,7 @@ impl Voice {
         let first_block = block_start == 0;
 
         // Portamento, applied for the whole block at once
-        self.semitone_detune *= if block_len == context.control_block {
+        self.semitone_detune *= if block_len == CONTROL_BLOCK_SAMPLES {
             context.portamento_block
         } else {
             partial_block_portamento(context.portamento_rate, block_len)
@@ -743,6 +779,7 @@ impl Voice {
     fn render_oscillators(&mut self, context: &VoiceContext, block_len: usize) {
         let block_len = block_len.min(CONTROL_BLOCK_SAMPLES);
         let stereo = context.stereo;
+        let per_sample = context.per_sample;
         let oscillators = context.oscillators;
         // The whole buffers, which is no dearer than a block's worth and saves a call for
         // short blocks
@@ -751,86 +788,149 @@ impl Voice {
             self.pre_filter_right = [0.0; CONTROL_BLOCK_SAMPLES];
         }
 
-        // The block of output of the oscillator after the current one (its modulator), and
-        // the current oscillator's output when the oscillator before it is modulated. The two
-        // buffers take turns, by swapping the references to them.
-        let mut buffers = [[0.0_f32; CONTROL_BLOCK_SAMPLES]; 2];
-        let [modulator, modulator_next] = &mut buffers;
+        // The two modulator buffers take turns, by swapping the references to them
+        let Scratch { modulators: [modulator, modulator_next], amounts } = &mut self.scratch;
         let (mut modulator, mut modulator_next) = (modulator, modulator_next);
+        let samples = &self.samples;
+        // Which kinds of modulation (FM, PM, AM) each oscillator has from the next one
+        let kinds = |i: usize| -> [bool; 3] {
+            if per_sample {
+                samples.osc_modulated[i]
+            } else {
+                [self.osc_fm[i] > 0.0, self.osc_pm[i] > 0.0, self.osc_am[i] > 0.0]
+            }
+        };
         let mut have_modulator = false;
         for i in (0..3).rev() {
-            let modulates_next = i > 0
-                && context.active[i - 1]
-                && (self.osc_pm[i - 1] > 0.0 || self.osc_fm[i - 1] > 0.0 || self.osc_am[i - 1] > 0.0);
-            let silent = self.osc_gain[i] == 0.0 && self.osc_gain_step[i] == 0.0;
+            let modulates_next = i > 0 && context.active[i - 1] && kinds(i - 1).contains(&true);
+            let silent = if per_sample {
+                samples.osc_silent[i]
+            } else {
+                self.osc_gain[i] == 0.0 && self.osc_gain_step[i] == 0.0
+            };
             if !context.active[i] || (silent && !modulates_next) {
                 // Its output would be silent, and it isn't modulating anything that matters
                 have_modulator = false;
                 continue;
             }
             let osc = &oscillators[i];
-            let modulated = self.osc_pm[i] > 0.0 || self.osc_fm[i] > 0.0 || self.osc_am[i] > 0.0;
-            let modulation = if modulated && have_modulator {
-                Some(Modulation {
-                    input: &modulator[..block_len],
-                    fm: self.osc_fm[i] * FM_DEPTH,
-                    pm: self.osc_pm[i] * PM_DEPTH_CYCLES,
-                    am: self.osc_am[i],
-                })
+            let kinds = kinds(i);
+            let modulated = have_modulator && kinds.contains(&true);
+            if modulated {
+                // The modulator's output scaled by the depth of each kind of modulation
+                let [fm, pm, am] = &mut *amounts;
+                let amounts = [&mut fm[..block_len], &mut pm[..block_len], &mut am[..block_len]];
+                if per_sample {
+                    let [fm, pm, am] = &samples.osc_depths[i];
+                    Modulation::scale(&modulator[..block_len], |n| [fm[n], pm[n], am[n]], amounts);
+                } else {
+                    let depths = [self.osc_fm[i] * FM_DEPTH, self.osc_pm[i] * PM_DEPTH_CYCLES, self.osc_am[i]];
+                    Modulation::scale(&modulator[..block_len], |_| depths, amounts);
+                }
+            }
+            let detune_factors = if self.detune_modulated[i] {
+                &self.detune_factors[i]
             } else {
-                None
+                &osc.detune_factors
             };
 
-            let params = BlockParams {
-                delta: self.osc_delta[i],
-                delta_step: self.osc_delta_step[i],
-                gain: self.osc_gain[i] * self.drive,
-                gain_step: self.osc_gain_step[i] * self.drive,
-                modulation,
-                voices: osc.unison_voices(),
-                detune_factors: if self.detune_modulated[i] {
-                    &self.detune_factors[i]
-                } else {
-                    &osc.detune_factors
-                },
-                mask: &osc.voice_mask,
-                pan_left: &osc.pan_left,
-                pan_right: &osc.pan_right,
+            // The block in runs of samples with the same pair of frames: always one at the
+            // control rate, and nearly always at the sample rate. Values that don't change
+            // within the block are rendered like a control rate block without ramps.
+            let wavetable = context.frames[i];
+            let varies = per_sample && samples.osc_varies[i];
+            let (delta, delta_step, gain, gain_step) = if !per_sample {
+                let (gain, gain_step) = (self.osc_gain[i] * self.drive, self.osc_gain_step[i] * self.drive);
+                (self.osc_delta[i], self.osc_delta_step[i], gain, gain_step)
+            } else {
+                (samples.osc_delta[i][0], 0.0, samples.osc_gain[i][0], 0.0)
             };
-            let mut output = BlockOutput {
-                left: &mut self.pre_filter[..block_len],
-                right: if stereo {
-                    Some(&mut self.pre_filter_right[..block_len])
+            let mut start = 0;
+            while start < block_len {
+                let (end, frames) = if varies {
+                    let frame = samples.osc_frame[i][start];
+                    let (end, blend) = if samples.osc_frames_vary[i] {
+                        let end = (start + 1..block_len)
+                            .find(|&n| samples.osc_frame[i][n] != frame)
+                            .unwrap_or(block_len);
+                        (end, samples.osc_mix[i][start..end].iter().any(|mix| *mix > 0.0))
+                    } else {
+                        (block_len, samples.osc_blend[i])
+                    };
+                    // The pair's mix only says whether the second frame is read
+                    let a = frame as usize;
+                    let b = (a + 1).min(wavetable.frames.len() - 1);
+                    (end, wavetable.frame_pair((a, b, if blend { 1.0 } else { 0.0 }), self.osc_note[i]))
+                } else if per_sample {
+                    let a = samples.osc_frame[i][0] as usize;
+                    let b = (a + 1).min(wavetable.frames.len() - 1);
+                    (block_len, wavetable.frame_pair((a, b, samples.osc_mix[i][0]), self.osc_note[i]))
                 } else {
-                    None
-                },
-                mono: if modulates_next {
-                    Some((&mut modulator_next[..block_len], 1.0))
-                } else {
-                    None
-                },
-            };
-            let frames = context.frames[i].frame_pair(self.osc_frames[i], self.osc_note[i]);
-            frames.render_block(
-                &mut self.osc_voice[i],
-                &params,
-                &mut output,
-                context.simd,
-                context.interpolation,
-            );
+                    (block_len, wavetable.frame_pair(self.osc_frames[i], self.osc_note[i]))
+                };
+                let modulation = modulated.then(|| {
+                    let [fm, pm, am] = &*amounts;
+                    Modulation {
+                        fm: kinds[0].then_some(&fm[start..end]),
+                        pm: kinds[1].then_some(&pm[start..end]),
+                        am: kinds[2].then_some(&am[start..end]),
+                    }
+                });
+                let params = BlockParams {
+                    delta,
+                    delta_step,
+                    gain,
+                    gain_step,
+                    per_sample: varies.then(|| SampleValues {
+                        delta: &samples.osc_delta[i][start..end],
+                        gain: &samples.osc_gain[i][start..end],
+                        mix: &samples.osc_mix[i][start..end],
+                    }),
+                    modulation,
+                    voices: osc.unison_voices(),
+                    detune_factors,
+                    mask: &osc.voice_mask,
+                    pan_left: &osc.pan_left,
+                    pan_right: &osc.pan_right,
+                };
+                let mut output = BlockOutput {
+                    left: &mut self.pre_filter[start..end],
+                    right: if stereo {
+                        Some(&mut self.pre_filter_right[start..end])
+                    } else {
+                        None
+                    },
+                    mono: if modulates_next {
+                        Some((&mut modulator_next[start..end], 1.0))
+                    } else {
+                        None
+                    },
+                };
+                frames.render_block(
+                    &mut self.osc_voice[i],
+                    &params,
+                    &mut output,
+                    context.simd,
+                    context.interpolation,
+                );
+                start = end;
+            }
 
-            // The ramps continue from where the block left them
-            self.osc_delta[i] += self.osc_delta_step[i] * block_len as f32;
-            self.osc_gain[i] += self.osc_gain_step[i] * block_len as f32;
+            if !per_sample {
+                // The ramps continue from where the block left them
+                self.osc_delta[i] += self.osc_delta_step[i] * block_len as f32;
+                self.osc_gain[i] += self.osc_gain_step[i] * block_len as f32;
+            }
             have_modulator = modulates_next;
             std::mem::swap(&mut modulator, &mut modulator_next);
         }
     }
     /// Runs the voice's filter(s) over the current block, one sample at a time.
-    fn filter_block(&mut self, block_len: usize, stereo: bool) {
-        filter_samples(&mut self.filter, &mut self.pre_filter[..block_len]);
+    fn filter_block(&mut self, block_len: usize, stereo: bool, per_sample: Option<f32>) {
+        let samples = per_sample.map(|sample_rate| (&self.samples, sample_rate));
+        filter_samples(&mut self.filter, &mut self.pre_filter[..block_len], samples);
         if stereo {
-            filter_samples(&mut self.filter_right, &mut self.pre_filter_right[..block_len]);
+            filter_samples(&mut self.filter_right, &mut self.pre_filter_right[..block_len], samples);
         }
     }
     /// Applies the amplitude envelope and velocity to the filtered block and adds it to the
@@ -839,10 +939,34 @@ impl Voice {
         &mut self,
         block_len: usize,
         stereo: bool,
+        per_sample: bool,
         out_left: &mut [f32],
         out_right: &mut [f32],
     ) {
         let block_len = block_len.min(out_left.len()).min(out_right.len());
+        if per_sample {
+            // Every sample's own gain
+            let gains = &self.samples.gain[..block_len];
+            let left = &self.pre_filter[..block_len];
+            if stereo {
+                let right = &self.pre_filter_right[..block_len];
+                for ((((out_l, out_r), left), right), gain) in
+                    izip!(&mut out_left[..block_len], &mut out_right[..block_len]).zip(left).zip(right).zip(gains)
+                {
+                    *out_l += left * gain;
+                    *out_r += right * gain;
+                }
+            } else {
+                for (((out_l, out_r), left), gain) in
+                    izip!(&mut out_left[..block_len], &mut out_right[..block_len]).zip(left).zip(gains)
+                {
+                    let sample = left * gain;
+                    *out_l += sample;
+                    *out_r += sample;
+                }
+            }
+            return;
+        }
         // The gain of each sample is computed from its index rather than accumulated, so the
         // samples don't depend on each other and the loop vectorises. The index goes through an
         // `i32`, which converts to a float in one instruction (a `usize` takes several).
@@ -885,25 +1009,37 @@ fn partial_block_portamento(rate: f32, block_len: usize) -> f32 {
 const SVF_LOCKSTEP_MIN_BLOCK: usize = 4;
 
 /// Runs every voice's filter over the current block. The Digital (SVF) and Ladder filters are
-/// processed several voices at a time, in lockstep.
-fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: SimdLevel) {
+/// processed several voices at a time, in lockstep. With `per_sample` (the sample rate, when
+/// the modulation runs at it), the filters take each sample's coefficients from the voices'
+/// [`SampleControls`].
+fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: SimdLevel, per_sample: Option<f32>) {
     // Every voice is configured from the same controller before being filtered, so they all
     // use the same filter model and the first voice's picks the lockstep kernel. Any voice that
     // doesn't match it is filtered one sample at a time.
     match voices.first().map(|voice| &voice.filter) {
-        // Too short a block to be worth moving into lockstep (a single sample, when the
-        // modulation runs at the sample rate): one voice at a time gives the same output.
+        // Too short a block to be worth moving into lockstep (a single sample, at the end of a
+        // buffer or before an event): one voice at a time gives the same output.
         Some(FilterContainer::SvfSimperFilter(_)) if block_len >= SVF_LOCKSTEP_MIN_BLOCK => {
             for chunk in voices.chunks_mut(SVF_LANES) {
                 filter_chunk_lockstep::<SvfSimper, SVF_LANES>(
                     chunk,
                     block_len,
                     stereo,
+                    per_sample,
                     |filter| match filter {
                         FilterContainer::SvfSimperFilter(svf) => Ok(svf),
                         other => Err(other),
                     },
-                    |lanes| {
+                    |lanes, samples| {
+                        if per_sample.is_some() && coefficients_vary(&samples) {
+                            let coefficients = samples.map(|samples| samples.map(|samples| svf_samples(samples, block_len)));
+                            #[cfg(target_arch = "x86_64")]
+                            if simd.has_avx() {
+                                // SAFETY: the CPU supports AVX.
+                                return unsafe { SvfSimper::process_block_x8_samples_avx(lanes, &coefficients) };
+                            }
+                            return SvfSimper::process_block_x8_samples(lanes, &coefficients);
+                        }
                         #[cfg(target_arch = "x86_64")]
                         if simd.has_avx() {
                             // SAFETY: the CPU supports AVX.
@@ -921,6 +1057,7 @@ fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: Sim
                     chunk,
                     block_len,
                     stereo,
+                    per_sample,
                     |filter| {
                         let lockstep = matches!(
                             filter,
@@ -936,55 +1073,113 @@ fn filter_voices(voices: &mut [Voice], block_len: usize, stereo: bool, simd: Sim
                     },
                     // SAFETY: this path is only taken on the AVX2 levels, which are only
                     // picked when the CPU supports AVX2 and FMA.
-                    |lanes| unsafe { LadderFilter::process_block_x8_fma(lanes) },
+                    |lanes, samples| unsafe {
+                        if per_sample.is_some() && coefficients_vary(&samples) {
+                            let coefficients = samples.map(|samples| samples.map(|samples| ladder_samples(samples, block_len)));
+                            LadderFilter::process_block_x8_samples_fma(lanes, &coefficients)
+                        } else {
+                            LadderFilter::process_block_x8_fma(lanes)
+                        }
+                    },
                 );
             }
         }
         _ => {
             let _ = simd;
             for voice in voices {
-                voice.filter_block(block_len, stereo);
+                voice.filter_block(block_len, stereo, per_sample);
             }
         }
     }
 }
 
-/// Runs a filter over a block of samples, in place.
-fn filter_samples(filter: &mut FilterContainer, samples: &mut [f32]) {
-    if matches!(filter, FilterContainer::None) {
-        return;
+/// Whether any of the lanes' filter coefficients change within the block. If none do, they
+/// have been set on the filters, which run as at the control rate.
+fn coefficients_vary(samples: &[Option<&SampleControls>]) -> bool {
+    samples.iter().flatten().any(|samples| samples.filter_varies)
+}
+
+/// The Digital filter's coefficients of the first `len` samples of a block.
+fn svf_samples(samples: &SampleControls, len: usize) -> SvfSamples<'_> {
+    let [c1, c2, c3, k] = &samples.filter;
+    SvfSamples {
+        c1: &c1[..len],
+        c2: &c2[..len],
+        c3: &c3[..len],
+        k: &k[..len],
     }
-    for sample in samples {
-        *sample = filter.process(*sample);
+}
+
+/// The ladder's integration rates and resonances of the first `len` samples of a block.
+fn ladder_samples(samples: &SampleControls, len: usize) -> LadderSamples<'_> {
+    let [dt, resonance, ..] = &samples.filter;
+    LadderSamples {
+        dt: &dt[..len],
+        resonance: &resonance[..len],
+    }
+}
+
+/// Runs a filter over a block of samples, in place. With `per_sample`, every sample's
+/// coefficients come from the voice's [`SampleControls`] (the other models than the Digital
+/// filter and the ladder work theirs out from each sample's cutoff and resonance, at the given
+/// sample rate), unless they stay the same throughout the block.
+fn filter_samples(filter: &mut FilterContainer, samples: &mut [f32], per_sample: Option<(&SampleControls, f32)>) {
+    let Some((controls, sample_rate)) = per_sample.filter(|(controls, _)| controls.filter_varies) else {
+        if matches!(filter, FilterContainer::None) {
+            return;
+        }
+        for sample in samples {
+            *sample = filter.process(*sample);
+        }
+        return;
+    };
+    let len = samples.len();
+    match filter {
+        FilterContainer::None => {}
+        FilterContainer::SvfSimperFilter(svf) => svf.process_samples(samples, svf_samples(controls, len)),
+        FilterContainer::LadderFilter(ladder) => ladder.process_samples(samples, ladder_samples(controls, len)),
+        other => {
+            let [cutoff, resonance, ..] = &controls.filter;
+            for (n, sample) in samples.iter_mut().enumerate() {
+                other.set_params(sample_rate, cutoff[n], resonance[n]);
+                *sample = other.process(*sample);
+            }
+        }
     }
 }
 
 /// Filters a chunk of up to `N` voices: the filters that `select` picks out run in lockstep
-/// through `process`, the rest one sample at a time. In stereo the right channel's filters form
-/// a second set of lanes.
+/// through `process` (which also gets the voices' [`SampleControls`] with `per_sample`), the
+/// rest one sample at a time. In stereo the right channel's filters form a second set of lanes.
 fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
     chunk: &'a mut [Voice],
     block_len: usize,
     stereo: bool,
+    per_sample: Option<f32>,
     select: impl Fn(&mut FilterContainer) -> Result<&mut F, &mut FilterContainer>,
-    process: impl Fn([Option<(&mut F, &mut [f32])>; N]),
+    process: impl Fn([Option<(&mut F, &mut [f32])>; N], [Option<&'a SampleControls>; N]),
 ) {
     let mut left: [Option<(&'a mut F, &'a mut [f32])>; N] = std::array::from_fn(|_| None);
     let mut right: [Option<(&'a mut F, &'a mut [f32])>; N] = std::array::from_fn(|_| None);
+    let mut samples: [Option<&'a SampleControls>; N] = [None; N];
     for (lane, voice) in chunk.iter_mut().enumerate() {
         let Voice {
             filter,
             filter_right,
             pre_filter,
             pre_filter_right,
+            samples: controls,
             ..
         } = voice;
+        let controls = &*controls;
+        samples[lane] = Some(controls);
+        let per_sample = per_sample.map(|sample_rate| (controls, sample_rate));
         let assign = |filter: &'a mut FilterContainer,
                       buffer: &'a mut [f32],
                       lanes: &mut [Option<(&'a mut F, &'a mut [f32])>; N]| {
             match select(filter) {
                 Ok(filter) => lanes[lane] = Some((filter, buffer)),
-                Err(filter) => filter_samples(filter, buffer),
+                Err(filter) => filter_samples(filter, buffer, per_sample),
             }
         };
         assign(filter, &mut pre_filter[..block_len], &mut left);
@@ -992,13 +1187,17 @@ fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
             assign(filter_right, &mut pre_filter_right[..block_len], &mut right);
         }
     }
-    process(left);
+    // The lanes whose filters are left out have their controls left out too
+    let right_samples = std::array::from_fn(|lane| right[lane].as_ref().and(samples[lane]));
+    let left_samples = std::array::from_fn(|lane| left[lane].as_ref().and(samples[lane]));
+    process(left, left_samples);
     if stereo {
-        process(right);
+        process(right, right_samples);
     }
 }
 
 pub mod fastmath;
+mod per_sample;
 pub mod wav;
 pub mod wavetable_file;
 pub mod modulation;

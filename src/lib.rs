@@ -902,42 +902,57 @@ mod tests {
         assert!(ids.contains(&String::from("env_attack_2")));
     }
 
-    /// Renders a note whose pitch and cutoff are modulated by LFOs (one of them faster than
-    /// half the block rate's control rate), with a short attack and a pitch slide, at the given
-    /// modulation rate and in buffers of `buffer_len` samples.
-    fn render_fast_modulation(
+    /// Fast modulation of a sine note, whose bandlimited tables are all the same whatever the
+    /// pitch: pitch and volume LFOs faster than the block rate can follow, an envelope on the
+    /// amplitude, a slower LFO on the cutoff, a short attack and a pitch slide, and optionally
+    /// an LFO modulating another's rate.
+    fn fast_modulation(plugin: &mut ThreeOscPlugin, model: synth::filter::FilterModel, lfo_rate: bool) {
+        let route = |source, target, amount| Route {
+            source,
+            target,
+            amount,
+        };
+        let synth = &mut plugin.synth;
+        synth.routes.extend_from_slice(&[
+            route(ModSource::Lfo1, ModTarget::Pitch, 0.1),
+            route(ModSource::Lfo2, ModTarget::Volume, -0.5),
+            route(ModSource::Env1, ModTarget::Osc1Amp, -0.4),
+            route(ModSource::Lfo3, ModTarget::Cutoff, -0.2),
+        ]);
+        if lfo_rate {
+            synth.routes.push(route(ModSource::Lfo3, ModTarget::Lfo1Rate, 0.3));
+        }
+        synth.lfos[0].freq = 900.0;
+        synth.lfos[1].freq = 700.0;
+        synth.lfos[2].freq = 40.0;
+        synth.mod_envelopes[0].decay_time = 0.01;
+        synth.gain_envelope.attack_time = 0.002;
+        synth.portamento_offset = 12.0;
+        synth.filter_controller.filter_model = model;
+        synth.filter_controller.target_cutoff = 3000.0;
+        synth.oscillators[0].wavetable = 0;
+    }
+
+    /// Renders a note with the given patch changes, at the given modulation rate and in
+    /// buffers of `buffer_len` samples.
+    fn render_buffers(
         plugin: &mut ThreeOscPlugin,
         rate: synth::ModulationRate,
         buffer_len: usize,
+        setup: impl Fn(&mut ThreeOscPlugin),
     ) -> Vec<f32> {
         plugin.synth.reset();
         plugin.apply_params();
         plugin.synth.modulation_rate = rate;
         plugin.synth.routes.clear();
-        plugin.synth.routes.extend_from_slice(&[
-            Route {
-                source: ModSource::Lfo1,
-                target: ModTarget::Pitch,
-                amount: 0.1,
-            },
-            Route {
-                source: ModSource::Lfo2,
-                target: ModTarget::Cutoff,
-                amount: 0.3,
-            },
-        ]);
-        plugin.synth.lfos[0].freq = 900.0;
-        plugin.synth.lfos[1].freq = 30.0;
-        plugin.synth.gain_envelope.attack_time = 0.002;
-        plugin.synth.portamento_offset = 12.0;
-        plugin.synth.filter_controller.filter_model = synth::filter::FilterModel::SvfSimperFilter;
         for osc in plugin.synth.oscillators.iter_mut() {
             osc.phase_rand = 0.0;
         }
+        setup(plugin);
         plugin.synth.note_on(60, 100);
 
-        let mut left = vec![0.0; 2048];
-        let mut right = vec![0.0; 2048];
+        let mut left = vec![0.0; 4096];
+        let mut right = vec![0.0; 4096];
         for (left, right) in left.chunks_mut(buffer_len).zip(right.chunks_mut(buffer_len)) {
             plugin.synth.run(left, right);
         }
@@ -945,11 +960,14 @@ mod tests {
         left
     }
 
-    /// At the sample rate, the modulation is worked out afresh for every sample: exactly what
-    /// the block rate does when the buffers are a sample long. That is audibly different from
-    /// the block rate for fast modulation.
+    /// At the sample rate, every sample gets the control values for its own time. That is
+    /// what the block rate gives with buffers a sample long (the per sample path works a
+    /// whole block's values out at once, and its filters take each sample's coefficients for
+    /// that sample, where the block rate's take the next sample's), and far from what it gives
+    /// for fast modulation otherwise.
     #[test]
-    fn sample_rate_modulation_updates_every_sample() {
+    fn sample_rate_modulation_follows_every_sample() {
+        use synth::filter::FilterModel;
         use synth::ModulationRate;
 
         let mut plugin = ThreeOscPlugin::default();
@@ -957,14 +975,88 @@ mod tests {
             plugin.params.global.modulation_rate.value().to_modulation_rate(),
             ModulationRate::Block
         );
-        let sample_rate = render_fast_modulation(&mut plugin, ModulationRate::Sample, 2048);
-        let one_at_a_time = render_fast_modulation(&mut plugin, ModulationRate::Block, 1);
-        assert_eq!(sample_rate, one_at_a_time);
-        let block_rate = render_fast_modulation(&mut plugin, ModulationRate::Block, 2048);
-        assert!(max_abs_diff(&sample_rate, &block_rate) > 1e-2);
-        // Buffer sizes still don't matter at the sample rate
-        let odd_buffers = render_fast_modulation(&mut plugin, ModulationRate::Sample, 37);
-        assert_eq!(sample_rate, odd_buffers);
+        for (model, lfo_rate) in [
+            (FilterModel::None, false),
+            (FilterModel::None, true),
+            (FilterModel::SvfSimperFilter, false),
+            (FilterModel::LadderFilter, false),
+            (FilterModel::RcFilter, false),
+        ] {
+            let case = format!("{model:?}, LFO rate modulated: {lfo_rate}");
+            let setup = |plugin: &mut ThreeOscPlugin| fast_modulation(plugin, model, lfo_rate);
+            let sample_rate = render_buffers(&mut plugin, ModulationRate::Sample, 4096, setup);
+            let one_at_a_time = render_buffers(&mut plugin, ModulationRate::Block, 1, setup);
+            let block_rate = render_buffers(&mut plugin, ModulationRate::Block, 4096, setup);
+            let peak = one_at_a_time.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            assert!(peak > 0.05, "{case}: {peak}");
+            assert!(max_abs_diff(&sample_rate, &one_at_a_time) < 5e-3 * peak, "{case}");
+            assert!(max_abs_diff(&sample_rate, &block_rate) > 0.1 * peak, "{case}");
+            // The buffer sizes only change the rounding
+            let odd_buffers = render_buffers(&mut plugin, ModulationRate::Sample, 37, setup);
+            assert!(max_abs_diff(&sample_rate, &odd_buffers) < 1e-5, "{case}");
+        }
+    }
+
+    /// At the sample rate, the controls that stay the same throughout a block are only worked
+    /// out once, and the filters then run on one set of coefficients. That renders exactly
+    /// what working out every sample's gives: modulation by a source that never changes (the
+    /// mod wheel) sounds the same as by one that could, but doesn't (a square LFO slow enough
+    /// to stay high throughout).
+    #[test]
+    fn unchanging_modulation_is_worked_out_once() {
+        use synth::filter::FilterModel;
+        use synth::ModulationRate;
+
+        let mut plugin = ThreeOscPlugin::default();
+        let targets = [
+            (ModTarget::Cutoff, -0.3),
+            (ModTarget::Resonance, 0.2),
+            (ModTarget::Drive, 0.4),
+            (ModTarget::Pitch, 0.05),
+            (ModTarget::Osc1Amp, -0.2),
+            (ModTarget::Osc1Position, 0.6),
+            (ModTarget::Osc1Fm, 0.3),
+            (ModTarget::Osc1Am, 0.5),
+            (ModTarget::Volume, -0.25),
+        ];
+        for model in [
+            FilterModel::SvfSimperFilter,
+            FilterModel::LadderFilter,
+            FilterModel::RcFilter,
+            FilterModel::None,
+        ] {
+            let render = |plugin: &mut ThreeOscPlugin, source: ModSource| {
+                // The same start in the ladder's noise for both
+                fastrand::seed(7);
+                render_buffers(plugin, ModulationRate::Sample, 4096, |plugin| {
+                    let synth = &mut plugin.synth;
+                    synth.filter_controller.filter_model = model;
+                    synth.mod_wheel = 1.0;
+                    synth.lfos[0].wave = synth::oscillator::OscWave::Square;
+                    synth.lfos[0].freq = 0.01;
+                    // The second oscillator, for the FM and AM
+                    synth.oscillators[1].amp = 0.5;
+                    synth.oscillators[0].wavetable = OscillatorWave::PwSweep.wavetable_index().unwrap();
+                    for (target, amount) in targets {
+                        synth.routes.push(Route {
+                            source,
+                            target,
+                            amount,
+                        });
+                    }
+                })
+            };
+            let constant = render(&mut plugin, ModSource::ModWheel);
+            let changing = render(&mut plugin, ModSource::Lfo1);
+            assert_eq!(constant, changing, "{model:?}");
+            // (and the modulation does something)
+            let unmodulated = render_buffers(&mut plugin, ModulationRate::Sample, 4096, |plugin| {
+                plugin.synth.filter_controller.filter_model = model;
+                plugin.synth.oscillators[1].amp = 0.5;
+                plugin.synth.oscillators[0].wavetable = OscillatorWave::PwSweep.wavetable_index().unwrap();
+            });
+            assert!(max_abs_diff(&constant, &unmodulated) > 1e-3, "{model:?}");
+        }
     }
 
     /// Renders one note with the default patch, the given number of unison voices on every

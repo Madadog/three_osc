@@ -730,7 +730,8 @@ fn global(ui: &mut Ui, title: &str, global: &GlobalParams, matrix: &Matrix, sett
              worked out. Block works them out every 32 samples and glides gains, pitch and the \
              Digital filter in between, which is plenty for most sounds. Sample works them out at \
              every sample, for the snappiest envelopes and LFOs fast enough to be heard as \
-             tones, but takes 5 to 20 times the CPU, depending on the patch.",
+             tones. It costs little extra while nothing moves, and up to two or three times the \
+             CPU while modulation does.",
             setter,
         );
     });
