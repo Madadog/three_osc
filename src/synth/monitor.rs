@@ -1,6 +1,7 @@
 //! What the audio thread shows the GUI of the notes that are playing, so that the displays can
 //! follow them: where each voice is in its envelopes, and the newest voice's LFO phases,
-//! modulation and filter cutoff.
+//! modulation and filter cutoff. And the synth's output itself, for the meter and spectrogram
+//! (see [`OutputTap`]).
 //!
 //! The audio thread writes it after each buffer while the GUI is open (see
 //! [`ThreeOsc::publish()`][super::ThreeOsc::publish()]), and the GUI reads it as it draws. The
@@ -52,6 +53,8 @@ pub struct Monitor {
     modulation: [AtomicU32; N_TARGETS],
     /// The newest voice's filter cutoff, in Hz.
     cutoff: AtomicU32,
+    /// The synth's output.
+    pub output: OutputTap,
 }
 
 impl Default for Monitor {
@@ -63,6 +66,7 @@ impl Default for Monitor {
             lfo_phases: std::array::from_fn(|_| AtomicU32::new(0)),
             modulation: std::array::from_fn(|_| AtomicU32::new(0)),
             cutoff: AtomicU32::new(0),
+            output: OutputTap::default(),
         }
     }
 }
@@ -127,9 +131,88 @@ impl Monitor {
     }
 }
 
+/// The samples of each channel the output tap keeps: a third of a second at 192 kHz, which is
+/// many frames of the GUI.
+pub const OUTPUT_SAMPLES: usize = 1 << 16;
+
+/// The synth's output, for the GUI's meter and spectrogram: the audio thread writes each buffer
+/// into a ring of samples, and the GUI reads what is new as it draws.
+pub struct OutputTap {
+    left: Box<[AtomicU32]>,
+    right: Box<[AtomicU32]>,
+    /// The number of samples written so far, stored after the samples themselves.
+    written: AtomicU64,
+}
+
+impl Default for OutputTap {
+    fn default() -> Self {
+        let ring = || (0..OUTPUT_SAMPLES).map(|_| AtomicU32::new(0)).collect();
+        Self {
+            left: ring(),
+            right: ring(),
+            written: AtomicU64::new(0),
+        }
+    }
+}
+
+impl OutputTap {
+    /// Adds a buffer of the synth's output.
+    pub fn write(&self, left: &[f32], right: &[f32]) {
+        let start = self.written.load(Ordering::Relaxed);
+        let len = left.len().min(right.len());
+        for (i, (left, right)) in left.iter().zip(right).enumerate() {
+            let at = (start as usize + i) % OUTPUT_SAMPLES;
+            self.left[at].store(left.to_bits(), Ordering::Relaxed);
+            self.right[at].store(right.to_bits(), Ordering::Relaxed);
+        }
+        self.written.store(start + len as u64, Ordering::Release);
+    }
+
+    /// Appends the samples written since `from` (a count of samples written, as this returns)
+    /// to `left` and `right`, and returns the count to read on from next time. After a long
+    /// break, only the most recent half of the ring is read (the rest could be overwritten
+    /// while it is read).
+    pub fn read(&self, from: u64, left: &mut Vec<f32>, right: &mut Vec<f32>) -> u64 {
+        let end = self.written.load(Ordering::Acquire);
+        let start = from.clamp(end.saturating_sub(OUTPUT_SAMPLES as u64 / 2), end);
+        for position in start..end {
+            let at = (position % OUTPUT_SAMPLES as u64) as usize;
+            left.push(f32::from_bits(self.left[at].load(Ordering::Relaxed)));
+            right.push(f32::from_bits(self.right[at].load(Ordering::Relaxed)));
+        }
+        end
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_output_tap_hands_on_what_is_new() {
+        let tap = OutputTap::default();
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        assert_eq!(tap.read(0, &mut left, &mut right), 0);
+        tap.write(&[1.0, 2.0, 3.0], &[-1.0, -2.0, -3.0]);
+        let position = tap.read(0, &mut left, &mut right);
+        assert_eq!((position, &left[..], &right[..]), (3, &[1.0, 2.0, 3.0][..], &[-1.0, -2.0, -3.0][..]));
+        left.clear();
+        right.clear();
+        tap.write(&[4.0], &[-4.0]);
+        assert_eq!(tap.read(position, &mut left, &mut right), 4);
+        assert_eq!(left, [4.0]);
+
+        // Round the ring, more than it can keep: the newest half of it is read
+        let long: Vec<f32> = (0..OUTPUT_SAMPLES + 100).map(|i| i as f32).collect();
+        tap.write(&long, &long);
+        left.clear();
+        right.clear();
+        let end = tap.read(4, &mut left, &mut right);
+        assert_eq!(end, 4 + long.len() as u64);
+        assert_eq!(left.len(), OUTPUT_SAMPLES / 2);
+        assert_eq!(left.last(), long.last());
+        assert_eq!(right[0], long[long.len() - OUTPUT_SAMPLES / 2]);
+    }
 
     #[test]
     fn monitor_keeps_the_newest_voices() {

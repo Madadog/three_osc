@@ -23,7 +23,9 @@ Currently a work in progress, but usable nevertheless.
 * Effects after the voices: distortion (anti-aliased soft clipping), stereo chorus, delay (with ping-pong) and reverb
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
 * MIDI pitch bend with an adjustable range
-* A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page (the effects on a tab in place of the oscillators), and displays of each oscillator's wave, the LFOs, the envelopes, the filter's frequency response and the effects, which follow the notes as they play. Hover a control's label (or a display) for a description of what it does.
+* Presets: 21 factory presets (basses, leads, pads, plucks, keys and effects), and your own saved as JSON files
+* Microtuning with Scala files: any `.scl` scale, with an optional `.kbm` keyboard mapping
+* A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page (the effects on a tab in place of the oscillators), the presets and the tuning in the title bar, displays of each oscillator's wave, the LFOs, the envelopes, the filter's frequency response and the effects, which follow the notes as they play, and a spectrogram and level meter of the output. Hover a control's label (or a display) for a description of what it does.
 * Sample-accurate note timing
 
 ## Sound Demo
@@ -72,6 +74,37 @@ The FX tab, in the oscillators' place, has four effects that process the synth's
 
 Every setting is smoothed sample by sample, so automation and modulation (applied once per control rate block) don't step, and an effect that is switched on starts from silence. All four together take about 130 ns per sample on the machine below, a little over twice what 8 notes of the default patch take.
 
+### Presets
+The title bar's preset menu lists the factory presets by category, then your own; the arrows step through them, and a `*` after the name means the controls have been moved since the preset was loaded. Save stores the current settings as a preset of your own in `Documents/Three Osc/Presets` in your home directory (or the folder the `THREE_OSC_PRESETS` environment variable names), named after the file. The tuning isn't part of a preset: it stays as it is while you browse.
+
+A preset is a JSON file that lists the parameters that differ from their defaults, by their IDs (the same as in the plugin's saved state), plus the wavetable file of each oscillator that plays one:
+
+```json
+{
+  "name": "Wobble",
+  "category": "Bass",
+  "params": {
+    "fil1_cutoff": 300.0,
+    "fil1_model": "ladder",
+    "lfo_wave_1": "triangle",
+    "mod_source_1": "lfo1",
+    "mod_target_1": "cutoff",
+    "mod_amount_1": 0.35,
+    "osc1_voices": 3
+  }
+}
+```
+
+Sliders are numbers in the units they show (Hz, seconds, semitones, decibels, and 0 to 1 for percentages, except for the oscillators' Amplitude, Unison Detune, Phase and Phase Rand., which go from 0 to 100), switches are `true` or `false`, and choices are the IDs of their options. Anything a preset leaves out gets its default, so presets keep loading as parameters are added. Loading a preset sets each parameter through the host, as moving its slider would, so the host keeps track of them. The factory presets are the files in `presets/`, built into the plugin.
+
+### Tuning
+The title bar's Tuning menu retunes the keys with [Scala](https://www.huygens-fokker.org/scala/) files from `Documents/Three Osc/Tunings` (or the folder `THREE_OSC_TUNINGS` names), or from any path typed in:
+
+* A scale (`.scl`) lists the pitches of its steps above its root, in cents or as ratios, the last being the period it repeats at (usually the octave, `2/1`). On its own, its root is middle C at its usual pitch (261.63 Hz), and each key goes up the scale a step.
+* A keyboard mapping (`.kbm`) says which key plays which step (keys can be left silent, to put a 7 note scale on the white keys, say), which key is tuned to which frequency, and which keys are retuned at all (the others stay silent). With the standard scale, it can just move A away from 440 Hz.
+
+The files' contents are saved with the plugin's state, so a project sounds the same on a computer without them. Only the notes' pitches change: pitch bend, the oscillators' Detune and Octave controls and the pitch modulation still move in ordinary semitones, the filter's keytracking follows the tuned pitch, and the Key Track modulation source still follows the key's place on the keyboard.
+
 ### Wavetable files
 Set an oscillator's Wave to File to play a wavetable from a `.wav` file. The File row that appears lists the `.wav` files in the wavetable folder, `Documents/Three Osc/Wavetables` in your home directory (or the folder the `THREE_OSC_WAVETABLES` environment variable names); the Wavetable Files box shows the folder, rescans it, and loads a file from any other path into an oscillator. The chosen path is saved with the plugin's state.
 
@@ -85,6 +118,8 @@ Each note's table is only as long as its harmonics need (a power of two of at le
 The displays are drawn with the synth's own code, so they show what is played. An oscillator's display is one cycle of its wavetable at the current position (rendered from the same spectra as the tables it plays, loaded files included), with a line where the wave starts when Phase Rand is below 100%; it is dimmed while the oscillator's amplitude is 0. The LFO displays show one cycle. The envelope displays draw attack, decay, a stretch of sustain and release, each stage as wide as the square root of its time, so that a 2 ms attack is still visible next to a 2 second release. The filter display is the frequency response from 20 Hz to 20 kHz, measured by running an impulse through the filter model itself at the host's sample rate (a quiet one, so the nonlinear models show their small-signal response; the drive's distortion doesn't show), with the response at the peak of the filter envelope drawn more faintly. The effects show the distortion's curve, the chorus's sweep, the delay's echoes and the reverb's decay (its lows and, faster under the damping, its highs).
 
 While notes play, the displays follow them: a dot for each of the newest 16 notes moves through the envelopes, a dot on each LFO shows the newest note's phase, the filter display marks the newest note's cutoff (with its envelope, keytracking and modulation), and the waves and the effects' displays show the newest note's modulated position and settings. After each buffer the audio thread writes what the GUI shows into a handful of atomics (only while the GUI is open), and the GUI reads them as it draws.
+
+The Output section at the top right shows what the synth plays, after the effects. The spectrogram covers the last few seconds, the newest at the right, with frequency going up the side from 20 Hz to 20 kHz on a log scale and brightness showing level from -90 to 0 dB (hover it to read a frequency off it): each column is the FFT of about 90 ms of the output under a Hann window, a quarter of a window after the last. Under it, each channel's meter has a bright bar for the RMS level (over 300 ms), a dim one for the peaks, which fall back at 20 dB a second, and a line for the highest peak of the last second and a half, with that peak's level beside them, in red once the output has clipped (click the meter to clear it). The audio thread copies its output into a ring of samples (only while the GUI is open), and the GUI does the rest.
 
 ### Control rate
 Envelopes, pitch (including portamento), the LFOs, the modulation matrix, keytracking and the filter coefficients are recalculated once per control rate block of `CONTROL_BLOCK_SAMPLES` samples (in `src/synth.rs`, 32 by default) rather than every sample. Gains and pitch are ramped linearly across the block and the Digital filter ramps its coefficients, so the main audible effects of the block size are on very fast envelopes and on the LFOs, which can't go faster than half the control rate (689 Hz at 44.1 kHz). Change the constant to try other sizes.
@@ -147,7 +182,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Switch between Naive, Wavetable, and Additive synthesis with a control
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
 * Adjust more knobs to sensible values / defaults
-* Add presets that make the synth look good (current idea: reimplement/extend patches from MDA jx10, which are unreasonably nice)
+* More presets (current idea: reimplement/extend patches from MDA jx10, which are unreasonably nice)
 * Make the build system nicer
 * Tools for working with the harmonic series
 * Use audio buffering for more optimisations
@@ -159,7 +194,6 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Improve the UI
     * Knobs instead of sliders, envelope / waveform displays
     * 2nd page for oversampling and other unimportant things
-* Load Scala .scl and .kbm files
 * A file browser for wavetable files outside the wavetable folder (paths can be typed in for now)
 * Publish
 

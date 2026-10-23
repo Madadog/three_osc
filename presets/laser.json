@@ -1,0 +1,23 @@
+{
+  "name": "Laser",
+  "category": "FX",
+  "params": {
+    "delay_feedback": 0.5,
+    "delay_on": true,
+    "delay_ping_pong": true,
+    "delay_time": 0.18,
+    "fil1_env_amount": 0.0,
+    "osc1_wave": "square",
+    "osc2_amp": 60.0,
+    "osc2_semitone": 0.3,
+    "osc2_wave": "saw",
+    "output_gain": -11.0,
+    "pitch_offset": 36.0,
+    "portamento_rate": 0.87,
+    "reverb_mix": 0.2,
+    "reverb_on": true,
+    "vol_decay": 0.35,
+    "vol_release": 0.15,
+    "vol_sustain": 0.0
+  }
+}

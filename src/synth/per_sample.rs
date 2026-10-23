@@ -316,7 +316,7 @@ impl Voice {
         self.pitch_multiply = context.octave_detune;
 
         // The base phase delta of each sample, as `delta()` works it out
-        let key = (self.id as i16 - 69) as f32;
+        let key = self.pitch - 69.0;
         let delta = if sliding {
             let mut delta = [f32x8::ZERO; BLOCK_VECTORS];
             for (delta, detune) in delta.iter_mut().zip(&semitone_detune).take(vectors) {
@@ -362,7 +362,7 @@ impl Voice {
         for v in 0..if filtered { distinct(coefficients_vary) } else { 0 } {
             let mut mult = if controller.keytrack != 0.0 {
                 x8::exp2(
-                    (splat(self.id as f32) - splat(69.0) + semitone_detune[v]) / splat(12.0)
+                    (splat(self.pitch - 69.0) + semitone_detune[v]) / splat(12.0)
                         * splat(controller.keytrack),
                 )
             } else {

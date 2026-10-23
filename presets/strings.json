@@ -1,0 +1,31 @@
+{
+  "name": "Strings",
+  "category": "Pad",
+  "params": {
+    "chorus_depth": 0.6,
+    "chorus_mix": 0.4,
+    "chorus_on": true,
+    "chorus_rate": 0.5,
+    "fil1_cutoff": 3500.0,
+    "fil1_env_amount": 0.0,
+    "fil1_keytrack": 0.4,
+    "fil1_resonance": 0.6,
+    "lfo_rate_1": 4.8,
+    "mod_amount_1": 0.05,
+    "mod_source_1": "lfo1",
+    "mod_target_1": "fine_pitch",
+    "osc1_super_detune": 25.0,
+    "osc1_voices": 7,
+    "osc2_amp": 35.0,
+    "osc2_octave": 1,
+    "osc2_super_detune": 20.0,
+    "osc2_voices": 5,
+    "osc2_wave": "saw",
+    "output_gain": -17.0,
+    "reverb_on": true,
+    "reverb_size": 0.7,
+    "vol_attack": 0.35,
+    "vol_decay": 1.0,
+    "vol_release": 0.8
+  }
+}

@@ -1,11 +1,13 @@
 //! The plugin's GUI, built with egui through `nih_plug_egui`.
 //!
-//! It's a deliberately simple "everything on one page" layout: the three oscillators and the
-//! LFOs across the top, and the filter, envelopes, global controls and the modulation matrix
-//! underneath. The effects are on a tab that takes the oscillators' place, so that the
-//! modulation sources stay in view. Every control is a [`ParamSlider`] (or a combo box for the enumerated parameters)
-//! bound directly to a parameter, so host automation and the GUI stay in sync. Hovering a
-//! control's label shows what it does.
+//! It's a deliberately simple "everything on one page" layout: the three oscillators, the
+//! LFOs and the output's spectrogram and meters (see [`analyser`]) across the top, and the
+//! filter, envelopes, global controls and the modulation matrix underneath. The effects are on
+//! a tab that takes the oscillators' place, so that the modulation sources stay in view, and the
+//! presets and the tuning are in the title bar (see [`title_bar`]). Every control is a
+//! [`ParamSlider`] (or a combo box for the enumerated parameters) bound directly to a
+//! parameter, so host automation and the GUI stay in sync. Hovering a control's label shows
+//! what it does.
 //!
 //! Modulation is set up by dragging: every modulation source (the LFOs, the envelopes, and the
 //! MIDI sources) has a handle that can be dragged onto any slider that can be modulated, which
@@ -40,7 +42,9 @@ use crate::synth::oscillator::{builtin_spectra, CycleRenderer, WavePreview};
 use crate::synth::wavetable_file;
 use crate::{Task, ThreeOscPlugin};
 
+mod analyser;
 mod displays;
+mod title_bar;
 
 /// The window's default size, in logical pixels.
 pub const DEFAULT_WIDTH: u32 = 1400;
@@ -69,8 +73,8 @@ pub fn default_state() -> Arc<EguiState> {
     EguiState::from_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
 }
 
-/// State that only the GUI needs: the listing of the wavetable folder, and what the displays
-/// draw.
+/// State that only the GUI needs: the listing of the wavetable folder, the preset and tuning
+/// browsers, and what the displays draw.
 pub struct EditorState {
     folder: PathBuf,
     /// The `.wav` files in the folder.
@@ -87,6 +91,10 @@ pub struct EditorState {
     /// The size the oscillators took when they were last shown, which the effects take too, so
     /// that nothing else moves when the tabs are switched.
     oscillators_size: egui::Vec2,
+    presets: title_bar::PresetBrowser,
+    tuning: title_bar::TuningBrowser,
+    /// The output section's spectrogram and meters.
+    analyser: analyser::Analyser,
 }
 
 /// What the top left of the window shows: the oscillators, or the effects in their place.
@@ -108,6 +116,9 @@ impl EditorState {
             filter_response: displays::FilterResponse::new(),
             tab: Tab::Oscillators,
             oscillators_size: egui::Vec2::ZERO,
+            presets: title_bar::PresetBrowser::new(),
+            tuning: title_bar::TuningBrowser::new(),
+            analyser: analyser::Analyser::new(),
         }
     }
     fn rescan(&mut self) {
@@ -205,19 +216,7 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
     };
     let live = gui.live;
 
-    ui.horizontal(|ui| {
-        ui.heading("Three Osc");
-        ui.label(RichText::new(format!("v{}", ThreeOscPlugin::VERSION)).weak());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(
-                    "Double-click a slider to reset it, Shift+drag for fine control, click a \
-                     value to type it in. Hover a label for help.",
-                )
-                .weak(),
-            );
-        });
-    });
+    title_bar::title_bar(ui, params, setter, gui);
     ui.separator();
     tabs(ui, &params.fx, gui);
 
@@ -255,9 +254,17 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
             }
         }
         ui.vertical(|ui| {
-            for (i, lfo_params) in params.lfos.iter().enumerate() {
-                lfo(ui, i, lfo_params, &matrix, setter, live);
-            }
+            ui.horizontal_top(|ui| {
+                let lfos = ui
+                    .vertical(|ui| {
+                        for (i, lfo_params) in params.lfos.iter().enumerate() {
+                            lfo(ui, i, lfo_params, &matrix, setter, live);
+                        }
+                    })
+                    .response
+                    .rect;
+                output_section(ui, lfos.height(), gui);
+            });
             midi_sources(ui);
             if gui.state.tab == Tab::Oscillators {
                 wavetable_folder(ui, params, setter, gui);
@@ -809,6 +816,34 @@ fn wavetable_folder(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, 
                         }
                     }
                 });
+            });
+        });
+    });
+}
+
+/// The narrowest the output section gets, when the window is too narrow for the layout.
+const OUTPUT_MIN_WIDTH: f32 = 130.0;
+
+/// What the synth plays, after the effects: a spectrogram and the level of each channel. It
+/// fills the rest of the width beside the LFOs, `height` tall.
+fn output_section(ui: &mut Ui, height: f32, gui: &mut Gui) {
+    let width = (ui.available_width() - 2.0 * FRAME_MARGIN).max(OUTPUT_MIN_WIDTH);
+    ui.push_id("output", |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.label(RichText::new("Output").strong()).on_hover_text(analyser::HELP);
+                ui.separator();
+                let display_height = height - SECTION_HEADER - 2.0 * FRAME_MARGIN;
+                let live = gui.live;
+                analyser::output(
+                    ui,
+                    &mut gui.state.analyser,
+                    &live.monitor.output,
+                    live.sample_rate,
+                    width,
+                    display_height,
+                );
             });
         });
     });

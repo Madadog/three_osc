@@ -1,0 +1,32 @@
+{
+  "name": "Shapeshifter",
+  "category": "Pad",
+  "params": {
+    "chorus_on": true,
+    "env_attack_1": 4.0,
+    "env_decay_1": 4.0,
+    "env_release_1": 2.0,
+    "env_sustain_1": 0.4,
+    "fil1_cutoff": 4000.0,
+    "fil1_env_amount": 0.0,
+    "lfo_rate_1": 0.07,
+    "mod_amount_1": 1.0,
+    "mod_amount_2": 0.4,
+    "mod_source_1": "env1",
+    "mod_source_2": "lfo1",
+    "mod_target_1": "osc1_position",
+    "mod_target_2": "osc2_position",
+    "osc1_super_detune": 15.0,
+    "osc1_voices": 3,
+    "osc1_wave": "basic_shapes",
+    "osc2_amp": 50.0,
+    "osc2_octave": -1,
+    "osc2_position": 0.3,
+    "osc2_wave": "basic_shapes",
+    "output_gain": -16.0,
+    "reverb_on": true,
+    "reverb_size": 0.75,
+    "vol_attack": 0.5,
+    "vol_release": 2.0
+  }
+}

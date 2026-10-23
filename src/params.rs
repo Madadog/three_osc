@@ -7,17 +7,20 @@
 //! The parameter IDs (e.g. `osc1_wave`, `fil1_cutoff`, `vol_attack`) intentionally match the old
 //! LV2 port symbols.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
+use serde::{Deserialize, Serialize};
 
 use crate::synth::effects::{self, EffectSettings};
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
 use crate::synth::oscillator::{Interpolation, OscWave, WavePreview};
+use crate::synth::tuning::{Tuning, KEYS};
 use crate::synth::{ModulationRate, Polyphony};
 
 /// Waveforms available to the LFO.
@@ -163,6 +166,121 @@ impl PersistentField<'_, String> for WavetableFile {
     }
 }
 
+/// The Scala files the synth is tuned with (see [`crate::synth::tuning`]), saved with the
+/// plugin's state: their names and contents, so that a project sounds the same on a computer
+/// without the files.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningFiles {
+    /// The scale, or `None` for twelve-tone equal temperament.
+    pub scale: Option<TextFile>,
+    /// The keyboard mapping, or `None` for a degree per key with the root on middle C.
+    pub mapping: Option<TextFile>,
+}
+
+/// A small text file's name and contents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextFile {
+    pub name: String,
+    pub text: String,
+}
+
+impl TextFile {
+    pub fn read(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|error| format!("can't read the file: {error}"))?;
+        Ok(Self {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            // Scala files are often in Latin-1, whose accents this replaces
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+        })
+    }
+}
+
+impl TuningFiles {
+    pub fn tuning(&self) -> Result<Tuning, String> {
+        let text = |file: &Option<TextFile>| file.as_ref().map(|file| file.text.clone());
+        Tuning::from_files(text(&self.scale).as_deref(), text(&self.mapping).as_deref())
+    }
+}
+
+/// The synth's tuning, see [`TuningFiles`]. The pitch of each key is worked out whenever the
+/// files change, for the audio thread to pick up without allocating.
+pub struct TuningParam {
+    files: RwLock<TuningFiles>,
+    /// Each key's pitch as `f32` bits, NaN for keys that don't play.
+    pitches: [AtomicU32; KEYS],
+    /// Bumped whenever the pitches change.
+    generation: AtomicU32,
+    /// Why the files saved with the state couldn't be used, if they couldn't.
+    error: Mutex<Option<String>>,
+}
+
+impl Default for TuningParam {
+    fn default() -> Self {
+        let tuning = Self {
+            files: RwLock::default(),
+            pitches: std::array::from_fn(|_| AtomicU32::new(0)),
+            generation: AtomicU32::new(0),
+            error: Mutex::default(),
+        };
+        tuning.store(&Tuning::standard());
+        tuning
+    }
+}
+
+impl TuningParam {
+    pub fn files(&self) -> TuningFiles {
+        self.files.read().unwrap().clone()
+    }
+    pub fn generation(&self) -> u32 {
+        self.generation.load(Ordering::Acquire)
+    }
+    /// Each key's pitch, NaN for keys that don't play.
+    pub fn pitches(&self) -> [f32; KEYS] {
+        std::array::from_fn(|key| f32::from_bits(self.pitches[key].load(Ordering::Relaxed)))
+    }
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+    /// Tunes the synth with new files, if they make a tuning. Otherwise the tuning stays as it
+    /// was, and the error says why.
+    pub fn try_set(&self, files: TuningFiles) -> Result<(), String> {
+        let tuning = files.tuning()?;
+        *self.files.write().unwrap() = files;
+        *self.error.lock().unwrap() = None;
+        self.store(&tuning);
+        Ok(())
+    }
+    fn store(&self, tuning: &Tuning) {
+        for (slot, pitch) in self.pitches.iter().zip(tuning.keys) {
+            slot.store(pitch.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl PersistentField<'_, TuningFiles> for TuningParam {
+    fn set(&self, files: TuningFiles) {
+        // Files restored with the state made a tuning when they were saved. If they somehow
+        // don't any more, the keys are tuned as usual, and the GUI says why
+        let (tuning, error) = match files.tuning() {
+            Ok(tuning) => (tuning, None),
+            Err(error) => (Tuning::standard(), Some(error)),
+        };
+        *self.files.write().unwrap() = files;
+        *self.error.lock().unwrap() = error;
+        self.store(&tuning);
+    }
+    fn map<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&TuningFiles) -> R,
+    {
+        f(&self.files.read().unwrap())
+    }
+}
+
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterModelParam {
     #[id = "none"]
@@ -268,6 +386,21 @@ impl PolyphonyParam {
     }
 }
 
+/// Where the synth's settings are read from: the parameters' current values, or (to test
+/// presets) the values a preset sets them to.
+pub trait ParamValues {
+    fn get<P: Param>(&self, param: &P) -> P::Plain;
+}
+
+/// The parameters' current values.
+pub struct CurrentValues;
+
+impl ParamValues for CurrentValues {
+    fn get<P: Param>(&self, param: &P) -> P::Plain {
+        param.modulated_plain_value()
+    }
+}
+
 /// All of the synth's parameters.
 #[derive(Params)]
 pub struct ThreeOscParams {
@@ -296,6 +429,13 @@ pub struct ThreeOscParams {
     pub osc2_file: WavetableFile,
     #[persist = "osc3_file"]
     pub osc3_file: WavetableFile,
+
+    /// The Scala files the keys are tuned with.
+    #[persist = "tuning"]
+    pub tuning: TuningParam,
+    /// The name of the preset last loaded or saved, which the title bar shows.
+    #[persist = "preset"]
+    pub preset_name: RwLock<String>,
 
     #[nested(id_prefix = "fil1", group = "Filter 1")]
     pub filter: FilterParams,
@@ -338,6 +478,8 @@ impl Default for ThreeOscParams {
             osc1_file: WavetableFile::default(),
             osc2_file: WavetableFile::default(),
             osc3_file: WavetableFile::default(),
+            tuning: TuningParam::default(),
+            preset_name: RwLock::new(String::from("Init")),
 
             filter: FilterParams::new(),
             filter_env: FilterEnvParams::new(),
@@ -901,31 +1043,36 @@ impl FxParams {
 
     /// The effects' settings, for the synth.
     pub fn settings(&self) -> EffectSettings {
+        self.settings_from(&CurrentValues)
+    }
+
+    /// The effects' settings with the parameters' values as `values` has them.
+    pub fn settings_from(&self, values: &impl ParamValues) -> EffectSettings {
         let (distortion, chorus, delay, reverb) = (&self.distortion, &self.chorus, &self.delay, &self.reverb);
         EffectSettings {
             distortion: effects::DistortionSettings {
-                enabled: distortion.enabled.value(),
-                drive_db: distortion.drive.value(),
-                mix: distortion.mix.value(),
+                enabled: values.get(&distortion.enabled),
+                drive_db: values.get(&distortion.drive),
+                mix: values.get(&distortion.mix),
             },
             chorus: effects::ChorusSettings {
-                enabled: chorus.enabled.value(),
-                rate: chorus.rate.value(),
-                depth: chorus.depth.value(),
-                mix: chorus.mix.value(),
+                enabled: values.get(&chorus.enabled),
+                rate: values.get(&chorus.rate),
+                depth: values.get(&chorus.depth),
+                mix: values.get(&chorus.mix),
             },
             delay: effects::DelaySettings {
-                enabled: delay.enabled.value(),
-                time: delay.time.value(),
-                feedback: delay.feedback.value(),
-                mix: delay.mix.value(),
-                ping_pong: delay.ping_pong.value(),
+                enabled: values.get(&delay.enabled),
+                time: values.get(&delay.time),
+                feedback: values.get(&delay.feedback),
+                mix: values.get(&delay.mix),
+                ping_pong: values.get(&delay.ping_pong),
             },
             reverb: effects::ReverbSettings {
-                enabled: reverb.enabled.value(),
-                size: reverb.size.value(),
-                damping: reverb.damping.value(),
-                mix: reverb.mix.value(),
+                enabled: values.get(&reverb.enabled),
+                size: values.get(&reverb.size),
+                damping: values.get(&reverb.damping),
+                mix: values.get(&reverb.mix),
             },
         }
     }
@@ -1127,6 +1274,48 @@ mod tests {
         assert_eq!(file.claim_load(), Some(2));
         file.set_status(String::from("ok"));
         assert_eq!(file.status(), "ok");
+    }
+
+    #[test]
+    fn tunings_are_kept_with_the_files_that_make_them() {
+        let tuning = TuningParam::default();
+        let first = tuning.generation();
+        assert_eq!(tuning.pitches()[69], 69.0);
+        let scale = TextFile {
+            name: String::from("quarter tones.scl"),
+            text: String::from("Quarter tones\n24\n") + &(1..=24).map(|step| format!("{}.0\n", step * 50)).collect::<String>(),
+        };
+        let files = TuningFiles { scale: Some(scale), mapping: None };
+        tuning.try_set(files.clone()).unwrap();
+        assert_eq!(tuning.files(), files);
+        assert_ne!(tuning.generation(), first);
+        assert_eq!(tuning.pitches()[61], 60.5);
+
+        // A broken file leaves the tuning as it was
+        let broken = TuningFiles {
+            mapping: Some(TextFile { name: String::from("x.kbm"), text: String::from("nonsense") }),
+            ..files.clone()
+        };
+        assert!(tuning.try_set(broken.clone()).unwrap_err().starts_with("Mapping: "));
+        assert_eq!(tuning.files(), files);
+        assert_eq!(tuning.pitches()[61], 60.5);
+
+        // ...but one restored with the state is kept, playing the usual tuning
+        PersistentField::set(&tuning, broken.clone());
+        assert_eq!(PersistentField::map(&tuning, |files| files.clone()), broken);
+        assert_eq!(tuning.pitches()[61], 61.0);
+        assert!(tuning.error().is_some());
+        PersistentField::set(&tuning, TuningFiles::default());
+        assert_eq!(tuning.error(), None);
+
+        // Silent keys are NaN
+        let white_keys = TextFile {
+            name: String::from("white.kbm"),
+            text: String::from("12\n0\n127\n60\n69\n440.0\n12\n0\nx\n2\nx\n4\n5\nx\n7\nx\n9\nx\n11\n"),
+        };
+        tuning.try_set(TuningFiles { scale: None, mapping: Some(white_keys) }).unwrap();
+        assert!(tuning.pitches()[61].is_nan());
+        assert_eq!(tuning.pitches()[69], 69.0);
     }
 
     #[test]

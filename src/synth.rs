@@ -107,6 +107,9 @@ pub struct ThreeOsc {
     pub modulation_rate: ModulationRate,
     /// Draws each note's random modulation source.
     rng: fastrand::Rng,
+    /// The pitch each key plays, as a MIDI note number (fractional for keys between the usual
+    /// notes, see [`tuning`]), or NaN for a key that doesn't play.
+    pub key_pitches: [f32; tuning::KEYS],
 }
 
 impl ThreeOsc {
@@ -144,22 +147,29 @@ impl ThreeOsc {
             interpolation: Interpolation::default(),
             modulation_rate: ModulationRate::default(),
             rng: fastrand::Rng::new(),
+            key_pitches: std::array::from_fn(|key| key as f32),
         }
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
+        // Keys the tuning leaves out don't play
+        let Some(&pitch) = self.key_pitches.get(note as usize).filter(|pitch| !pitch.is_nan()) else {
+            return;
+        };
         self.notes.note_on(note, velocity);
         let random = self.rng.f32() * 2.0 - 1.0;
 
         match &self.polyphony {
             Polyphony::Polyphonic => {
-                let mut new_voice = Voice::from_midi_note(note, velocity, &self.oscillators, random);
+                let mut new_voice = Voice::from_midi_note(note, pitch, velocity, &self.oscillators, random);
                 new_voice.semitone_detune += self.portamento_offset;
                 self.voices.push(new_voice)
             }
             Polyphony::Legato | Polyphony::Monophonic => {
                 if let Some(voice) = self.voices.last_mut() {
-                    voice.semitone_detune = voice.id as f32 - note as f32 + voice.semitone_detune;
+                    // The pitch glides from where it is
+                    voice.semitone_detune = voice.pitch - pitch + voice.semitone_detune;
                     voice.id = note as u32;
+                    voice.pitch = pitch;
                     voice.velocity = velocity;
 
                     // If the note is released, or if we are in monophonic mode, retrigger it.
@@ -173,7 +183,7 @@ impl ThreeOsc {
                     }
                 } else {
                     let mut new_voice =
-                        Voice::from_midi_note(note, velocity, &self.oscillators, random);
+                        Voice::from_midi_note(note, pitch, velocity, &self.oscillators, random);
                     new_voice.semitone_detune += self.portamento_offset;
                     self.voices.push(new_voice)
                 }
@@ -205,11 +215,15 @@ impl ThreeOsc {
                             accum
                         }
                     });
+                    // (A key held while the tuning changed may not play any more)
+                    let latest_note = latest_note
+                        .map(|note| (note, self.key_pitches[note.id as usize]))
+                        .filter(|(_, pitch)| !pitch.is_nan());
 
-                    if let Some(note) = latest_note {
-                        voice.semitone_detune =
-                            voice.id as f32 + voice.semitone_detune - note.id as f32;
+                    if let Some((note, pitch)) = latest_note {
+                        voice.semitone_detune = voice.pitch + voice.semitone_detune - pitch;
                         voice.id = note.id as u32;
+                        voice.pitch = pitch;
                         // Retrigger notes when releasing keys in Monophonic mode
                         if matches!(self.polyphony, Polyphony::Monophonic) {
                             voice.semitone_detune += self.portamento_offset;
@@ -524,7 +538,10 @@ struct VoiceContext<'a> {
 /// An individual note press.
 // TODO: Separate phase, oscillator, and filter from note data.
 pub struct Voice {
+    /// The key that plays the note.
     id: u32,
+    /// The key's pitch in the tuning, as a MIDI note number.
+    pitch: f32,
     /// Samples rendered so far.
     runtime: u32,
     release_time: Option<u32>,
@@ -626,7 +643,7 @@ struct Scratch {
     amounts: [[f32; CONTROL_BLOCK_SAMPLES]; 3],
 }
 impl Voice {
-    pub fn from_midi_note(index: u8, velocity: u8, osc: &[OscillatorParams], random: f32) -> Self {
+    pub fn from_midi_note(index: u8, pitch: f32, velocity: u8, osc: &[OscillatorParams], random: f32) -> Self {
         let osc_voice = [
             SuperVoice::new(osc[0].phase, osc[0].phase_rand),
             SuperVoice::new(osc[1].phase, osc[1].phase_rand),
@@ -635,6 +652,7 @@ impl Voice {
 
         Self {
             id: index.into(),
+            pitch,
             runtime: 0,
             release_time: None,
             osc_voice,
@@ -700,10 +718,7 @@ impl Voice {
     /// The voice's base phase delta, in cycles per sample.
     pub fn delta(&self, sample_rate: f32) -> f32 {
         440.0
-            * fastmath::exp2(
-                (((self.id as i16 - 69) as f32 + self.semitone_detune) * self.pitch_multiply)
-                    / 12.0,
-            )
+            * fastmath::exp2((self.pitch - 69.0 + self.semitone_detune) * self.pitch_multiply / 12.0)
             / sample_rate
     }
     /// An envelope's level at the given point in the voice's life, in samples.
@@ -796,7 +811,7 @@ impl Voice {
             + modulation(ModTarget::FinePitch) * ModTarget::FINE_PITCH_SEMITONES;
 
         let keytrack_freq = if controller.keytrack != 0.0 {
-            fastmath::exp2((self.id as f32 - 69.0 + self.semitone_detune) / 12.0 * controller.keytrack)
+            fastmath::exp2((self.pitch - 69.0 + self.semitone_detune) / 12.0 * controller.keytrack)
         } else {
             1.0
         };
@@ -1344,6 +1359,7 @@ pub mod effects;
 pub mod fastmath;
 pub mod monitor;
 mod per_sample;
+pub mod tuning;
 pub mod wav;
 pub mod wavetable_file;
 pub mod modulation;

@@ -14,12 +14,14 @@ use nih_plug::prelude::*;
 #[cfg(test)]
 mod benchmark;
 mod editor;
+mod folders;
 mod params;
+mod presets;
 mod synth;
 
 use params::{
-    multiplier_to_pitch_multiplier, EnvelopeParams, ModParams, OscParams, OscillatorWave,
-    ThreeOscParams,
+    multiplier_to_pitch_multiplier, CurrentValues, EnvelopeParams, ModParams, OscParams,
+    OscillatorWave, ParamValues, ThreeOscParams,
 };
 use synth::envelopes::AdsrEnvelope;
 use synth::modulation::{ModSource, ModTarget, Route};
@@ -38,6 +40,8 @@ pub struct ThreeOscPlugin {
     loader: Loader,
     /// What the GUI shows of the notes that are playing.
     monitor: Arc<Monitor>,
+    /// The generation of the tuning the synth plays (see [`params::TuningParam`]).
+    tuning_generation: u32,
 }
 
 /// Work the plugin does off the audio thread, see [`Plugin::task_executor()`].
@@ -94,6 +98,7 @@ impl Default for ThreeOscPlugin {
                 spectra: [None, None, None],
             },
             monitor: Arc::new(Monitor::default()),
+            tuning_generation: 0,
         }
     }
 }
@@ -166,66 +171,73 @@ impl ThreeOscPlugin {
     /// This mirrors what the LV2 version did with its control ports at the start of every `run()`
     /// call, including the control scaling (percentages, squared modulation amounts, and so on).
     fn apply_params(&mut self) {
+        self.apply_param_values(&CurrentValues);
+    }
+
+    /// Applies the parameters' values as `values` has them, see [`apply_params()`].
+    fn apply_param_values(&mut self, values: &impl ParamValues) {
         let params = &self.params;
         let synth = &mut self.synth;
 
         // Global
         let global = &params.global;
-        let output_gain = global.output_gain.value();
+        let output_gain = values.get(&global.output_gain);
         synth.output_volume = if output_gain > -90.0 {
             10.0_f32.powf(output_gain * 0.05)
         } else {
             0.0
         };
-        synth.bend_range = global.bend_range.value() as f32;
-        synth.polyphony = global.polyphony.value().to_polyphony();
+        synth.bend_range = values.get(&global.bend_range) as f32;
+        synth.polyphony = values.get(&global.polyphony).to_polyphony();
         // Scaling: This is a lerp, and must be proportional to the sample rate
         // ... the '0.002' is just user-friendly control scaling.
         // TODO: test and make sure this actually keeps time constant across sample rates
-        synth.portamento_rate = 1.0
-            - global
-                .portamento_rate
-                .value()
-                .powf(0.002 * synth.sample_rate as f32 / 44100.0);
-        synth.portamento_offset = global.pitch_offset.value();
+        synth.portamento_rate =
+            1.0 - values.get(&global.portamento_rate).powf(0.002 * synth.sample_rate as f32 / 44100.0);
+        synth.portamento_offset = values.get(&global.pitch_offset);
         // multiplies delta: smaller = higher pitch
-        synth.octave_detune = 1.0 - global.octave_detune.value();
-        synth.stereo_width = global.stereo_width.value();
-        synth.effect_settings = params.fx.settings();
-        synth.interpolation = global.interpolation.value().to_interpolation();
-        synth.modulation_rate = global.modulation_rate.value().to_modulation_rate();
+        synth.octave_detune = 1.0 - values.get(&global.octave_detune);
+        synth.stereo_width = values.get(&global.stereo_width);
+        synth.effect_settings = params.fx.settings_from(values);
+        synth.interpolation = values.get(&global.interpolation).to_interpolation();
+        synth.modulation_rate = values.get(&global.modulation_rate).to_modulation_rate();
+        let tuning = params.tuning.generation();
+        if tuning != self.tuning_generation {
+            self.tuning_generation = tuning;
+            synth.key_pitches = params.tuning.pitches();
+        }
 
         // Master gain envelope
-        apply_envelope_params(&mut synth.gain_envelope, &params.vol_env);
+        apply_envelope_values(&mut synth.gain_envelope, &params.vol_env, values);
 
         // Filter
         let filter = &params.filter;
         let filter_env = &params.filter_env;
         let controller = &mut synth.filter_controller;
-        controller.envelope_amount = filter_env.amount.value().powi(2);
-        controller.keytrack = filter.keytrack.value();
-        apply_envelope_params(&mut controller.cutoff_envelope, &filter_env.envelope);
-        controller.target_cutoff = filter.cutoff.value();
-        controller.resonance = filter.resonance.value();
-        controller.drive = filter.drive.value();
-        controller.filter_type = filter.filter_type.value().to_filter_type();
-        controller.filter_model = filter.model.value().to_filter_model();
+        controller.envelope_amount = values.get(&filter_env.amount).powi(2);
+        controller.keytrack = values.get(&filter.keytrack);
+        apply_envelope_values(&mut controller.cutoff_envelope, &filter_env.envelope, values);
+        controller.target_cutoff = values.get(&filter.cutoff);
+        controller.resonance = values.get(&filter.resonance);
+        controller.drive = values.get(&filter.drive);
+        controller.filter_type = values.get(&filter.filter_type).to_filter_type();
+        controller.filter_model = values.get(&filter.model).to_filter_model();
 
         // Modulation: LFOs, envelopes and the matrix. The routes vector has room for every
         // slot, so this doesn't allocate.
         for (lfo, lfo_params) in synth.lfos.iter_mut().zip(params.lfos.iter()) {
-            lfo.wave = lfo_params.wave.value().to_osc_wave();
-            lfo.freq = lfo_params.rate.value();
+            lfo.wave = values.get(&lfo_params.wave).to_osc_wave();
+            lfo.freq = values.get(&lfo_params.rate);
         }
         for (envelope, env_params) in synth.mod_envelopes.iter_mut().zip(params.mod_envs.iter()) {
-            apply_envelope_params(envelope, &env_params.envelope);
+            apply_envelope_values(envelope, &env_params.envelope, values);
         }
         synth.routes.clear();
         for slot in params.mod_slots.iter() {
             let route = Route {
-                source: slot.source.value(),
-                target: slot.target.value(),
-                amount: slot.amount.value(),
+                source: values.get(&slot.source),
+                target: values.get(&slot.target),
+                amount: values.get(&slot.amount),
             };
             if route.source != ModSource::None && route.target != ModTarget::None && route.amount != 0.0 {
                 synth.routes.push(route);
@@ -233,15 +245,15 @@ impl ThreeOscPlugin {
         }
 
         // Oscillators
-        let global_pitch = global.global_pitch.value() as f32;
-        apply_osc_params(&mut synth.oscillators[0], &params.osc1, global_pitch);
-        apply_mod_params(&mut synth.oscillators[0], &params.osc1_mod);
+        let global_pitch = values.get(&global.global_pitch) as f32;
+        apply_osc_params(&mut synth.oscillators[0], &params.osc1, global_pitch, values);
+        apply_mod_params(&mut synth.oscillators[0], &params.osc1_mod, values);
 
-        apply_osc_params(&mut synth.oscillators[1], &params.osc2, global_pitch);
-        apply_mod_params(&mut synth.oscillators[1], &params.osc2_mod);
+        apply_osc_params(&mut synth.oscillators[1], &params.osc2, global_pitch, values);
+        apply_mod_params(&mut synth.oscillators[1], &params.osc2_mod, values);
 
         // The third oscillator has nothing after it to modulate it.
-        apply_osc_params(&mut synth.oscillators[2], &params.osc3, global_pitch);
+        apply_osc_params(&mut synth.oscillators[2], &params.osc3, global_pitch, values);
     }
 
     fn handle_event(&mut self, event: NoteEvent<()>) {
@@ -319,37 +331,41 @@ impl ThreeOscPlugin {
 }
 
 /// Applies the controls shared by all oscillators.
-fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch: f32) {
-    let wave = params.wave.value();
+fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch: f32, values: &impl ParamValues) {
+    let wave = values.get(&params.wave);
     osc.use_file = wave == OscillatorWave::File;
     osc.wavetable = wave.wavetable_index().unwrap_or(0);
-    osc.position = params.position.value();
-    osc.amp = params.amp.value() / 100.0;
-    osc.pan = params.pan.value();
-    osc.semitone = params.semitone.value() + global_pitch;
-    osc.octave = params.octave.value();
-    osc.pitch_multiplier = multiplier_to_pitch_multiplier(params.multiplier.value());
-    osc.voice_count = params.voices.value() as u8;
+    osc.position = values.get(&params.position);
+    osc.amp = values.get(&params.amp) / 100.0;
+    osc.pan = values.get(&params.pan);
+    osc.semitone = values.get(&params.semitone) + global_pitch;
+    osc.octave = values.get(&params.octave);
+    osc.pitch_multiplier = multiplier_to_pitch_multiplier(values.get(&params.multiplier));
+    osc.voice_count = values.get(&params.voices) as u8;
     // The synth cubes the detune amount, after any modulation
-    osc.voices_detune = params.super_detune.value() / 100.0;
-    osc.phase = params.phase.value() / 100.0;
-    osc.phase_rand = params.phase_rand.value() / 100.0;
+    osc.voices_detune = values.get(&params.super_detune) / 100.0;
+    osc.phase = values.get(&params.phase) / 100.0;
+    osc.phase_rand = values.get(&params.phase_rand) / 100.0;
 }
 
 /// Applies the PM/FM/AM amounts for an oscillator that has a modulator after it. The synth
 /// squares them, after any modulation.
-fn apply_mod_params(osc: &mut OscillatorParams, params: &ModParams) {
-    osc.pm = params.pm.value();
-    osc.fm = params.fm.value();
-    osc.am = params.am.value();
+fn apply_mod_params(osc: &mut OscillatorParams, params: &ModParams, values: &impl ParamValues) {
+    osc.pm = values.get(&params.pm);
+    osc.fm = values.get(&params.fm);
+    osc.am = values.get(&params.am);
 }
 
 fn apply_envelope_params(envelope: &mut AdsrEnvelope, params: &EnvelopeParams) {
-    envelope.attack_time = params.attack.value();
-    envelope.decay_time = params.decay.value();
-    envelope.sustain_level = params.sustain.value();
-    envelope.release_time = params.release.value();
-    envelope.set_slope(params.slope.value());
+    apply_envelope_values(envelope, params, &CurrentValues);
+}
+
+fn apply_envelope_values(envelope: &mut AdsrEnvelope, params: &EnvelopeParams, values: &impl ParamValues) {
+    envelope.attack_time = values.get(&params.attack);
+    envelope.decay_time = values.get(&params.decay);
+    envelope.sustain_level = values.get(&params.sustain);
+    envelope.release_time = values.get(&params.release);
+    envelope.set_slope(values.get(&params.slope));
 }
 
 /// Converts nih-plug's `[0, 1]` velocity to the 7-bit MIDI velocity the synth engine uses.
@@ -487,6 +503,7 @@ impl Plugin for ThreeOscPlugin {
         self.render(std::iter::from_fn(|| context.next_event()), out_l, out_r);
         if self.params.editor_state.is_open() {
             self.synth.publish(&self.monitor);
+            self.monitor.output.write(out_l, out_r);
         }
 
         ProcessStatus::KeepAlive
@@ -920,6 +937,130 @@ mod tests {
         assert!(ids.contains(&String::from("env_attack_2")));
     }
 
+    /// Every factory preset plays: a chord held for three seconds and let go, rendered through
+    /// the synth as the preset sets it up. Prints each one's levels (with `--nocapture`), to
+    /// keep them about as loud as each other.
+    #[test]
+    fn factory_presets_play_a_chord() {
+        let mut plugin = ThreeOscPlugin::default();
+        let sample_rate = plugin.synth.sample_rate as usize;
+        let chord = [48, 55, 60, 64];
+        let mut problems = Vec::new();
+        for preset in presets::factory() {
+            plugin.synth.reset();
+            plugin.apply_param_values(&presets::PresetValues::new(&preset, &plugin.params));
+            fastrand::seed(1);
+            let held = sample_rate * 3;
+            let mut left = vec![0.0; held + sample_rate * 2];
+            let mut right = left.clone();
+            for note in chord {
+                plugin.synth.note_on(note, 100);
+            }
+            plugin.synth.run(&mut left[..held], &mut right[..held]);
+            for note in chord {
+                plugin.synth.note_off(note, 0);
+            }
+            plugin.synth.run(&mut left[held..], &mut right[held..]);
+
+            let peak = left.iter().chain(&right).fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            // The loudest 300 ms
+            let window = sample_rate * 3 / 10;
+            let loudest = (0..left.len() - window)
+                .step_by(window / 3)
+                .map(|start| {
+                    let power: f32 = (start..start + window).map(|i| left[i] * left[i] + right[i] * right[i]).sum();
+                    (power / (2 * window) as f32).sqrt()
+                })
+                .fold(0.0, f32::max);
+            let db = |level: f32| 20.0 * level.max(1e-9).log10();
+            println!("{:<16} peak {:6.1} dB, loudest {:6.1} dB RMS", preset.name, db(peak), db(loudest));
+            if !left.iter().chain(&right).all(|sample| sample.is_finite()) {
+                problems.push(format!("{} isn't finite", preset.name));
+            } else if peak > 0.9 {
+                problems.push(format!("{} peaks at {peak}", preset.name));
+            } else if db(loudest) < -30.0 {
+                problems.push(format!("{} is too quiet ({} dB)", preset.name, db(loudest)));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// Quarter tones: twice as many keys to the octave.
+    fn quarter_tones() -> params::TuningFiles {
+        let steps: String = (1..=24).map(|step| format!("{}.0\n", step * 50)).collect();
+        params::TuningFiles {
+            scale: Some(params::TextFile {
+                name: String::from("24-EDO.scl"),
+                text: format!("Quarter tones\n24\n{steps}"),
+            }),
+            mapping: None,
+        }
+    }
+
+    #[test]
+    fn keys_play_their_tuned_pitches() {
+        let mut plugin = ThreeOscPlugin::default();
+        plugin.params.tuning.try_set(quarter_tones()).unwrap();
+        plugin.apply_params();
+        let sample_rate = plugin.synth.sample_rate as f32;
+        let delta = |pitch: f32| 440.0 * ((pitch - 69.0) / 12.0).exp2() / sample_rate;
+        let close = |a: f32, b: f32| (a / b - 1.0).abs() < 1e-4;
+
+        plugin.synth.note_on(61, 100);
+        plugin.synth.note_on(84, 100);
+        assert!(close(plugin.synth.voices[0].delta(sample_rate), delta(60.5)));
+        assert!(close(plugin.synth.voices[1].delta(sample_rate), delta(72.0)));
+
+        // Legato glides from the pitch it was at to the new key's
+        plugin.synth.reset();
+        plugin.synth.polyphony = synth::Polyphony::Legato;
+        plugin.synth.note_on(60, 100);
+        plugin.synth.note_on(64, 100);
+        assert_eq!(plugin.synth.voices.len(), 1);
+        assert!(close(plugin.synth.voices[0].delta(sample_rate), delta(60.0)));
+        let mut left = vec![0.0; 44100];
+        let mut right = vec![0.0; 44100];
+        plugin.synth.run(&mut left, &mut right);
+        assert!(close(plugin.synth.voices[0].delta(sample_rate), delta(62.0)));
+        // ...and back to the key still held when the new one is let go
+        plugin.synth.note_off(64, 0);
+        plugin.synth.run(&mut left, &mut right);
+        assert!(close(plugin.synth.voices[0].delta(sample_rate), delta(60.0)));
+
+        // Keys the mapping leaves out don't play
+        plugin.synth.reset();
+        plugin.synth.polyphony = synth::Polyphony::Polyphonic;
+        let white_keys = "12\n0\n127\n60\n69\n440.0\n12\n0\nx\n2\nx\n4\n5\nx\n7\nx\n9\nx\n11\n";
+        let files = params::TuningFiles {
+            scale: None,
+            mapping: Some(params::TextFile { name: String::from("white.kbm"), text: String::from(white_keys) }),
+        };
+        plugin.params.tuning.try_set(files).unwrap();
+        plugin.apply_params();
+        plugin.synth.note_on(61, 100);
+        assert!(plugin.synth.voices.is_empty());
+        plugin.synth.note_on(62, 100);
+        assert!(close(plugin.synth.voices[0].delta(sample_rate), delta(62.0)));
+
+        // A held key that the tuning silences isn't glided back to: the note ends instead
+        plugin.synth.reset();
+        plugin.params.tuning.try_set(params::TuningFiles::default()).unwrap();
+        plugin.apply_params();
+        plugin.synth.polyphony = synth::Polyphony::Legato;
+        plugin.synth.note_on(61, 100);
+        plugin.synth.note_on(62, 100);
+        plugin.params.tuning.try_set(quarter_tones()).unwrap();
+        let mut silent = quarter_tones().tuning().unwrap();
+        silent.keys[61] = None;
+        plugin.synth.key_pitches = silent.keys.map(|pitch| pitch.unwrap_or(f32::NAN));
+        plugin.synth.note_off(62, 0);
+        for _ in 0..2 {
+            plugin.synth.run(&mut left, &mut right);
+            assert!(left.iter().all(|sample| sample.is_finite()));
+        }
+        assert!(plugin.synth.voices.is_empty());
+    }
+
     /// Fast modulation of a sine note, whose bandlimited tables are all the same whatever the
     /// pitch: pitch and volume LFOs faster than the block rate can follow, an envelope on the
     /// amplitude, a slower LFO on the cutoff, a short attack and a pitch slide, and optionally
@@ -1249,6 +1390,20 @@ mod tests {
                 2 => synth::filter::FilterModel::LadderFilter,
                 _ => synth::filter::FilterModel::SvfSimperFilter,
             };
+            // Now and then a change of tuning, which can leave held keys silent
+            if rng.usize(0..32) == 0 {
+                let tuning = match rng.usize(0..3) {
+                    0 => synth::tuning::Tuning::standard(),
+                    1 => quarter_tones().tuning().unwrap(),
+                    _ => synth::tuning::Tuning::from_files(None, Some("12\n0\n127\n60\n60\n261.6\n12\n0\nx\n2\n")).unwrap(),
+                };
+                plugin.synth.key_pitches = tuning.keys.map(|pitch| pitch.unwrap_or(f32::NAN));
+                if rng.bool() {
+                    plugin.synth.polyphony = synth::Polyphony::Legato;
+                } else {
+                    plugin.synth.polyphony = synth::Polyphony::Polyphonic;
+                }
+            }
             // Now and then a block at the sample rate, which is much slower
             plugin.synth.modulation_rate = if rng.usize(0..8) == 0 {
                 synth::ModulationRate::Sample

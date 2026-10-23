@@ -1,0 +1,31 @@
+{
+  "name": "Brass",
+  "category": "Lead",
+  "params": {
+    "fil1_attack": 0.06,
+    "fil1_cutoff": 500.0,
+    "fil1_decay": 0.5,
+    "fil1_env_amount": 0.3,
+    "fil1_keytrack": 0.5,
+    "fil1_release": 0.25,
+    "fil1_resonance": 0.9,
+    "fil1_sustain": 0.45,
+    "mod_amount_1": 0.05,
+    "mod_amount_2": 0.15,
+    "mod_source_1": "lfo1",
+    "mod_source_2": "velocity",
+    "mod_target_1": "fine_pitch",
+    "mod_target_2": "cutoff",
+    "osc1_super_detune": 15.0,
+    "osc1_voices": 3,
+    "osc2_amp": 70.0,
+    "osc2_semitone": 0.08,
+    "osc2_wave": "saw",
+    "output_gain": -19.0,
+    "reverb_mix": 0.2,
+    "reverb_on": true,
+    "vol_attack": 0.03,
+    "vol_release": 0.2,
+    "vol_sustain": 0.9
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "Ping-Pong Pluck",
+  "category": "Pluck",
+  "params": {
+    "delay_feedback": 0.55,
+    "delay_mix": 0.35,
+    "delay_on": true,
+    "delay_ping_pong": true,
+    "delay_time": 0.28,
+    "fil1_cutoff": 600.0,
+    "fil1_decay": 0.12,
+    "fil1_env_amount": 0.35,
+    "fil1_resonance": 2.2,
+    "osc1_wave": "square",
+    "osc2_amp": 50.0,
+    "osc2_octave": 1,
+    "osc2_wave": "triangle",
+    "output_gain": -5.0,
+    "reverb_mix": 0.15,
+    "reverb_on": true,
+    "reverb_size": 0.4,
+    "vol_decay": 0.18,
+    "vol_release": 0.12,
+    "vol_sustain": 0.0
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "Saw Bass",
+  "category": "Bass",
+  "params": {
+    "fil1_cutoff": 180.0,
+    "fil1_decay": 0.22,
+    "fil1_drive": 2.0,
+    "fil1_env_amount": 0.38,
+    "fil1_keytrack": 0.5,
+    "fil1_model": "ladder",
+    "fil1_release": 0.08,
+    "fil1_resonance": 1.8,
+    "fil1_sustain": 0.1,
+    "osc1_phase_rand": 0.0,
+    "osc2_amp": 60.0,
+    "osc2_octave": -1,
+    "osc2_phase_rand": 0.0,
+    "osc2_wave": "square",
+    "output_gain": -10.0,
+    "polyphony": "legato",
+    "portamento_rate": 0.85,
+    "vol_decay": 0.4,
+    "vol_release": 0.06,
+    "vol_sustain": 0.8
+  }
+}

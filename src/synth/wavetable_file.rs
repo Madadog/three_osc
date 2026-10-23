@@ -119,45 +119,18 @@ impl LoadedSpectra {
 /// The folder wavetable files are listed from: `Documents/Three Osc/Wavetables` in the user's
 /// home directory, unless the `THREE_OSC_WAVETABLES` environment variable names another one.
 pub fn default_folder() -> PathBuf {
-    if let Some(folder) = std::env::var_os("THREE_OSC_WAVETABLES") {
-        return PathBuf::from(folder);
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join("Documents").join("Three Osc").join("Wavetables")
+    crate::folders::wavetables()
 }
 
 /// Resolves a saved path: relative paths (plain file names, as the GUI saves for files picked
 /// from the folder) are looked up in the default folder.
 pub fn resolve(path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        default_folder().join(path)
-    }
+    crate::folders::resolve(&default_folder(), path)
 }
 
 /// The WAV files in a folder, by name, sorted.
 pub fn list_folder(folder: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(folder)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
-                })
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort_unstable();
-    names
+    crate::folders::list(folder, &["wav"])
 }
 
 #[cfg(test)]

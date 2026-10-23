@@ -1,0 +1,31 @@
+{
+  "name": "Wobble",
+  "category": "Bass",
+  "params": {
+    "dist_drive": 14.0,
+    "dist_mix": 0.5,
+    "dist_on": true,
+    "fil1_cutoff": 300.0,
+    "fil1_drive": 2.5,
+    "fil1_env_amount": 0.0,
+    "fil1_keytrack": 0.3,
+    "fil1_model": "ladder",
+    "fil1_resonance": 3.0,
+    "lfo_rate_1": 3.0,
+    "lfo_wave_1": "triangle",
+    "mod_amount_1": 0.35,
+    "mod_amount_2": 0.5,
+    "mod_source_1": "lfo1",
+    "mod_source_2": "mod_wheel",
+    "mod_target_1": "cutoff",
+    "mod_target_2": "lfo1_rate",
+    "osc1_super_detune": 20.0,
+    "osc1_voices": 3,
+    "osc2_amp": 70.0,
+    "osc2_octave": -1,
+    "osc2_wave": "square",
+    "output_gain": -17.0,
+    "polyphony": "legato",
+    "portamento_rate": 0.9
+  }
+}

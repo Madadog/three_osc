@@ -1,0 +1,21 @@
+{
+  "name": "Sub Bass",
+  "category": "Bass",
+  "params": {
+    "dist_drive": 6.0,
+    "dist_mix": 0.35,
+    "dist_on": true,
+    "fil1_cutoff": 900.0,
+    "fil1_env_amount": 0.0,
+    "osc1_phase_rand": 0.0,
+    "osc1_wave": "sine",
+    "osc2_amp": 22.0,
+    "osc2_phase_rand": 0.0,
+    "osc2_wave": "triangle",
+    "output_gain": -13.5,
+    "polyphony": "legato",
+    "portamento_rate": 0.9,
+    "vol_attack": 0.006,
+    "vol_release": 0.08
+  }
+}

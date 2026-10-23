@@ -1,0 +1,31 @@
+{
+  "name": "FM Lead",
+  "category": "Lead",
+  "params": {
+    "delay_feedback": 0.3,
+    "delay_mix": 0.2,
+    "delay_on": true,
+    "delay_time": 0.25,
+    "lfo_rate_1": 0.3,
+    "lfo_rate_2": 5.5,
+    "mod_amount_1": 0.1,
+    "mod_amount_2": 0.04,
+    "mod_amount_3": 0.1,
+    "mod_source_1": "velocity",
+    "mod_source_2": "lfo1",
+    "mod_source_3": "lfo2",
+    "mod_target_1": "osc1_pm",
+    "mod_target_2": "osc1_pm",
+    "mod_target_3": "fine_pitch",
+    "osc1_pm": 0.12,
+    "osc1_wave": "sine",
+    "osc2_multiplier": 1,
+    "output_gain": -8.0,
+    "polyphony": "legato",
+    "portamento_rate": 0.9,
+    "reverb_mix": 0.15,
+    "reverb_on": true,
+    "vol_attack": 0.01,
+    "vol_release": 0.2
+  }
+}
