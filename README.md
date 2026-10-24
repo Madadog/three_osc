@@ -24,7 +24,7 @@ Currently a work in progress, but usable nevertheless.
 * Portamento and adjustable initial pitch slide for kickdrum synthesis.
 * MIDI pitch bend with an adjustable range
 * Presets: 21 factory presets (basses, leads, pads, plucks, keys and effects), and your own saved as JSON files
-* Microtuning with Scala files: any `.scl` scale, with an optional `.kbm` keyboard mapping
+* Microtuning with Scala files (any `.scl` scale, with an optional `.kbm` keyboard mapping), and a scale generator for equal divisions of the octave or any other interval, the harmonic and subharmonic series, stacks of a generator interval and historical temperaments, with a view of the scale and `.scl` export
 * A simple GUI (made with [egui](https://github.com/emilk/egui)) with every control on one page (the effects on a tab in place of the oscillators), the presets and the tuning in the title bar, displays of each oscillator's wave, the LFOs, the envelopes, the filter's frequency response and the effects, which follow the notes as they play, and a spectrogram and level meter of the output. Hover a control's label (or a display) for a description of what it does.
 * Sample-accurate note timing
 
@@ -98,12 +98,24 @@ A preset is a JSON file that lists the parameters that differ from their default
 Sliders are numbers in the units they show (Hz, seconds, semitones, decibels, and 0 to 1 for percentages, except for the oscillators' Amplitude, Unison Detune, Phase and Phase Rand., which go from 0 to 100), switches are `true` or `false`, and choices are the IDs of their options. Anything a preset leaves out gets its default, so presets keep loading as parameters are added. Loading a preset sets each parameter through the host, as moving its slider would, so the host keeps track of them. The factory presets are the files in `presets/`, built into the plugin.
 
 ### Tuning
-The title bar's Tuning menu retunes the keys with [Scala](https://www.huygens-fokker.org/scala/) files from `Documents/Three Osc/Tunings` (or the folder `THREE_OSC_TUNINGS` names), or from any path typed in:
+The title bar's Tuning button opens a window for retuning the keys with [Scala](https://www.huygens-fokker.org/scala/) scales and keyboard mappings. It has three tabs.
+
+**Files** lists the `.scl` and `.kbm` files in `Documents/Three Osc/Tunings` (or the folder `THREE_OSC_TUNINGS` names), and loads them from any other path typed in:
 
 * A scale (`.scl`) lists the pitches of its steps above its root, in cents or as ratios, the last being the period it repeats at (usually the octave, `2/1`). On its own, its root is middle C at its usual pitch (261.63 Hz), and each key goes up the scale a step.
 * A keyboard mapping (`.kbm`) says which key plays which step (keys can be left silent, to put a 7 note scale on the white keys, say), which key is tuned to which frequency, and which keys are retuned at all (the others stay silent). With the standard scale, it can just move A away from 440 Hz.
 
-The files' contents are saved with the plugin's state, so a project sounds the same on a computer without them. Only the notes' pitches change: pitch bend, the oscillators' Detune and Octave controls and the pitch modulation still move in ordinary semitones, the filter's keytracking follows the tuned pitch, and the Key Track modulation source still follows the key's place on the keyboard.
+**Generate** makes a scale from a few numbers, shows its steps, and plays it (keeping the keyboard mapping):
+
+* Equal divisions: so many equal steps of an interval, given as a ratio or in cents. Of the octave they're the EDOs (19, 31, 53...), of the tritave (3/1) Bohlen-Pierce, of the fifth (3/2) Wendy Carlos's alpha, and one division of so many cents is a scale of equal steps that never comes back to the octave.
+* Harmonic series: the harmonics from one to another, such as 8 to 16, an octave of steps that shrink as they go up.
+* Subharmonic series: the same upside down, from a subharmonic down to another.
+* Generator stack: a chain of one interval, each note moved by whole periods into one period of the root, with some of the chain going down from the root. Pure fifths (3/2) make Pythagorean tuning (12 notes, 3 down) or the major scale (7 notes, 1 down), and fifths of 696.578 cents quarter-comma meantone. With ratios, the notes come out as exact ratios.
+* Historical temperament: Pythagorean, quarter-comma meantone, Werckmeister III, Kirnberger III, Vallotti and Young, worked out from the sizes of their fifths, and 5-limit just intonation.
+
+**Scale** shows the scale being played: a ruler of its steps over the twelve-tone semitones, and a table of each degree's pitch in cents, the step up to it, its ratio (when the scale gives one) and the nearest twelve-tone note with how far off it is. It saves the scale as a `.scl` file in the tunings folder, for other synths (or later), or copies the file's text.
+
+The files' contents (a generated scale's too) are saved with the plugin's state, so a project sounds the same on a computer without them. Only the notes' pitches change: pitch bend, the oscillators' Detune and Octave controls and the pitch modulation still move in ordinary semitones, the filter's keytracking follows the tuned pitch, and the Key Track modulation source still follows the key's place on the keyboard.
 
 ### Wavetable files
 Set an oscillator's Wave to File to play a wavetable from a `.wav` file. The File row that appears lists the `.wav` files in the wavetable folder, `Documents/Three Osc/Wavetables` in your home directory (or the folder the `THREE_OSC_WAVETABLES` environment variable names); the Wavetable Files box shows the folder, rescans it, and loads a file from any other path into an oscillator. The chosen path is saved with the plugin's state.

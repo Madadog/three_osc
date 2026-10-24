@@ -4,7 +4,7 @@
 //! LFOs and the output's spectrogram and meters (see [`analyser`]) across the top, and the
 //! filter, envelopes, global controls and the modulation matrix underneath. The effects are on
 //! a tab that takes the oscillators' place, so that the modulation sources stay in view, and the
-//! presets and the tuning are in the title bar (see [`title_bar`]). Every control is a
+//! presets and the tuning are in the title bar (see [`title_bar`] and [`tuning_window`]). Every control is a
 //! [`ParamSlider`] (or a combo box for the enumerated parameters) bound directly to a
 //! parameter, so host automation and the GUI stay in sync. Hovering a control's label shows
 //! what it does.
@@ -45,6 +45,7 @@ use crate::{Task, ThreeOscPlugin};
 mod analyser;
 mod displays;
 mod title_bar;
+mod tuning_window;
 
 /// The window's default size, in logical pixels.
 pub const DEFAULT_WIDTH: u32 = 1400;
@@ -92,7 +93,7 @@ pub struct EditorState {
     /// that nothing else moves when the tabs are switched.
     oscillators_size: egui::Vec2,
     presets: title_bar::PresetBrowser,
-    tuning: title_bar::TuningBrowser,
+    tuning: tuning_window::TuningWindow,
     /// The output section's spectrogram and meters.
     analyser: analyser::Analyser,
 }
@@ -117,7 +118,7 @@ impl EditorState {
             tab: Tab::Oscillators,
             oscillators_size: egui::Vec2::ZERO,
             presets: title_bar::PresetBrowser::new(),
-            tuning: title_bar::TuningBrowser::new(),
+            tuning: tuning_window::TuningWindow::new(),
             analyser: analyser::Analyser::new(),
         }
     }
@@ -217,6 +218,7 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
     let live = gui.live;
 
     title_bar::title_bar(ui, params, setter, gui);
+    tuning_window::show(ui.ctx(), params, &mut gui.state.tuning);
     ui.separator();
     tabs(ui, &params.fx, gui);
 

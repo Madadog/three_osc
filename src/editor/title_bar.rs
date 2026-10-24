@@ -1,13 +1,14 @@
-//! The title bar: the plugin's name, the preset browser and the tuning menu.
+//! The title bar: the plugin's name, the preset browser and the tuning window's button (see
+//! [`super::tuning_window`]).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::{self, Color32, PopupCloseBehavior, RichText, Stroke, Ui};
 
 use super::{load_wavetable_file, Gui};
 use crate::folders;
-use crate::params::{TextFile, ThreeOscParams, TuningFiles};
+use crate::params::ThreeOscParams;
 use crate::presets::{self, EnumIds, Preset, Targets, USER_CATEGORY};
 use crate::ThreeOscPlugin;
 
@@ -143,65 +144,6 @@ impl Default for PresetBrowser {
     }
 }
 
-/// The tuning files the menu lists, and what went wrong loading one.
-pub struct TuningBrowser {
-    folder: PathBuf,
-    scales: Vec<String>,
-    mappings: Vec<String>,
-    scanned: bool,
-    /// A path typed in, to load a file from anywhere else.
-    custom_path: String,
-    message: Option<String>,
-}
-
-impl TuningBrowser {
-    pub fn new() -> Self {
-        Self {
-            folder: folders::tunings(),
-            scales: Vec::new(),
-            mappings: Vec::new(),
-            scanned: false,
-            custom_path: String::new(),
-            message: None,
-        }
-    }
-
-    fn rescan(&mut self) {
-        self.scales = folders::list(&self.folder, &["scl"]);
-        self.mappings = folders::list(&self.folder, &["kbm"]);
-        self.scanned = true;
-    }
-
-    /// Tunes the synth with a scale (`.scl`) or keyboard mapping (`.kbm`) file, keeping the
-    /// other one.
-    fn load(&mut self, params: &ThreeOscParams, path: &Path) {
-        let mapping = path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("kbm"));
-        let result = TextFile::read(path).and_then(|file| {
-            let mut files = params.tuning.files();
-            if mapping {
-                files.mapping = Some(file);
-            } else {
-                files.scale = Some(file);
-            }
-            params.tuning.try_set(files)
-        });
-        self.message = result.err().map(|error| {
-            let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-            format!("{name}: {error}")
-        });
-    }
-
-    fn set(&mut self, params: &ThreeOscParams, files: TuningFiles) {
-        self.message = params.tuning.try_set(files).err();
-    }
-}
-
-impl Default for TuningBrowser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The plugin's name and version, the presets and the tuning, and some help at the right.
 pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
     ui.horizontal(|ui| {
@@ -210,7 +152,7 @@ pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui
         ui.add_space(14.0);
         presets(ui, params, setter, gui);
         ui.add_space(10.0);
-        tuning(ui, params, gui);
+        super::tuning_window::button(ui, params, &mut gui.state.tuning);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
                 egui::Label::new(
@@ -373,143 +315,9 @@ fn arrow_button(ui: &mut Ui, left: bool) -> egui::Response {
     response
 }
 
-/// What the tuning is called: the scale's file name, and the mapping's when there is one.
-fn tuning_name(files: &TuningFiles) -> String {
-    let scale = files.scale.as_ref().map_or("12-TET", |file| folders::stem(&file.name));
-    match &files.mapping {
-        Some(mapping) => format!("{scale}, {}", folders::stem(&mapping.name)),
-        None => scale.to_string(),
-    }
-}
-
-/// The tuning menu: the scales and keyboard mappings in the tunings folder, or a file from
-/// anywhere else.
-fn tuning(ui: &mut Ui, params: &ThreeOscParams, gui: &mut Gui) {
-    let browser = &mut gui.state.tuning;
-    let files = params.tuning.files();
-    let mut name = tuning_name(&files);
-    if name.chars().count() > 28 {
-        name = name.chars().take(27).collect::<String>() + "…";
-    }
-    let button = ui
-        .button(format!("Tuning: {name}"))
-        .on_hover_text("How the keys are tuned: the usual twelve-tone equal temperament, or a Scala scale and keyboard mapping. Click to pick one.");
-    let popup = ui.make_persistent_id("tuning menu");
-    if button.clicked() {
-        if !browser.scanned {
-            browser.rescan();
-        }
-        ui.memory_mut(|memory| memory.toggle_popup(popup));
-    }
-    egui::popup_below_widget(ui, popup, &button, PopupCloseBehavior::CloseOnClickOutside, |ui| {
-        ui.set_min_width(300.0);
-        ui.label(RichText::new("Scale").strong()).on_hover_text(
-            "A Scala .scl file: the pitches of the scale's steps. The keys go up the scale a \
-             step at a time, from its root on middle C (at 261.63 Hz) unless a keyboard \
-             mapping says otherwise. Pitch bend, the oscillators' Detune and Octave, and the \
-             Pitch modulation still move the pitch in ordinary semitones.",
-        );
-        let current_scale = files.scale.as_ref().map(|file| file.name.as_str());
-        if ui.selectable_label(current_scale.is_none(), "12-tone equal temperament (standard)").clicked() {
-            browser.set(params, TuningFiles { scale: None, ..files.clone() });
-        }
-        let mut load = None;
-        for scale in &browser.scales {
-            if ui.selectable_label(current_scale == Some(scale.as_str()), folders::stem(scale)).clicked() {
-                load = Some(browser.folder.join(scale));
-            }
-        }
-        if browser.scales.is_empty() {
-            ui.label(RichText::new("No .scl files in the tunings folder").small().weak());
-        }
-        // A file loaded from elsewhere
-        if let Some(name) = current_scale.filter(|name| !browser.scales.iter().any(|scale| scale == name)) {
-            let _ = ui.selectable_label(true, folders::stem(name));
-        }
-        if let Some(description) = files.scale.as_ref().and_then(|file| {
-            crate::synth::tuning::Scale::parse(&file.text).ok().map(|scale| scale.description)
-        }) {
-            if !description.is_empty() {
-                ui.add(egui::Label::new(RichText::new(description).small().weak()).wrap());
-            }
-        }
-
-        ui.add_space(4.0);
-        ui.label(RichText::new("Keyboard Mapping").strong()).on_hover_text(
-            "A Scala .kbm file: which key plays which step of the scale (some may be left \
-             silent), and which key is tuned to which frequency. It can retune the standard \
-             scale too, to move A away from 440 Hz, say.",
-        );
-        let current_mapping = files.mapping.as_ref().map(|file| file.name.as_str());
-        if ui
-            .selectable_label(current_mapping.is_none(), "A step per key, root on middle C (standard)")
-            .clicked()
-        {
-            browser.set(params, TuningFiles { mapping: None, ..files.clone() });
-        }
-        for mapping in &browser.mappings {
-            if ui.selectable_label(current_mapping == Some(mapping.as_str()), folders::stem(mapping)).clicked() {
-                load = Some(browser.folder.join(mapping));
-            }
-        }
-        if browser.mappings.is_empty() {
-            ui.label(RichText::new("No .kbm files in the tunings folder").small().weak());
-        }
-        if let Some(name) = current_mapping.filter(|name| !browser.mappings.iter().any(|mapping| mapping == name)) {
-            let _ = ui.selectable_label(true, folders::stem(name));
-        }
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Tunings folder").small()).on_hover_text(
-                "Documents/Three Osc/Tunings in your home directory, or wherever the \
-                 THREE_OSC_TUNINGS environment variable points.",
-            );
-            if ui.small_button("Rescan").clicked() {
-                browser.rescan();
-            }
-        });
-        ui.add(egui::Label::new(RichText::new(browser.folder.to_string_lossy()).small().weak()).wrap());
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut browser.custom_path)
-                    .hint_text("Path to a .scl or .kbm file")
-                    .desired_width(230.0),
-            );
-            if ui.button("Load").clicked() && !browser.custom_path.trim().is_empty() {
-                load = Some(PathBuf::from(browser.custom_path.trim()));
-            }
-        });
-        if let Some(path) = load {
-            browser.load(params, &path);
-        }
-        if let Some(message) = &browser.message {
-            ui.add(egui::Label::new(RichText::new(message).small().color(ERROR_COLOR)).wrap());
-        }
-        if let Some(error) = params.tuning.error() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("The saved tuning doesn't work ({error}), so the keys play the standard tuning."))
-                        .small()
-                        .color(ERROR_COLOR),
-                )
-                .wrap(),
-            );
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tunings_are_named_after_their_files() {
-        let file = |name: &str| Some(TextFile { name: name.to_string(), text: String::new() });
-        assert_eq!(tuning_name(&TuningFiles::default()), "12-TET");
-        assert_eq!(tuning_name(&TuningFiles { scale: file("19-EDO.scl"), mapping: None }), "19-EDO");
-        assert_eq!(tuning_name(&TuningFiles { scale: None, mapping: file("a432.kbm") }), "12-TET, a432");
-    }
 
     #[test]
     fn the_browser_lists_factory_then_user_presets() {

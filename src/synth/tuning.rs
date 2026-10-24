@@ -7,7 +7,10 @@
 //! usual twelve-tone equal temperament (to move A away from 440 Hz, say).
 //!
 //! The formats are described at <https://www.huygens-fokker.org/scala/scl_format.html> and in
-//! the keyboard mapping section of <https://www.huygens-fokker.org/scala/help.htm>.
+//! the keyboard mapping section of <https://www.huygens-fokker.org/scala/help.htm>. Scales can
+//! also be worked out from a few numbers, see [`generate`].
+
+pub mod generate;
 
 /// MIDI key numbers.
 pub const KEYS: usize = 128;
@@ -22,23 +25,100 @@ const LOWEST_NOTE: f64 = -48.0;
 const HIGHEST_NOTE: f64 = 176.0;
 
 /// The most degrees a scale, and the most keys a mapping's pattern, may have.
-const MAX_DEGREES: usize = 4096;
+pub const MAX_DEGREES: usize = 4096;
+
+/// A pitch above a scale's root, as a `.scl` file gives it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Pitch {
+    Cents(f64),
+    /// A frequency ratio: numerator over denominator, both above zero.
+    Ratio(u128, u128),
+}
+
+impl Pitch {
+    pub fn cents(self) -> f64 {
+        match self {
+            Self::Cents(cents) => cents,
+            Self::Ratio(numerator, denominator) => {
+                1200.0 * (numerator as f64 / denominator as f64).log2()
+            }
+        }
+    }
+
+    /// Reads a pitch: cents if it has a decimal point, otherwise a ratio (`3/2`, or `2` for
+    /// 2/1).
+    pub fn parse(word: &str) -> Option<Self> {
+        if word.contains('.') {
+            return word.parse::<f64>().ok().filter(|cents| cents.is_finite()).map(Self::Cents);
+        }
+        let (numerator, denominator) = word.split_once('/').unwrap_or((word, "1"));
+        let numerator = numerator.parse::<u128>().ok()?;
+        let denominator = denominator.parse::<u128>().ok()?;
+        (numerator > 0 && denominator > 0).then_some(Self::Ratio(numerator, denominator))
+    }
+
+    /// The pitch as a `.scl` file writes it.
+    pub fn to_scl(self) -> String {
+        match self {
+            Self::Cents(cents) => format_cents(cents),
+            Self::Ratio(numerator, denominator) => format!("{numerator}/{denominator}"),
+        }
+    }
+}
+
+/// Cents to six decimal places at most, always with a decimal point (which is what makes them
+/// cents in a `.scl` file).
+pub fn format_cents(cents: f64) -> String {
+    let text = format!("{cents:.6}");
+    let text = text.trim_end_matches('0');
+    if text.ends_with('.') {
+        format!("{text}0")
+    } else {
+        text.to_string()
+    }
+}
 
 /// A scale: the pitches of its degrees above its root.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scale {
     pub description: String,
-    /// Degrees 1 to the period, in cents above the root (degree 0).
-    pub cents: Vec<f64>,
+    /// Degrees 1 to the period (degree 0, the root, goes without saying), as given.
+    pub pitches: Vec<Pitch>,
+    /// The same in cents.
+    cents: Vec<f64>,
 }
 
 impl Scale {
+    /// The scale of these pitches above the root, the last of which is the period it repeats
+    /// at.
+    pub fn new(description: impl Into<String>, pitches: Vec<Pitch>) -> Result<Self, String> {
+        if pitches.is_empty() {
+            return Err(String::from("the scale has no pitches"));
+        }
+        if pitches.len() > MAX_DEGREES {
+            return Err(format!("the scale has more than {MAX_DEGREES} pitches"));
+        }
+        let cents: Vec<f64> = pitches.iter().map(|pitch| pitch.cents()).collect();
+        if cents[cents.len() - 1] <= 0.0 {
+            return Err(String::from(
+                "the last pitch is the period the scale repeats at (usually 2/1), so it has to \
+                 be above the root",
+            ));
+        }
+        Ok(Self {
+            description: description.into(),
+            pitches,
+            cents,
+        })
+    }
+
     /// Twelve-tone equal temperament, the usual tuning.
     pub fn equal_temperament() -> Self {
-        Self {
-            description: String::from("12-tone equal temperament"),
-            cents: (1..=12).map(|step| step as f64 * 100.0).collect(),
-        }
+        let pitches = (1..12)
+            .map(|step| Pitch::Cents(step as f64 * 100.0))
+            .chain([Pitch::Ratio(2, 1)])
+            .collect();
+        Self::new("12-tone equal temperament", pitches).expect("a valid scale")
     }
 
     /// Reads a `.scl` file.
@@ -58,20 +138,36 @@ impl Scale {
         if count > MAX_DEGREES {
             return Err(format!("the scale has more than {MAX_DEGREES} pitches"));
         }
-        let cents = lines.take(count).map(parse_pitch).collect::<Result<Vec<f64>, String>>()?;
-        if cents.len() < count {
+        let pitches = lines.take(count).map(parse_pitch).collect::<Result<Vec<Pitch>, String>>()?;
+        if pitches.len() < count {
             return Err(format!(
                 "the scale says it has {count} pitches, but lists {}",
-                cents.len()
+                pitches.len()
             ));
         }
-        if cents[count - 1] <= 0.0 {
-            return Err(String::from(
-                "the last pitch is the period the scale repeats at (usually 2/1), so it has to \
-                 be above the root",
-            ));
+        Self::new(description, pitches)
+    }
+
+    /// The scale as a `.scl` file called `file_name`.
+    pub fn to_scl(&self, file_name: &str) -> String {
+        // (The description has to be one line, which isn't a comment)
+        let description = self.description.replace(['\r', '\n'], " ");
+        let description = description.trim_start_matches('!');
+        let mut text = format!("! {file_name}\n!\n{description}\n {}\n!\n", self.pitches.len());
+        for pitch in &self.pitches {
+            text += &format!(" {}\n", pitch.to_scl());
         }
-        Ok(Self { description, cents })
+        text
+    }
+
+    /// Degrees 1 to the period, in cents above the root.
+    pub fn cents(&self) -> &[f64] {
+        &self.cents
+    }
+
+    /// The interval the scale repeats at.
+    pub fn period(&self) -> Pitch {
+        self.pitches[self.pitches.len() - 1]
     }
 
     /// The number of degrees in a period.
@@ -90,21 +186,17 @@ impl Scale {
     }
 }
 
-/// A `.scl` pitch: cents if it has a decimal point, otherwise a ratio (`3/2`, or `2` for 2/1).
-/// Anything after the first word is a comment.
-fn parse_pitch(line: &str) -> Result<f64, String> {
+/// A `.scl` pitch line: anything after the first word is a comment.
+fn parse_pitch(line: &str) -> Result<Pitch, String> {
     let word = first_word(line);
-    let invalid = || format!("\"{line}\" isn't a pitch: cents like 701.955, or a ratio like 3/2");
-    if word.contains('.') {
-        return word.parse::<f64>().ok().filter(|cents| cents.is_finite()).ok_or_else(invalid);
+    match Pitch::parse(word) {
+        Some(pitch) => Ok(pitch),
+        // Whole numbers, one of them zero
+        None if word.split('/').all(|part| part.parse::<u128>().is_ok()) => {
+            Err(format!("\"{line}\" isn't a positive ratio"))
+        }
+        None => Err(format!("\"{line}\" isn't a pitch: cents like 701.955, or a ratio like 3/2")),
     }
-    let (numerator, denominator) = word.split_once('/').unwrap_or((word, "1"));
-    let numerator = numerator.parse::<u128>().map_err(|_| invalid())?;
-    let denominator = denominator.parse::<u128>().map_err(|_| invalid())?;
-    if numerator == 0 || denominator == 0 {
-        return Err(format!("\"{line}\" isn't a positive ratio"));
-    }
-    Ok(1200.0 * (numerator as f64 / denominator as f64).log2())
 }
 
 fn first_word(line: &str) -> &str {
@@ -318,14 +410,38 @@ mod tests {
         assert_eq!(scale.description, "Quarter-comma meantone, partly");
         assert_eq!(scale.len(), 4);
         let expected = [76.049, 386.3137, 701.955, 1200.0];
-        for (cents, expected) in scale.cents.iter().zip(expected) {
+        for (cents, expected) in scale.cents().iter().zip(expected) {
             assert!((cents - expected).abs() < 1e-3, "{cents} isn't {expected}");
         }
         assert_eq!(scale.degree_cents(0), 0.0);
         assert!((scale.degree_cents(6) - (1200.0 + 386.3137)).abs() < 1e-3);
         assert!((scale.degree_cents(-1) - (701.955 - 1200.0)).abs() < 1e-3);
         // A description can be empty
-        assert_eq!(Scale::parse("\n1\n2/1").unwrap().cents, vec![1200.0]);
+        assert_eq!(Scale::parse("\n1\n2/1").unwrap().cents(), [1200.0]);
+        assert_eq!(scale.pitches[1], Pitch::Ratio(5, 4));
+        assert_eq!(scale.period(), Pitch::Ratio(2, 1));
+    }
+
+    #[test]
+    fn scales_write_out_as_scl_files() {
+        assert_eq!(format_cents(63.157_894_736), "63.157895");
+        assert_eq!(format_cents(1200.0), "1200.0");
+        assert_eq!(format_cents(-3.5), "-3.5");
+        let scale = Scale::new(
+            "Mixed\nup",
+            vec![Pitch::Cents(150.0), Pitch::Ratio(5, 4), Pitch::Cents(701.955), Pitch::Ratio(2, 1)],
+        )
+        .unwrap();
+        let text = scale.to_scl("mixed.scl");
+        assert!(text.starts_with("! mixed.scl\n!\nMixed up\n 4\n"), "{text}");
+        let read = Scale::parse(&text).unwrap();
+        assert_eq!(read.pitches, scale.pitches);
+        assert_eq!(read.description, "Mixed up");
+        let standard = Scale::equal_temperament();
+        assert_eq!(Scale::parse(&standard.to_scl("12.scl")).unwrap(), standard);
+        // A description can't start a comment
+        let odd = Scale::new("!!Loud", vec![Pitch::Ratio(2, 1)]).unwrap();
+        assert_eq!(Scale::parse(&odd.to_scl("odd.scl")).unwrap().description, "Loud");
     }
 
     #[test]
