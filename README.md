@@ -17,6 +17,7 @@ Currently a work in progress, but usable nevertheless.
 * ADSR envelopes with slopes smoothly adjustable from exponential to logarithmic.
 * Wavetable oscillators with sine, triangle, absolute sine, saw, square and pulse waves, a pulse width sweep wavetable and a Basic Shapes wavetable (those nine shapes in a row) that each oscillator's position control morphs through, and wavetables loaded from `.wav` files (single cycles or multi-frame tables, including the `clm` frame size chunk Serum-style tables carry)
 * Bandlimited wave synthesis using wavetables computed via FFT (harmonics extend up to the Nyquist frequency, with no unexpected drop-off), read with cubic, linear or no interpolation (a global control, for trading quality against CPU)
+* Oversampling: the voices can run at 2, 4 or 8 times the sample rate, which takes the aliasing out of strong PM, FM and AM and the filters' distortion
 * Detunable unison with (up to) 32 voices for each oscillator (i.e. yes it can supersaw), with a stereo width control (at its widest by default) that spreads the voices across the stereo field around each oscillator's pan
 * Integer frequency division/multiplication for each oscillator for harmonic sound effects
 * A modulation matrix: three LFOs, two spare envelopes, the volume and filter envelopes, velocity, key position, mod wheel, aftertouch and a per-note random value can each modulate pitch, wavetable position, amplitude, pan, unison detune, PM/FM/AM amounts, filter cutoff, resonance and drive, note volume, the LFO rates and the effects' controls, through 16 routes. Drag a source's handle onto a slider in the GUI to route it. Modulation is worked out every 32 samples, or at every sample with the Modulation Rate control.
@@ -55,7 +56,7 @@ cargo run --release --features standalone -- --help
 ```
 
 ### Benchmarks
-Rough throughput numbers for the synth engine (time per sample for a few patches, at both modulation rates, and wavetable generation time and memory):
+Rough throughput numbers for the synth engine (time per sample for a few patches, at both modulation rates and at each oversampling, and wavetable generation time and memory), and how much aliasing each oversampling leaves:
 
 ```shell
 cargo test --release --lib benchmark -- --ignored --nocapture --test-threads=1
@@ -75,7 +76,7 @@ The FX tab, in the oscillators' place, has four effects that process the synth's
 Every setting is smoothed sample by sample, so automation and modulation (applied once per control rate block) don't step, and an effect that is switched on starts from silence. All four together take about 130 ns per sample on the machine below, a little over twice what 8 notes of the default patch take.
 
 ### Presets
-The title bar's preset menu lists the factory presets by category, then your own; the arrows step through them, and a `*` after the name means the controls have been moved since the preset was loaded. Save stores the current settings as a preset of your own in `Documents/Three Osc/Presets` in your home directory (or the folder the `THREE_OSC_PRESETS` environment variable names), named after the file. The tuning isn't part of a preset: it stays as it is while you browse.
+The title bar's preset menu lists the factory presets by category, then your own; the arrows step through them, and a `*` after the name means the controls have been moved since the preset was loaded. Save stores the current settings as a preset of your own in `Documents/Three Osc/Presets` in your home directory (or the folder the `THREE_OSC_PRESETS` environment variable names), named after the file. The tuning and the oversampling aren't part of a preset: they stay as they are while you browse.
 
 A preset is a JSON file that lists the parameters that differ from their defaults, by their IDs (the same as in the plugin's saved state), plus the wavetable file of each oscillator that plays one:
 
@@ -127,7 +128,7 @@ The file is read and analysed on a background thread: each frame's spectrum is k
 Each note's table is only as long as its harmonics need (a power of two of at least 16 samples per harmonic, from 64 up to 2048 samples), and a wavetable with many frames shares one table between neighbouring notes when it would otherwise take more than 24 MB. The built in wavetables take 26 MB.
 
 ### Displays
-The displays are drawn with the synth's own code, so they show what is played. An oscillator's display is one cycle of its wavetable at the current position (rendered from the same spectra as the tables it plays, loaded files included), with a line where the wave starts when Phase Rand is below 100%; it is dimmed while the oscillator's amplitude is 0. The LFO displays show one cycle. The envelope displays draw attack, decay, a stretch of sustain and release, each stage as wide as the square root of its time, so that a 2 ms attack is still visible next to a 2 second release. The filter display is the frequency response from 20 Hz to 20 kHz, measured by running an impulse through the filter model itself at the host's sample rate (a quiet one, so the nonlinear models show their small-signal response; the drive's distortion doesn't show), with the response at the peak of the filter envelope drawn more faintly. The effects show the distortion's curve, the chorus's sweep, the delay's echoes and the reverb's decay (its lows and, faster under the damping, its highs).
+The displays are drawn with the synth's own code, so they show what is played. An oscillator's display is one cycle of its wavetable at the current position (rendered from the same spectra as the tables it plays, loaded files included), with a line where the wave starts when Phase Rand is below 100%; it is dimmed while the oscillator's amplitude is 0. The LFO displays show one cycle. The envelope displays draw attack, decay, a stretch of sustain and release, each stage as wide as the square root of its time, so that a 2 ms attack is still visible next to a 2 second release. The filter display is the frequency response from 20 Hz to 20 kHz, measured by running an impulse through the filter model itself at the rate the voices run at, the host's sample rate times the oversampling (a quiet impulse, so the nonlinear models show their small-signal response; the drive's distortion doesn't show), with the response at the peak of the filter envelope drawn more faintly. The effects show the distortion's curve, the chorus's sweep, the delay's echoes and the reverb's decay (its lows and, faster under the damping, its highs).
 
 While notes play, the displays follow them: a dot for each of the newest 16 notes moves through the envelopes, a dot on each LFO shows the newest note's phase, the filter display marks the newest note's cutoff (with its envelope, keytracking and modulation), and the waves and the effects' displays show the newest note's modulated position and settings. After each buffer the audio thread writes what the GUI shows into a handful of atomics (only while the GUI is open), and the GUI reads them as it draws.
 
@@ -157,6 +158,36 @@ The control rate code uses polynomial approximations of `2^x`, `log2`, `x^y`, `s
 ### Interpolation
 The global Interpolation control picks how the wavetables are read in between their samples: Cubic (4-point Hermite, the default and cleanest), Linear, or None (the sample below the read position, which steps audibly on all but the lowest notes). Each mode has its own specialised lookup kernels, so there is no per-sample cost to the choice. On an 8 note, 3 x 8 voice supersaw, Linear is about 20% cheaper than Cubic and None about 30% cheaper.
 
+### Oversampling
+The Oversampling menu in the title bar runs the voices at 2, 4 or 8 times the sample rate (it is Off by default). The wavetables are bandlimited to the host's Nyquist frequency either way, so a plain note sounds the same at every setting (its level stays within 0.05 dB); what oversampling takes out is the aliasing of what the voices make above the Nyquist frequency: the sidebands of phase, frequency and amplitude modulation, and the filters' distortion. The voices' output comes back down to the sample rate through a cascade of halfband decimators, one per halving: polyphase IIR filters made of two chains of first order allpasses, designed as in Laurent de Soras's HIIR library, with both chains of both channels running in one 4-lane vector. They keep up to 20 kHz flat (at 44.1 kHz, and in proportion at other rates), keep anything that would fold back into that band at least 100 dB down, and delay the output by 1.5 (2x) to 2.4 samples (8x). The effects run at the sample rate, after the decimators. A voice still works its controls out once per 32 of its own samples, so oversampled, envelopes and modulation are worked out two, four or eight times as often. The setting is a quality and CPU choice, like the tuning, so presets leave it alone. It can change while notes play, and they carry on where they were: the new decimators start from the voices' last output rather than from silence, so the sound doesn't drop out.
+
+How much aliasing is left, from `benchmark_aliasing`: the share of a held note's output that isn't at a harmonic of the note (or at 0 Hz), from an FFT of three quarters of a second of it under a Blackman-Harris window, at 44.1 kHz. Oscillator 2 is the modulator in the modulation cases, a sine (and silent itself) unless said otherwise.
+
+| Patch | Off | 2x | 4x | 8x |
+|---|---|---|---|---|
+| Saw, no filter, C7 | -89 dB | -89 dB | -89 dB | -91 dB |
+| Sine, phase modulated (50%) by a sine, C6 | -2 dB | -90 dB | -90 dB | -90 dB |
+| Sine, phase modulated (50%) by a sine, C7 | -1 dB | -2 dB | -89 dB | -89 dB |
+| Sine, frequency modulated (30%) by a sine, C7 | -8 dB | -91 dB | -91 dB | -91 dB |
+| Sine, ring modulated (100%) by a saw, C6 | -34 dB | -89 dB | -89 dB | -89 dB |
+| Saw through the Ladder filter at 5 kHz, drive 10, C6 | -49 dB | -60 dB | -84 dB | -88 dB |
+
+The bandlimited saw has nothing to lose; the strongly phase modulated C7, with sidebands up to about 80 kHz, needs 4x; and the Ladder filter, already 3x oversampled on its own, aliases less to start with but still needs 4x to clean up its distortion.
+
+The cost, from `benchmark_oversampling` (8 notes at 44.1 kHz on a 2.1 GHz Xeon, time per sample of output, with how many times the cost without oversampling):
+
+| Patch | Off | 2x | 4x | 8x |
+|---|---|---|---|---|
+| Default (1 saw, Digital filter) | 56 ns | 115 ns (2.1x) | 238 ns (4.3x) | 480 ns (8.6x) |
+| Default, no filter | 40 ns | 88 ns (2.2x) | 178 ns (4.4x) | 380 ns (9.4x) |
+| Default, Ladder filter | 168 ns | 319 ns (1.9x) | 655 ns (3.9x) | 1297 ns (7.7x) |
+| Phase modulation (2 sines) | 111 ns | 218 ns (2.0x) | 430 ns (3.9x) | 903 ns (8.1x) |
+| 3 x saw, unison 8 | 301 ns | 588 ns (2.0x) | 1219 ns (4.0x) | 2457 ns (8.2x) |
+| 3 x saw, unison 8, stereo | 325 ns | 631 ns (1.9x) | 1274 ns (3.9x) | 2636 ns (8.1x) |
+| 3 x saw, unison 8, Ladder filter | 406 ns | 827 ns (2.0x) | 1712 ns (4.2x) | 3412 ns (8.4x) |
+
+Nearly all of the cost is the voices rendering two, four or eight times as many samples; the decimators themselves take 5.8, 15 and 34 ns per sample of stereo output at 2x, 4x and 8x. So 2x, at twice the CPU, takes care of most modulation, and 8x is for the extreme cases.
+
 ### Oscillator kernels and SIMD
 Each oscillator renders a whole control rate block in one kernel call: the unison voices' phases advance as vectors, every sample reads and interpolates the wavetable at each voice and sums the voices into the block (with AVX2, eight samples' sums across the voices are worked out together), and a modulated oscillator reads its modulator's block sample for sample (the oscillators are rendered from the last to the first, so the modulation is still instantaneous). With fewer than 8 unison voices the vectors run across time instead: each holds 8 consecutive samples of one voice, whose phases have a closed form (or are added up one by one under frequency modulation), so nothing has to be summed across a vector's lanes at every sample, and the gain ramp and the additions to the output go a vector at a time too. That makes a single voice more than three times cheaper than with the vectors across voices. Phases are 32-bit fixed point: one cycle is 2^32, so they wrap for free and pitch resolves to 2^-32 cycles per sample, and a phase splits into a table index and a fraction with a shift and a mask (wavetable cycles are powers of two long).
 
@@ -171,7 +202,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * The absolute sine / exponential wave is like a saw wave where the harmonics decrease volume at -12dB per octave instead of -6 dB per octave (i.e. it's a saw wave tracked by a soft filter). Similarly, the triangle wave is like a square wave where the harmonics diminish at -12dB per octave instead of -6dB.
 * Increasing envelope slope makes it steeper, decreasing it does the opposite. Slope = 0 gives perfectly linear slopes, which are not perceptually linear. Slope = 1 gives perceptually-linear (logarithmic) volume decay.
 * The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Underdriving the filters (i.e. drive below 1) and sweeping them very slowly gives a 'harmonic snap' effect.
-* The Ladder filter runs 3x oversampled, with its input properly upsampled and its output decimated so that its distortion doesn't alias. Its cutoff can't go higher than about 12.6 kHz at a 44.1 kHz sample rate (13.7 kHz at 48 kHz), so even fully open it softens the top octave (15 kHz comes out about 11 dB below 1 kHz at 44.1 kHz). At 88.2 kHz and above it opens up fully. It runs in single precision, like the original module's 32-bit build: its output is within about -110 dB of a double precision version.
+* The Ladder filter runs 3x oversampled, with its input properly upsampled and its output decimated so that its distortion doesn't alias. Its cutoff can't go higher than about 12.6 kHz at a 44.1 kHz sample rate (13.7 kHz at 48 kHz), so even fully open it softens the top octave (15 kHz comes out about 11 dB below 1 kHz at 44.1 kHz). At 88.2 kHz and above (or with the voices oversampled) it opens up fully. It runs in single precision, like the original module's 32-bit build: its output is within about -110 dB of a double precision version.
 * Setting octave detune to -0.0028 gives near perfect fifths, while 0.0342 gives near perfect major thirds.
 * FM changes frequency with the modulator's waveform, PM changes frequency with the derivative of the modulator's waveform. (I.E. PM by triangle == FM by square wave)
 
@@ -190,7 +221,6 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 
 ## TODO
 * Use naive wave generation for modulation between oscillators? (stop ringing artifacts)
-* Add oversampling with a control (for FM / PM)
 * Switch between Naive, Wavetable, and Additive synthesis with a control
 * Only generate unique wavetables when necessary (i.e. every third note, and only when harmonic count changes)
 * Adjust more knobs to sensible values / defaults
@@ -205,7 +235,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * Come up with better name for "Initial Pitch Slide" control
 * Improve the UI
     * Knobs instead of sliders, envelope / waveform displays
-    * 2nd page for oversampling and other unimportant things
+    * 2nd page for unimportant settings
 * A file browser for wavetable files outside the wavetable folder (paths can be typed in for now)
 * Publish
 

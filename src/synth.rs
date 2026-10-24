@@ -19,6 +19,7 @@ use self::modulation::{
     N_SOURCES, N_TARGETS,
 };
 use self::notes::Notes;
+use self::oversampling::{Decimator, Oversampling};
 use self::oscillator::BlockOutput;
 use self::oscillator::BlockParams;
 use self::oscillator::Interpolation;
@@ -110,6 +111,17 @@ pub struct ThreeOsc {
     /// The pitch each key plays, as a MIDI note number (fractional for keys between the usual
     /// notes, see [`tuning`]), or NaN for a key that doesn't play.
     pub key_pitches: [f32; tuning::KEYS],
+    /// How many times the sample rate the voices run at (see [`oversampling`]). A change takes
+    /// effect at the start of the next [`run()`][Self::run()].
+    pub oversampling: Oversampling,
+    /// The oversampling the voices run at now.
+    oversampled: Oversampling,
+    /// What brings the voices' output down to the sample rate. Taken out of the synth while the
+    /// voices render, like the effects.
+    decimator: Option<Decimator>,
+    /// What the voices added to the last sample of output, in each channel, for a new
+    /// decimator to start from.
+    voice_output: [f32; 2],
 }
 
 impl ThreeOsc {
@@ -148,7 +160,40 @@ impl ThreeOsc {
             modulation_rate: ModulationRate::default(),
             rng: fastrand::Rng::new(),
             key_pitches: std::array::from_fn(|key| key as f32),
+            oversampling: Oversampling::Off,
+            oversampled: Oversampling::Off,
+            decimator: Some(Decimator::new(Oversampling::Off)),
+            voice_output: [0.0; 2],
         }
+    }
+    /// The rate the voices run at: the sample rate times the oversampling.
+    pub fn voice_rate(&self) -> f64 {
+        self.sample_rate * self.oversampled.factor() as f64
+    }
+    /// Puts a change of oversampling into effect, so that the notes carry on where they were:
+    /// the voices' clocks and pitches count in samples at the new rate, their filters take
+    /// the new rate's coefficients, and the new decimators start from the voices' last output.
+    fn switch_oversampling(&mut self) {
+        if self.oversampling == self.oversampled {
+            return;
+        }
+        let (old, new) = (self.oversampled.factor() as u64, self.oversampling.factor() as u64);
+        let rescale = |samples: u32| (samples as u64 * new / old) as u32;
+        for voice in &mut self.voices {
+            voice.runtime = rescale(voice.runtime);
+            voice.release_time = voice.release_time.map(rescale);
+            // The oscillators' pitch ramps carry on from the same pitch, in cycles per sample
+            // at the new rate
+            for delta in &mut voice.osc_delta {
+                *delta *= old as f32 / new as f32;
+            }
+            voice.rate_changed = true;
+        }
+        let mut decimator = Decimator::new(self.oversampling);
+        let [left, right] = self.voice_output;
+        decimator.settle(left, right);
+        self.decimator = Some(decimator);
+        self.oversampled = self.oversampling;
     }
     pub fn note_on(&mut self, note: u8, velocity: u8) {
         // Keys the tuning leaves out don't play
@@ -250,10 +295,14 @@ impl ThreeOsc {
         if let Some(effects) = &mut self.effects {
             effects.reset();
         }
+        if let Some(decimator) = &mut self.decimator {
+            decimator.reset();
+        }
+        self.voice_output = [0.0; 2];
         self.effect_modulation = [0.0; N_TARGETS];
     }
     pub fn release_voices(&mut self) {
-        let duration = (self.gain_envelope.release_time * self.sample_rate as f32) as u32;
+        let duration = (self.gain_envelope.release_time * self.voice_rate() as f32) as u32;
 
         self.voices.retain(|voice| {
             if let Some(release_time) = voice.release_time {
@@ -340,7 +389,7 @@ impl ThreeOsc {
             sources_used,
             mod_wheel: self.mod_wheel,
             aftertouch: self.aftertouch,
-            sample_rate: self.sample_rate as f32,
+            sample_rate: self.voice_rate() as f32,
             stereo,
             stereo_width: self.stereo_width,
             octave_detune: self.octave_detune,
@@ -355,6 +404,7 @@ impl ThreeOsc {
         }
     }
     pub fn run(&mut self, output_left: &mut [f32], output_right: &mut [f32]) {
+        self.switch_oversampling();
         self.release_voices();
         self.filter_controller.cutoff = self.filter_controller.target_cutoff;
 
@@ -374,10 +424,11 @@ impl ThreeOsc {
             }
         }
 
-        // The voices and the effects are taken out of the synth while the context borrows the
-        // rest of it. This doesn't allocate: the vector keeps its capacity and goes back
-        // afterwards, and so do the effects.
+        // The voices, the decimator and the effects are taken out of the synth while the
+        // context borrows the rest of it. This doesn't allocate: the vector keeps its capacity
+        // and goes back afterwards, and so do the others.
         let mut voices = std::mem::take(&mut self.voices);
+        let mut decimator = self.decimator.take();
         let mut effects = self.effects.take();
         let settings = self.effect_settings;
         let mut effect_modulation = self.effect_modulation;
@@ -387,37 +438,44 @@ impl ThreeOsc {
 
         // Write samples from all voices, one control rate block at a time. Each block goes
         // through three stages: the oscillators of every voice, then the filters (which can run
-        // several voices in lockstep), then the amplitude envelopes mixing into the output,
-        // which then goes through the output gain and the effects.
+        // several voices in lockstep), then the amplitude envelopes mixing into the output. When
+        // oversampled, the voices' blocks are at their own rate, and a block comes down to the
+        // sample rate before going through the output gain and the effects.
         let len = output_left.len().min(output_right.len());
-        let per_sample = context.per_sample;
+        let factor = self.oversampled.factor();
+        let mut oversampled = [[0.0; CONTROL_BLOCK_SAMPLES]; 2];
+        let mut voice_output = self.voice_output;
         let mut start = 0;
         let mut last_block_len = 0;
         while start < len {
-            let end = (start + CONTROL_BLOCK_SAMPLES).min(len);
-            let block_len = end - start;
+            let end = (start + CONTROL_BLOCK_SAMPLES / factor).min(len);
+            let block_len = (end - start) * factor;
             last_block_len = block_len;
-            for voice in voices.iter_mut() {
-                if per_sample {
-                    voice.update_controls_per_sample(&context, block_len);
-                } else {
-                    voice.update_controls(&context, block_len);
+            let (left, right) = (&mut output_left[start..end], &mut output_right[start..end]);
+            match &mut decimator {
+                Some(decimator) if factor > 1 => {
+                    let [voice_left, voice_right] = &mut oversampled;
+                    let (voice_left, voice_right) = (&mut voice_left[..block_len], &mut voice_right[..block_len]);
+                    voice_left.fill(0.0);
+                    voice_right.fill(0.0);
+                    render_voice_block(&mut voices, &context, block_len, voice_left, voice_right);
+                    let decimated = decimator.process(voice_left, voice_right);
+                    for (output, sample) in left.iter_mut().zip(&voice_left[..decimated]) {
+                        *output += sample;
+                    }
+                    for (output, sample) in right.iter_mut().zip(&voice_right[..decimated]) {
+                        *output += sample;
+                    }
+                    voice_output = [voice_left[decimated - 1], voice_right[decimated - 1]];
                 }
-                voice.render_oscillators(&context, block_len);
-            }
-            let filter_rate = per_sample.then_some(self.sample_rate as f32);
-            filter_voices(&mut voices, block_len, stereo, self.simd, filter_rate);
-            for voice in voices.iter_mut() {
-                voice.mix_output(
-                    block_len,
-                    stereo,
-                    per_sample,
-                    &mut output_left[start..end],
-                    &mut output_right[start..end],
-                );
+                _ => {
+                    let last = left.len() - 1;
+                    let before = [left[last], right[last]];
+                    render_voice_block(&mut voices, &context, block_len, left, right);
+                    voice_output = [left[last] - before[0], right[last] - before[1]];
+                }
             }
 
-            let (left, right) = (&mut output_left[start..end], &mut output_right[start..end]);
             for (left, right) in izip!(left.iter_mut(), right.iter_mut()) {
                 *left *= output_volume;
                 *right *= output_volume;
@@ -441,6 +499,8 @@ impl ThreeOsc {
         };
         self.newest_modulation = newest_modulation;
         self.voices = voices;
+        self.decimator = decimator;
+        self.voice_output = voice_output;
         self.effects = effects;
         self.effect_modulation = effect_modulation;
     }
@@ -472,9 +532,11 @@ impl ThreeOsc {
     }
     /// Shows the GUI the notes that are playing, see [`Monitor`].
     pub fn publish(&self, monitor: &Monitor) {
+        // (The voices count samples at their own rate)
+        let factor = self.oversampled.factor() as u32;
         let voices = self.voices.iter().map(|voice| VoiceState {
-            runtime: voice.runtime,
-            released: voice.release_time,
+            runtime: voice.runtime / factor,
+            released: voice.release_time.map(|time| time / factor),
         });
         let newest = self.voices.last().map(|voice| NewestVoice {
             lfo_phases: std::array::from_fn(|lfo| voice.lfos[lfo].phase as f32),
@@ -593,6 +655,9 @@ pub struct Voice {
     drive: f32,
     /// The filter's cutoff at the end of the last block, for the GUI.
     cutoff: f32,
+    /// Whether the voices' rate changed after the last block, so that the Digital filter's
+    /// coefficients start at the new rate's rather than ramping from the old rate's.
+    rate_changed: bool,
 
     /// The current block's samples on their way from the oscillators through the filter to the
     /// output; `pre_filter_right` is only used in stereo.
@@ -683,6 +748,7 @@ impl Voice {
             gain_step: 0.0,
             drive: 1.0,
             cutoff: 0.0,
+            rate_changed: false,
             pre_filter: [0.0; CONTROL_BLOCK_SAMPLES],
             pre_filter_right: [0.0; CONTROL_BLOCK_SAMPLES],
             scratch: Scratch {
@@ -898,6 +964,8 @@ impl Voice {
         if drive_mod != 0.0 {
             drive = (drive * fastmath::exp2(drive_mod * ModTarget::DRIVE_OCTAVES)).clamp(0.01, 10.0);
         }
+        // (Not ramped from coefficients for another rate)
+        let ramp_samples = if std::mem::take(&mut self.rate_changed) { 0 } else { block_len };
         let configure_filter = |filter: &mut FilterContainer| {
             filter.set(
                 controller.filter_model,
@@ -907,7 +975,7 @@ impl Voice {
                 controller.filter_type,
             );
             filter.set_filter_type(controller.filter_type);
-            filter.set_params_ramped(sample_rate, cutoff, resonance, block_len);
+            filter.set_params_ramped(sample_rate, cutoff, resonance, ramp_samples);
         };
         configure_filter(&mut self.filter);
         if context.stereo {
@@ -1167,6 +1235,31 @@ fn partial_block_portamento(rate: f32, block_len: usize) -> f32 {
 /// in lockstep even for a single sample.
 const SVF_LOCKSTEP_MIN_BLOCK: usize = 4;
 
+/// Renders a control rate block of every voice at the voices' rate, adding it into the output:
+/// their oscillators, then their filters, then their amplitude envelopes.
+fn render_voice_block(
+    voices: &mut [Voice],
+    context: &VoiceContext,
+    block_len: usize,
+    out_left: &mut [f32],
+    out_right: &mut [f32],
+) {
+    let per_sample = context.per_sample;
+    for voice in voices.iter_mut() {
+        if per_sample {
+            voice.update_controls_per_sample(context, block_len);
+        } else {
+            voice.update_controls(context, block_len);
+        }
+        voice.render_oscillators(context, block_len);
+    }
+    let filter_rate = per_sample.then_some(context.sample_rate);
+    filter_voices(voices, block_len, context.stereo, context.simd, filter_rate);
+    for voice in voices.iter_mut() {
+        voice.mix_output(block_len, context.stereo, per_sample, out_left, out_right);
+    }
+}
+
 /// Runs every voice's filter over the current block. The Digital (SVF) and Ladder filters are
 /// processed several voices at a time, in lockstep. With `per_sample` (the sample rate, when
 /// the modulation runs at it), the filters take each sample's coefficients from the voices'
@@ -1358,6 +1451,7 @@ fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
 pub mod effects;
 pub mod fastmath;
 pub mod monitor;
+pub mod oversampling;
 mod per_sample;
 pub mod tuning;
 pub mod wav;

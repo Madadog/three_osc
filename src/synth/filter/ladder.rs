@@ -717,16 +717,24 @@ impl LadderFilter {
     /// everything above 90% of the output's Nyquist frequency. The upsampler smooths the input
     /// into the oversampled rate, and the decimator removes the distortion the filter
     /// generates above the output's Nyquist frequency before the signal is decimated, so that
-    /// it doesn't alias. Redesigning clears their state, so it is only done when something
-    /// changed (this is called for every control rate block).
+    /// it doesn't alias. Redesigning clears their state, so it is only done when the design
+    /// changed (this is called for every control rate block): at another rate, the same
+    /// design (relative to the rate) keeps its coefficients and its state.
     fn update_decimator(&mut self) {
         let rate = self.sample_rate * self.oversampling_factor as f64;
         let cutoff = IIR_DOWNSAMPLING_BANDWIDTH * self.sample_rate / 2.0;
         let iir = &self.iir_lowpass;
-        if iir.sample_rate != rate
-            || iir.cutoff_frequency != cutoff
-            || iir.decimator_order != self.decimator_order
-        {
+        if iir.sample_rate == rate && iir.cutoff_frequency == cutoff && iir.decimator_order == self.decimator_order {
+            return;
+        }
+        if iir.decimator_order == self.decimator_order && iir.cutoff_frequency / iir.sample_rate == cutoff / rate {
+            // The same filters at another rate (when the voices' oversampling changes): the
+            // coefficients are the same, so they carry on as they are
+            for iir in [&mut self.iir_lowpass, &mut self.iir_upsampler] {
+                iir.sample_rate = rate;
+                iir.cutoff_frequency = cutoff;
+            }
+        } else {
             self.iir_lowpass.redesign(rate, cutoff, self.decimator_order);
             self.iir_upsampler.redesign(rate, cutoff, self.decimator_order);
         }

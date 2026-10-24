@@ -189,11 +189,11 @@ impl ThreeOscPlugin {
         };
         synth.bend_range = values.get(&global.bend_range) as f32;
         synth.polyphony = values.get(&global.polyphony).to_polyphony();
-        // Scaling: This is a lerp, and must be proportional to the sample rate
+        synth.oversampling = values.get(&global.oversampling).to_oversampling();
+        // Scaling: This is a lerp per sample at the voices' rate, and must be proportional to it
         // ... the '0.002' is just user-friendly control scaling.
-        // TODO: test and make sure this actually keeps time constant across sample rates
-        synth.portamento_rate =
-            1.0 - values.get(&global.portamento_rate).powf(0.002 * synth.sample_rate as f32 / 44100.0);
+        let voice_rate = synth.sample_rate as f32 * synth.oversampling.factor() as f32;
+        synth.portamento_rate = 1.0 - values.get(&global.portamento_rate).powf(0.002 * voice_rate / 44100.0);
         synth.portamento_offset = values.get(&global.pitch_offset);
         // multiplies delta: smaller = higher pitch
         synth.octave_detune = 1.0 - values.get(&global.octave_detune);
@@ -985,6 +985,275 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
     }
 
+    /// Sets the plugin up with the parameters a preset of `params` gives, at an oversampling.
+    fn set_up(plugin: &mut ThreeOscPlugin, params: &[(&str, serde_json::Value)], oversampling: &str) {
+        let mut preset = presets::Preset::default();
+        for (id, value) in params {
+            preset.params.insert(id.to_string(), value.clone());
+        }
+        // Presets leave the oversampling alone, so it's set apart from them
+        let ParamPtr::EnumParam(inner) = plugin.params.global.oversampling.as_ptr() else { unreachable!() };
+        assert!(unsafe { (*inner).set_from_id(oversampling) }, "{oversampling}");
+        plugin.synth.reset();
+        plugin.apply_param_values(&presets::PresetValues::new(&preset, &plugin.params));
+        fastrand::seed(3);
+    }
+
+    /// Renders a note for `seconds`, letting go of it `held` seconds in.
+    fn render_note(plugin: &mut ThreeOscPlugin, note: u8, held: f32, seconds: f32) -> (Vec<f32>, Vec<f32>) {
+        let rate = plugin.synth.sample_rate as f32;
+        let mut left = vec![0.0; (seconds * rate) as usize];
+        let mut right = left.clone();
+        let release = ((held * rate) as usize).min(left.len());
+        plugin.synth.note_on(note, 100);
+        plugin.synth.run(&mut left[..release], &mut right[..release]);
+        plugin.synth.note_off(note, 0);
+        plugin.synth.run(&mut left[release..], &mut right[release..]);
+        (left, right)
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    /// A plain note sounds the same at every oversampling: its level, its pitch (counted in
+    /// zero crossings) and its envelope's timing.
+    #[test]
+    fn oversampling_leaves_plain_notes_alone() {
+        let mut plugin = ThreeOscPlugin::default();
+        let patch = [
+            ("osc1_wave", serde_json::Value::from("triangle")),
+            ("osc1_phase_rand", serde_json::Value::from(0.0)),
+            ("vol_decay", serde_json::Value::from(0.3)),
+            ("vol_sustain", serde_json::Value::from(0.5)),
+            ("vol_release", serde_json::Value::from(0.1)),
+        ];
+        let rate = plugin.synth.sample_rate as usize;
+        let measure = |plugin: &mut ThreeOscPlugin, oversampling: &str| {
+            set_up(plugin, &patch, oversampling);
+            let (left, right) = render_note(plugin, 69, 0.5, 0.7);
+            assert_eq!(left, right);
+            let window = |from: f32| rms(&left[(from * rate as f32) as usize..][..rate / 20]);
+            let crossings = left[rate / 10..rate / 2].windows(2).filter(|pair| pair[0] < 0.0 && pair[1] >= 0.0).count();
+            // Decaying, sustaining, released, and gone
+            ([window(0.05), window(0.25), window(0.45), window(0.6)], crossings, plugin.synth.voices.len())
+        };
+        let (levels, crossings, voices) = measure(&mut plugin, "off");
+        assert_eq!(crossings, 176);
+        // (Released, it goes at the start of the next buffer)
+        assert_eq!(voices, 1);
+        assert!(levels[3] < 1e-6);
+        for oversampling in ["2x", "4x", "8x"] {
+            let (oversampled, oversampled_crossings, oversampled_voices) = measure(&mut plugin, oversampling);
+            assert_eq!((oversampled_crossings, oversampled_voices), (crossings, voices), "{oversampling}");
+            for (level, oversampled) in levels[..3].iter().zip(oversampled) {
+                let db = 20.0 * (oversampled / level).log10();
+                assert!(db.abs() < 0.05, "{oversampling}: {levels:?} vs {oversampled:?}");
+            }
+            assert!(oversampled[3] < 1e-6);
+        }
+    }
+
+    /// The share of a note's output that isn't at a harmonic of the note (or at 0 Hz, where
+    /// FM's and AM's sidebands can land too), in dB: what aliasing folds back in between them.
+    fn inharmonic_db(samples: &[f32], frequency: f32, sample_rate: f32) -> f32 {
+        let len = samples.len().next_power_of_two() / 2;
+        let samples = &samples[samples.len() - len..];
+        let fft = rustfft::FftPlanner::new().plan_fft_forward(len);
+        // A Blackman-Harris window, whose leakage is 92 dB down
+        let mut bins: Vec<rustfft::num_complex::Complex32> = samples
+            .iter()
+            .enumerate()
+            .map(|(n, sample)| {
+                let x = std::f32::consts::TAU * n as f32 / len as f32;
+                let window = 0.35875 - 0.48829 * x.cos() + 0.14128 * (2.0 * x).cos() - 0.01168 * (3.0 * x).cos();
+                rustfft::num_complex::Complex32::new(sample * window, 0.0)
+            })
+            .collect();
+        fft.process(&mut bins);
+        let bin_hz = sample_rate / len as f32;
+        let (mut harmonic, mut other) = (0.0, 0.0);
+        for (bin, value) in bins[1..len / 2].iter().enumerate().map(|(i, value)| (i + 1, value)) {
+            let hz = bin as f32 * bin_hz;
+            let nearest = (hz / frequency).round() * frequency;
+            if (hz - nearest).abs() <= 6.0 * bin_hz {
+                harmonic += value.norm_sqr();
+            } else {
+                other += value.norm_sqr();
+            }
+        }
+        10.0 * (other / (harmonic + other)).log10()
+    }
+
+    /// Strong phase modulation of a high note has sidebands far above the Nyquist frequency,
+    /// which fold back as aliasing at the sample rate and much less oversampled.
+    #[test]
+    fn oversampling_takes_the_aliasing_out_of_phase_modulation() {
+        let mut plugin = ThreeOscPlugin::default();
+        let patch = [
+            ("osc1_wave", serde_json::Value::from("sine")),
+            ("osc1_phase_rand", serde_json::Value::from(0.0)),
+            ("osc1_pm", serde_json::Value::from(0.5)),
+            ("osc2_phase_rand", serde_json::Value::from(0.0)),
+            ("fil1_model", serde_json::Value::from("none")),
+        ];
+        let rate = plugin.synth.sample_rate as f32;
+        let aliasing = |plugin: &mut ThreeOscPlugin, note: u8| -> Vec<f32> {
+            ["off", "2x", "4x", "8x"]
+                .into_iter()
+                .map(|oversampling| {
+                    set_up(plugin, &patch, oversampling);
+                    let (left, _) = render_note(plugin, note, 1.0, 1.0);
+                    inharmonic_db(&left, 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0), rate)
+                })
+                .collect()
+        };
+        // C6, with sidebands up to about 40 kHz: twice the sample rate is plenty
+        let c6 = aliasing(&mut plugin, 84);
+        println!("Phase modulation of C6, aliasing (off, 2x, 4x, 8x): {c6:.1?} dB");
+        assert!(c6[0] > -40.0, "{c6:?}");
+        assert!(c6[1] < -80.0 && c6[2] < -80.0 && c6[3] < -80.0, "{c6:?}");
+        // C7, with sidebands up to about 80 kHz, needs four times
+        let c7 = aliasing(&mut plugin, 96);
+        println!("Phase modulation of C7, aliasing (off, 2x, 4x, 8x): {c7:.1?} dB");
+        assert!(c7[0] > -20.0 && c7[1] > -20.0, "{c7:?}");
+        assert!(c7[2] < -80.0 && c7[3] < -80.0, "{c7:?}");
+    }
+
+    /// How much aliasing a few kinds of patch have at each oversampling: the share of their
+    /// output that isn't at a harmonic of the note.
+    #[test]
+    #[ignore]
+    fn benchmark_aliasing() {
+        use serde_json::Value;
+        let sine = |extra: &[(&'static str, Value)]| {
+            let mut patch = vec![
+                ("osc1_wave", Value::from("sine")),
+                ("osc1_phase_rand", Value::from(0.0)),
+                ("osc2_phase_rand", Value::from(0.0)),
+                ("fil1_model", Value::from("none")),
+            ];
+            patch.extend_from_slice(extra);
+            patch
+        };
+        let cases: Vec<(&str, u8, Vec<(&str, Value)>)> = vec![
+            ("saw, no filter", 96, vec![("osc1_phase_rand", Value::from(0.0)), ("fil1_model", Value::from("none"))]),
+            ("phase modulation, C6", 84, sine(&[("osc1_pm", Value::from(0.5))])),
+            ("phase modulation, C7", 96, sine(&[("osc1_pm", Value::from(0.5))])),
+            ("frequency modulation, C7", 96, sine(&[("osc1_fm", Value::from(0.3))])),
+            ("ring modulation by a saw, C6", 84, sine(&[("osc1_am", Value::from(1.0)), ("osc2_wave", Value::from("saw"))])),
+            (
+                "saw through the ladder, driven, C6",
+                84,
+                vec![
+                    ("osc1_phase_rand", Value::from(0.0)),
+                    ("fil1_model", Value::from("ladder")),
+                    ("fil1_cutoff", Value::from(5000.0)),
+                    ("fil1_drive", Value::from(10.0)),
+                    ("fil1_env_amount", Value::from(0.0)),
+                ],
+            ),
+        ];
+        let mut plugin = ThreeOscPlugin::default();
+        let rate = plugin.synth.sample_rate as f32;
+        println!("\n{:<36} {:>8} {:>8} {:>8} {:>8}", "aliasing (dB)", "off", "2x", "4x", "8x");
+        for (name, note, patch) in cases {
+            print!("{name:<36}");
+            for oversampling in ["off", "2x", "4x", "8x"] {
+                set_up(&mut plugin, &patch, oversampling);
+                let (left, _) = render_note(&mut plugin, note, 1.0, 1.0);
+                let db = inharmonic_db(&left, 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0), rate);
+                print!(" {db:>8.1}");
+            }
+            println!();
+        }
+    }
+
+    /// Changing the oversampling while a note plays carries it on where it was.
+    #[test]
+    fn oversampling_can_change_while_notes_play() {
+        let mut plugin = ThreeOscPlugin::default();
+        set_up(&mut plugin, &[("vol_decay", serde_json::Value::from(1.0)), ("vol_sustain", serde_json::Value::from(0.2))], "off");
+        let mut left = vec![0.0; 4410];
+        let mut right = left.clone();
+        plugin.synth.note_on(60, 100);
+        plugin.synth.run(&mut left, &mut right);
+        let mut before = rms(&left[4410 - 441..]);
+        for oversampling in [synth::oversampling::Oversampling::Four, synth::oversampling::Oversampling::Two, synth::oversampling::Oversampling::Off] {
+            plugin.synth.oversampling = oversampling;
+            left.fill(0.0);
+            right.fill(0.0);
+            plugin.synth.run(&mut left, &mut right);
+            assert!(left.iter().all(|sample| sample.is_finite()));
+            // Still decaying from where it was, not started again
+            let after = rms(&left[..441]);
+            assert!((20.0 * (after / before).log10()).abs() < 1.0, "{oversampling:?}: {before} then {after}");
+            assert_eq!(plugin.synth.voices.len(), 1);
+            before = rms(&left[4410 - 441..]);
+            assert!(before < after);
+        }
+    }
+
+    /// ...and smoothly: across each change, a sine through each filter carries on in phase
+    /// (give or take the few samples the decimators and the Ladder's resampling filters delay
+    /// it by) and without a click. (Left to themselves, the decimators would start from
+    /// silence, taking it down to 0 and back, the oscillators would ramp from their pitch in
+    /// the old rate's samples, putting it out of phase, and the Ladder's resampling filters
+    /// would start afresh.)
+    #[test]
+    fn oversampling_changes_without_a_click() {
+        use synth::oversampling::Oversampling;
+        let rate = 44100.0;
+        let frequency = 440.0 * 2.0_f64.powf((60.0 - 69.0) / 12.0);
+        // The sine's phase, in samples, over the end of a buffer that starts at sample `start`
+        let period = rate / frequency;
+        let phase = |samples: &[f32], start: usize| {
+            let (mut sin, mut cos) = (0.0, 0.0);
+            for (n, sample) in samples.iter().enumerate().skip(samples.len() - 2048) {
+                let t = std::f64::consts::TAU * frequency * (start + n) as f64 / rate;
+                sin += *sample as f64 * t.sin();
+                cos += *sample as f64 * t.cos();
+            }
+            cos.atan2(sin) / std::f64::consts::TAU * period
+        };
+        let largest_step = |samples: &[f32]| samples.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
+        for filter in ["none", "digital", "ladder"] {
+            let mut plugin = ThreeOscPlugin::default();
+            let patch = [
+                ("osc1_wave", serde_json::Value::from("sine")),
+                ("fil1_model", serde_json::Value::from(filter)),
+                ("fil1_cutoff", serde_json::Value::from(2000.0)),
+                ("fil1_env_amount", serde_json::Value::from(0.0)),
+                ("vol_sustain", serde_json::Value::from(1.0)),
+            ];
+            set_up(&mut plugin, &patch, "off");
+            let mut left = vec![0.0; 4410];
+            let mut right = left.clone();
+            plugin.synth.note_on(60, 100);
+            plugin.synth.run(&mut left, &mut right);
+            let usual = largest_step(&left[2205..]);
+            let mut before = phase(&left, 0);
+            // How far behind it is of where it would have been without the changes
+            let mut delay = 0.0;
+            for (buffer, oversampling) in [Oversampling::Two, Oversampling::Eight, Oversampling::Four, Oversampling::Off, Oversampling::Four]
+                .into_iter()
+                .enumerate()
+            {
+                let last = left[left.len() - 1];
+                plugin.synth.oversampling = oversampling;
+                left.fill(0.0);
+                right.fill(0.0);
+                plugin.synth.run(&mut left, &mut right);
+                let across = largest_step(&[&[last], &left[..256]].concat());
+                assert!(across < 3.5 * usual, "{filter}, {oversampling:?}: a step of {across} (usually {usual})");
+                let after = phase(&left, (buffer + 1) * left.len());
+                delay += (before - after + period / 2.0).rem_euclid(period) - period / 2.0;
+                assert!((-2.5..5.0).contains(&delay), "{filter}, {oversampling:?}: {delay} samples behind");
+                before = after;
+            }
+        }
+    }
+
     /// Quarter tones: twice as many keys to the octave.
     fn quarter_tones() -> params::TuningFiles {
         let steps: String = (1..=24).map(|step| format!("{}.0\n", step * 50)).collect();
@@ -1403,6 +1672,12 @@ mod tests {
                 } else {
                     plugin.synth.polyphony = synth::Polyphony::Polyphonic;
                 }
+            }
+            // Now and then a change of oversampling
+            if rng.usize(0..16) == 0 {
+                use synth::oversampling::Oversampling;
+                plugin.synth.oversampling =
+                    [Oversampling::Off, Oversampling::Two, Oversampling::Four, Oversampling::Eight][rng.usize(0..4)];
             }
             // Now and then a block at the sample rate, which is much slower
             plugin.synth.modulation_rate = if rng.usize(0..8) == 0 {

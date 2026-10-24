@@ -20,6 +20,7 @@ use crate::synth::effects::{self, EffectSettings};
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
 use crate::synth::oscillator::{Interpolation, OscWave, WavePreview};
+use crate::synth::oversampling::Oversampling;
 use crate::synth::tuning::{Tuning, KEYS};
 use crate::synth::{ModulationRate, Polyphony};
 
@@ -362,6 +363,33 @@ impl ModulationRateParam {
         match self {
             ModulationRateParam::Block => ModulationRate::Block,
             ModulationRateParam::Sample => ModulationRate::Sample,
+        }
+    }
+}
+
+/// How many times the sample rate the voices run at, see [`Oversampling`].
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OversamplingParam {
+    #[id = "off"]
+    Off,
+    #[id = "2x"]
+    #[name = "2x"]
+    Two,
+    #[id = "4x"]
+    #[name = "4x"]
+    Four,
+    #[id = "8x"]
+    #[name = "8x"]
+    Eight,
+}
+
+impl OversamplingParam {
+    pub fn to_oversampling(self) -> Oversampling {
+        match self {
+            OversamplingParam::Off => Oversampling::Off,
+            OversamplingParam::Two => Oversampling::Two,
+            OversamplingParam::Four => Oversampling::Four,
+            OversamplingParam::Eight => Oversampling::Eight,
         }
     }
 }
@@ -897,6 +925,9 @@ pub struct GlobalParams {
     /// at every sample.
     #[id = "mod_rate"]
     pub modulation_rate: EnumParam<ModulationRateParam>,
+    /// How many times the sample rate the voices run at.
+    #[id = "oversampling"]
+    pub oversampling: EnumParam<OversamplingParam>,
 }
 
 impl GlobalParams {
@@ -948,6 +979,7 @@ impl GlobalParams {
                 .with_unit(" st"),
             interpolation: EnumParam::new("Interpolation", InterpolationParam::Cubic),
             modulation_rate: EnumParam::new("Modulation Rate", ModulationRateParam::Block),
+            oversampling: EnumParam::new("Oversampling", OversamplingParam::Off),
         }
     }
 }

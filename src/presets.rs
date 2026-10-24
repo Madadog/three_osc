@@ -44,6 +44,15 @@ const FACTORY: &[&str] = &[
 /// The category user presets are listed under.
 pub const USER_CATEGORY: &str = "User";
 
+/// The parameters presets leave alone: how the plugin runs rather than how it sounds (like the
+/// tuning), so loading a preset doesn't change them, saving one doesn't keep them, and changing
+/// them doesn't count as changing the preset.
+const NOT_IN_PRESETS: &[&str] = &["oversampling"];
+
+fn in_presets(id: &str) -> bool {
+    !NOT_IN_PRESETS.contains(&id)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
     #[serde(default)]
@@ -121,6 +130,7 @@ pub fn capture(params: &ThreeOscParams, name: &str) -> Preset {
     let values = params
         .param_map()
         .into_iter()
+        .filter(|(id, _, _)| in_presets(id))
         // Safety: the pointers point into `params`, which outlives this
         .filter_map(|(id, ptr, _)| unsafe { saved_value(ptr) }.map(|value| (id, value)))
         .collect();
@@ -179,8 +189,8 @@ fn round_for_saving(value: f32) -> f64 {
     format!("{}", rounded as f32).parse().unwrap_or(rounded)
 }
 
-/// What a preset sets the parameters to: the normalized value of every parameter, with the
-/// default for those the preset leaves out, and the wavetable file of each oscillator.
+/// What a preset sets the parameters to: the normalized value of every parameter presets keep,
+/// with the default for those the preset leaves out, and the wavetable file of each oscillator.
 pub struct Targets {
     pub values: Vec<(ParamPtr, f32)>,
     pub files: [String; 3],
@@ -194,6 +204,7 @@ impl Targets {
         let map = params.param_map();
         let values = map
             .iter()
+            .filter(|(id, _, _)| in_presets(id))
             .map(|(id, ptr, _)| {
                 // Safety: the pointers point into `params`, which outlives this
                 let default = unsafe { ptr.default_normalized_value() };
@@ -392,6 +403,24 @@ mod tests {
         assert_eq!(ids.index("mod_source_3", "lfo2"), Some(2));
         assert_eq!(ids.index("mod_source_3", "nonsense"), None);
         assert_eq!(ids.index("osc1_amp", "lfo2"), None);
+    }
+
+    #[test]
+    fn presets_leave_the_oversampling_alone() {
+        let params = ThreeOscParams::default();
+        let ids = EnumIds::new();
+        let ParamPtr::EnumParam(oversampling) = params.global.oversampling.as_ptr() else { unreachable!() };
+        assert!(unsafe { (*oversampling).set_from_id("4x") });
+        // It isn't saved, and doesn't keep the settings from matching a preset without it
+        assert!(capture(&params, "Oversampled").params.is_empty());
+        assert!(Targets::new(&factory()[0], &params, &ids).matches(&params));
+        // ...and loading a preset doesn't set it, even one that has it
+        let mut preset = factory()[0].clone();
+        preset.params.insert(String::from("oversampling"), Value::from("2x"));
+        let targets = Targets::new(&preset, &params, &ids);
+        assert!(targets.problems.is_empty(), "{:?}", targets.problems);
+        assert!(targets.values.iter().all(|(ptr, _)| *ptr != params.global.oversampling.as_ptr()));
+        assert!(targets.matches(&params));
     }
 
     #[test]

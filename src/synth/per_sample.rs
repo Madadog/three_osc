@@ -297,6 +297,8 @@ impl Voice {
         let sample_rate = context.sample_rate;
         let block_start = self.runtime;
         self.runtime += block_len as u32;
+        // (The filters take each block's coefficients afresh here)
+        self.rate_changed = false;
         let vectors = block_len.div_ceil(8);
         let last = block_len - 1;
         // The vectors to work a control out for: all of them, or the first if it doesn't change

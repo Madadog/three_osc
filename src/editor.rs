@@ -39,6 +39,7 @@ use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::modulation::{ModSource, ModTarget, Targets, N_SLOTS, N_TARGETS};
 use crate::synth::monitor::Monitor;
 use crate::synth::oscillator::{builtin_spectra, CycleRenderer, WavePreview};
+use crate::synth::oversampling::Oversampling;
 use crate::synth::wavetable_file;
 use crate::{Task, ThreeOscPlugin};
 
@@ -276,7 +277,8 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
 
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
-            filter(ui, "Filter 1", &params.filter, &params.filter_env, &matrix, setter, gui);
+            let oversampling = params.global.oversampling.value().to_oversampling();
+            filter(ui, "Filter 1", &params.filter, &params.filter_env, oversampling, &matrix, setter, gui);
             filter_envelope(ui, "Filter 1 Envelope", &params.filter_env, setter, live);
         });
         ui.vertical(|ui| {
@@ -876,11 +878,13 @@ fn midi_sources(ui: &mut Ui) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn filter(
     ui: &mut Ui,
     title: &str,
     filter: &FilterParams,
     filter_env: &FilterEnvParams,
+    oversampling: Oversampling,
     matrix: &Matrix,
     setter: &ParamSetter,
     gui: &mut Gui,
@@ -892,7 +896,8 @@ fn filter(
         filter.resonance.value(),
         // As the synth applies it
         filter_env.amount.value().powi(2),
-        gui.live.sample_rate,
+        // At the rate the voices' filters run at
+        gui.live.sample_rate * oversampling.factor() as f32,
     );
     let response = &mut gui.state.filter_response;
     let live_cutoff = gui.live.monitor.cutoff();

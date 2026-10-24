@@ -17,6 +17,11 @@ const PRESET_COMBO_WIDTH: f32 = 190.0;
 /// in seconds, during which it isn't marked as changed.
 const LOAD_SETTLE_SECONDS: f64 = 0.5;
 const ERROR_COLOR: Color32 = Color32::from_rgb(255, 120, 100);
+const OVERSAMPLING_HELP: &str = "Runs the voices at 2, 4 or 8 times the sample rate and filters \
+     them back down, so that the sidebands of FM, PM and AM and the filters' distortion above the \
+     Nyquist frequency are filtered out instead of folding back down as aliasing (the waves \
+     themselves are alias-free either way). The voices cost about that many times the CPU; the \
+     effects run at the sample rate. Presets leave it as it is.";
 
 /// The presets the browser lists, and what it is doing.
 pub struct PresetBrowser {
@@ -153,6 +158,9 @@ pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui
         presets(ui, params, setter, gui);
         ui.add_space(10.0);
         super::tuning_window::button(ui, params, &mut gui.state.tuning);
+        ui.add_space(10.0);
+        ui.label("Oversampling").on_hover_text(OVERSAMPLING_HELP);
+        super::combo_cell(ui, &params.global.oversampling, 0, 52.0, OVERSAMPLING_HELP, setter);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
                 egui::Label::new(

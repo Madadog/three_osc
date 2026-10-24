@@ -301,6 +301,86 @@ fn benchmark_modulation_rate() {
     }
 }
 
+/// Each oversampling on a few patches, and how many times the cost without it that is; and the
+/// decimators on their own.
+#[test]
+#[ignore]
+fn benchmark_oversampling() {
+    use crate::synth::oversampling::{Decimator, Oversampling};
+    type Setup = fn(&mut ThreeOscPlugin);
+    let patches: [(&str, Setup); 7] = [
+        ("default patch (1 saw, 8 notes)", |_| {}),
+        ("default patch, no filter", |plugin| {
+            plugin.synth.filter_controller.filter_model = FilterModel::None;
+        }),
+        ("default patch, ladder filter", |plugin| {
+            plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
+        }),
+        ("phase modulation (2 sines)", |plugin| {
+            let [carrier, modulator, _] = &mut plugin.synth.oscillators;
+            carrier.wavetable = OscillatorWave::Sine.wavetable_index().unwrap();
+            carrier.pm = 0.5;
+            modulator.wavetable = OscillatorWave::Sine.wavetable_index().unwrap();
+        }),
+        ("3 x saw, unison 8", |plugin| plugin.synth.oscillators.iter_mut().for_each(supersaw)),
+        ("3 x saw, unison 8, stereo", |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            plugin.synth.stereo_width = 1.0;
+        }),
+        ("3 x saw, unison 8, ladder filter", |plugin| {
+            plugin.synth.oscillators.iter_mut().for_each(supersaw);
+            plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
+        }),
+    ];
+    let factors = [Oversampling::Off, Oversampling::Two, Oversampling::Four, Oversampling::Eight];
+    // The machines these run on are shared and noisy: the best of a few rounds, taken in turn
+    const ROUNDS: usize = 5;
+    let mut best = vec![[f64::INFINITY; 4]; patches.len()];
+    for _ in 0..ROUNDS {
+        for ((_, setup), best) in patches.iter().zip(best.iter_mut()) {
+            for (&oversampling, best) in factors.iter().zip(best.iter_mut()) {
+                let time = render_time(&CHORD, |plugin| {
+                    setup(plugin);
+                    plugin.synth.oversampling = oversampling;
+                });
+                *best = best.min(time.ns_per_sample);
+            }
+        }
+    }
+    println!("\n{:<36} {:>9} {:>17} {:>17} {:>17}", "ns/sample", "off", "2x", "4x", "8x");
+    for ((name, _), times) in patches.iter().zip(&best) {
+        print!("{name:<36} {:>9.1}", times[0]);
+        for time in &times[1..] {
+            print!(" {:>9.1} ({:>4.1}x)", time, time / times[0]);
+        }
+        println!();
+    }
+
+    // The decimators alone, on a stereo signal, a control rate block at a time
+    let len = SAMPLE_RATE as usize * 4;
+    for oversampling in &factors[1..] {
+        let factor = oversampling.factor();
+        let signal: Vec<f32> = (0..len * factor).map(|n| (n as f32 * 0.0137).sin()).collect();
+        let mut best = f64::INFINITY;
+        for _ in 0..ROUNDS {
+            let mut decimator = Decimator::new(*oversampling);
+            let (mut left, mut right) = ([0.0; 32], [0.0; 32]);
+            let mut sum = 0.0;
+            let start = Instant::now();
+            for chunk in signal.chunks_exact(32) {
+                left.copy_from_slice(chunk);
+                right.copy_from_slice(chunk);
+                decimator.process(&mut left, &mut right);
+                sum += left[0] + right[0];
+            }
+            let elapsed = start.elapsed();
+            assert!(sum.is_finite());
+            best = best.min(elapsed.as_nanos() as f64 / len as f64);
+        }
+        println!("decimators, {factor}x to 1x, stereo: {best:.1} ns/sample");
+    }
+}
+
 /// Each effect on its own, on a stereo signal, in control rate blocks as the synth runs them.
 #[test]
 #[ignore]
