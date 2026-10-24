@@ -1,5 +1,5 @@
 use self::ladder::tanh_pade32_f32;
-pub(crate) use self::ladder::{LadderFilter, LadderSamples, LADDER_LANES};
+pub(crate) use self::ladder::{oversampling_for as ladder_oversampling, LadderFilter, LadderSamples, LADDER_LANES};
 pub(crate) use self::svf_simper::{SvfSamples, SvfSimper, SVF_LANES};
 
 use super::lerp;
@@ -277,6 +277,15 @@ impl FilterContainer {
             (_, _) => {
                 unreachable!("Forgot to set a FilterModel for FilterContainer")
             }
+        }
+    }
+}
+impl FilterContainer {
+    /// Sets how many times the voices' rate the Ladder filter runs at (the other models run at
+    /// the voices' rate), see [`ladder_oversampling()`].
+    pub fn set_ladder_oversampling(&mut self, factor: i32) {
+        if let FilterContainer::LadderFilter(ladder) = self {
+            ladder.set_oversampling_factor(factor);
         }
     }
 }

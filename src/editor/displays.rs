@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::filter::{
-    Filter, FilterContainer, FilterController, FilterModel, FilterType, LadderFilter, LADDER_LANES,
+    ladder_oversampling, Filter, FilterContainer, FilterController, FilterModel, FilterType, LadderFilter,
+    LADDER_LANES,
 };
 use crate::synth::oscillator::{OscWave, WavePreview};
 
@@ -370,12 +371,16 @@ pub struct FilterSettings {
     pub resonance: f32,
     /// The cutoff at the peak of the filter envelope, when the envelope moves it.
     pub envelope_cutoff: Option<f32>,
+    /// The rate the voices' filters run at: the sample rate times the oversampling.
     pub sample_rate: f32,
+    /// How many times that rate the Ladder filter runs at.
+    pub ladder_oversampling: i32,
 }
 
 impl FilterSettings {
     /// The settings for a cutoff control, with the filter envelope's amount (as the synth uses
-    /// it, squared) added at the envelope's peak.
+    /// it, squared) added at the envelope's peak, for voices running at `oversampling` times
+    /// the sample rate.
     pub fn new(
         model: FilterModel,
         filter_type: FilterType,
@@ -383,7 +388,9 @@ impl FilterSettings {
         resonance: f32,
         envelope_amount: f32,
         sample_rate: f32,
+        oversampling: usize,
     ) -> Self {
+        let sample_rate = sample_rate * oversampling as f32;
         let mut controller = FilterController::new();
         controller.cutoff = cutoff;
         controller.envelope_amount = envelope_amount;
@@ -396,6 +403,7 @@ impl FilterSettings {
             resonance,
             envelope_cutoff: (peak > base * 1.01).then_some(peak),
             sample_rate,
+            ladder_oversampling: ladder_oversampling(oversampling),
         }
     }
 }
@@ -471,6 +479,7 @@ impl FilterResponse {
             .flat_map(|&cutoff| {
                 let mut filter = FilterContainer::None;
                 filter.set(settings.model, cutoff, settings.resonance, sample_rate, settings.filter_type);
+                filter.set_ladder_oversampling(settings.ladder_oversampling);
                 filter.set_filter_type(settings.filter_type);
                 filter.set_params(sample_rate, cutoff, settings.resonance);
                 [filter.clone(), filter]
@@ -750,7 +759,7 @@ mod tests {
         thread_local! {
             static FFT: Arc<dyn Fft<f32>> = FftPlanner::new().plan_fft_forward(FilterResponse::LEN);
         }
-        let settings = FilterSettings::new(model, filter_type, cutoff, resonance, 0.0, sample_rate);
+        let settings = FilterSettings::new(model, filter_type, cutoff, resonance, 0.0, sample_rate, 1);
         FFT.with(|fft| FilterResponse::measure(&settings, &[settings.cutoff], &**fft).remove(0))
     }
 

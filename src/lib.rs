@@ -1138,23 +1138,23 @@ mod tests {
             patch.extend_from_slice(extra);
             patch
         };
+        let ladder = |drive: f32| {
+            vec![
+                ("osc1_phase_rand", Value::from(0.0)),
+                ("fil1_model", Value::from("ladder")),
+                ("fil1_cutoff", Value::from(5000.0)),
+                ("fil1_drive", Value::from(drive)),
+                ("fil1_env_amount", Value::from(0.0)),
+            ]
+        };
         let cases: Vec<(&str, u8, Vec<(&str, Value)>)> = vec![
             ("saw, no filter", 96, vec![("osc1_phase_rand", Value::from(0.0)), ("fil1_model", Value::from("none"))]),
             ("phase modulation, C6", 84, sine(&[("osc1_pm", Value::from(0.5))])),
             ("phase modulation, C7", 96, sine(&[("osc1_pm", Value::from(0.5))])),
             ("frequency modulation, C7", 96, sine(&[("osc1_fm", Value::from(0.3))])),
             ("ring modulation by a saw, C6", 84, sine(&[("osc1_am", Value::from(1.0)), ("osc2_wave", Value::from("saw"))])),
-            (
-                "saw through the ladder, driven, C6",
-                84,
-                vec![
-                    ("osc1_phase_rand", Value::from(0.0)),
-                    ("fil1_model", Value::from("ladder")),
-                    ("fil1_cutoff", Value::from(5000.0)),
-                    ("fil1_drive", Value::from(10.0)),
-                    ("fil1_env_amount", Value::from(0.0)),
-                ],
-            ),
+            ("saw through the ladder, drive 4, C6", 84, ladder(4.0)),
+            ("saw through the ladder, drive 10, C6", 84, ladder(10.0)),
         ];
         let mut plugin = ThreeOscPlugin::default();
         let rate = plugin.synth.sample_rate as f32;
@@ -1196,12 +1196,12 @@ mod tests {
         }
     }
 
-    /// ...and smoothly: across each change, a sine through each filter carries on in phase
-    /// (give or take the few samples the decimators and the Ladder's resampling filters delay
-    /// it by) and without a click. (Left to themselves, the decimators would start from
-    /// silence, taking it down to 0 and back, the oscillators would ramp from their pitch in
-    /// the old rate's samples, putting it out of phase, and the Ladder's resampling filters
-    /// would start afresh.)
+    /// ...and smoothly: across each change, a sine through each filter carries on without a
+    /// click, and in phase with the same note played at the new setting all along (whose
+    /// decimators and Ladder filter delay it by a few samples more or less). Left to themselves,
+    /// the decimators would start from silence, taking it down to 0 and back, the oscillators
+    /// would ramp from their pitch in the old rate's samples, putting it out of phase, and the
+    /// Ladder's resampling filters would start afresh.
     #[test]
     fn oversampling_changes_without_a_click() {
         use synth::oversampling::Oversampling;
@@ -1219,39 +1219,49 @@ mod tests {
             cos.atan2(sin) / std::f64::consts::TAU * period
         };
         let largest_step = |samples: &[f32]| samples.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
+        let changes = [Oversampling::Off, Oversampling::Two, Oversampling::Eight, Oversampling::Four, Oversampling::Off, Oversampling::Four];
+        const LEN: usize = 4410;
         for filter in ["none", "digital", "ladder"] {
             let mut plugin = ThreeOscPlugin::default();
             let patch = [
                 ("osc1_wave", serde_json::Value::from("sine")),
+                ("osc1_phase_rand", serde_json::Value::from(0.0)),
                 ("fil1_model", serde_json::Value::from(filter)),
                 ("fil1_cutoff", serde_json::Value::from(2000.0)),
                 ("fil1_env_amount", serde_json::Value::from(0.0)),
                 ("vol_sustain", serde_json::Value::from(1.0)),
             ];
-            set_up(&mut plugin, &patch, "off");
-            let mut left = vec![0.0; 4410];
-            let mut right = left.clone();
-            plugin.synth.note_on(60, 100);
-            plugin.synth.run(&mut left, &mut right);
-            let usual = largest_step(&left[2205..]);
-            let mut before = phase(&left, 0);
-            // How far behind it is of where it would have been without the changes
-            let mut delay = 0.0;
-            for (buffer, oversampling) in [Oversampling::Two, Oversampling::Eight, Oversampling::Four, Oversampling::Off, Oversampling::Four]
-                .into_iter()
-                .enumerate()
-            {
-                let last = left[left.len() - 1];
-                plugin.synth.oversampling = oversampling;
-                left.fill(0.0);
-                right.fill(0.0);
-                plugin.synth.run(&mut left, &mut right);
-                let across = largest_step(&[&[last], &left[..256]].concat());
+            // Plays the note through buffers at each of the oversamplings in turn, and returns
+            // its phase at the end of each, and each buffer's first samples with the sample
+            // before
+            let mut play = |oversamplings: &[Oversampling]| {
+                set_up(&mut plugin, &patch, "off");
+                let (mut left, mut right) = ([0.0; LEN], [0.0; LEN]);
+                plugin.synth.note_on(60, 100);
+                let mut last = 0.0;
+                oversamplings
+                    .iter()
+                    .enumerate()
+                    .map(|(buffer, oversampling)| {
+                        plugin.synth.oversampling = *oversampling;
+                        left.fill(0.0);
+                        right.fill(0.0);
+                        plugin.synth.run(&mut left, &mut right);
+                        let start = [&[last], &left[..256]].concat();
+                        last = left[LEN - 1];
+                        (phase(&left, buffer * LEN), start)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let changed = play(&changes);
+            let usual = largest_step(&changed[0].1[1..]);
+            for (buffer, oversampling) in changes.iter().enumerate().skip(1) {
+                let (after, start) = &changed[buffer];
+                let across = largest_step(start);
                 assert!(across < 3.5 * usual, "{filter}, {oversampling:?}: a step of {across} (usually {usual})");
-                let after = phase(&left, (buffer + 1) * left.len());
-                delay += (before - after + period / 2.0).rem_euclid(period) - period / 2.0;
-                assert!((-2.5..5.0).contains(&delay), "{filter}, {oversampling:?}: {delay} samples behind");
-                before = after;
+                let (steady, _) = play(&vec![*oversampling; buffer + 1])[buffer];
+                let behind = (steady - after + period / 2.0).rem_euclid(period) - period / 2.0;
+                assert!(behind.abs() < 0.5, "{filter}, {oversampling:?}: {behind} samples behind");
             }
         }
     }

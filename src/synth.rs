@@ -399,6 +399,7 @@ impl ThreeOsc {
             octave_detune: self.octave_detune,
             portamento_powers,
             per_sample,
+            ladder_oversampling: filter::ladder_oversampling(self.oversampled.factor()),
             routes_by_target: RoutesByTarget::new(&self.routes),
             active,
             simd: self.simd,
@@ -587,6 +588,9 @@ struct VoiceContext<'a> {
     portamento_powers: [f32; CONTROL_BLOCK_SAMPLES + 1],
     /// Whether the modulation runs at the sample rate, see [`ModulationRate`].
     per_sample: bool,
+    /// How many times the voices' rate the Ladder filter runs at, see
+    /// [`filter::ladder_oversampling()`].
+    ladder_oversampling: i32,
     /// The routes grouped by target, for the modulation at the sample rate.
     routes_by_target: RoutesByTarget,
     /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
@@ -969,6 +973,7 @@ impl Voice {
                 sample_rate,
                 controller.filter_type,
             );
+            filter.set_ladder_oversampling(context.ladder_oversampling);
             filter.set_filter_type(controller.filter_type);
             filter.set_params_ramped(sample_rate, cutoff, resonance, ramp_samples);
         };

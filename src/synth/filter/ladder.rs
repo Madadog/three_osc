@@ -86,12 +86,21 @@ pub enum IntegrationMethod {
     TrapezoidalFeedbackTanh,
 }
 
+/// How many times the voices' rate the filter runs at, when the voices themselves run at
+/// `voice_oversampling` times the sample rate: at least three times the sample rate in all, where
+/// its cutoff reaches 12.6 kHz at 44.1 kHz (its integration rate limits it to about 4.2 kHz for
+/// every 44.1 kHz it runs at), but no more on top of the voices' own oversampling than that needs.
+pub fn oversampling_for(voice_oversampling: usize) -> i32 {
+    3usize.div_ceil(voice_oversampling.max(1)) as i32
+}
+
 fn integration_rate(sample_rate: f64, oversampling_factor: i32, cutoff_frequency: f64) -> f64 {
     let dt = 44100.0 / (sample_rate * oversampling_factor as f64) * cutoff_frequency;
     dt.clamp(0.0, 0.6)
 }
 
-/// The Kocmoc ladder filter, 3x oversampled.
+/// The Kocmoc ladder filter, 3x oversampled (or less on top of the voices' own oversampling, see
+/// [`oversampling_for()`]).
 ///
 /// The filter runs in single precision, like the original's 32-bit build for the MetaModule:
 /// that is twice as many filters per SIMD vector as double precision, and the divisions in its
@@ -712,6 +721,20 @@ impl LadderFilter {
         self.update_decimator();
         self.set_integration_rate();
     }
+    /// Sets how many times its sample rate the filter runs at (see [`oversampling_for()`]),
+    /// carrying on from where it was: the resampling filters are redesigned, and start as
+    /// though the input and the output had been steady at their last values rather than from
+    /// silence.
+    pub fn set_oversampling_factor(&mut self, factor: i32) {
+        if factor == self.oversampling_factor {
+            return;
+        }
+        self.oversampling_factor = factor;
+        self.update_decimator();
+        self.set_integration_rate();
+        self.iir_upsampler.settle(self.ut_1);
+        self.iir_lowpass.settle(self.out);
+    }
     /// Designs the resampling filters for the current sample rate, oversampling factor and
     /// order, if any of them changed: lowpasses running at the oversampled rate that remove
     /// everything above 90% of the output's Nyquist frequency. The upsampler smooths the input
@@ -988,6 +1011,19 @@ mod iir {
         pub fn initialize_biquad_cascade(&mut self) {
             for i in self.z.iter_mut() {
                 *i = 0.0;
+            }
+        }
+
+        /// Sets the cascade's state to what a steady `level` coming in would leave it in, so
+        /// that its output carries on at that level. Each biquad passes a constant on with a
+        /// gain of `4 / (1 + a1 + a2)` (the gains `k` that bring it back to 1 are applied at
+        /// the end), and keeps that constant over `1 + a1 + a2` in both of its delays.
+        pub fn settle(&mut self, level: f32) {
+            let mut input = level;
+            for (&[a1, a2, _, _], z) in self.run.iter().zip(self.z.chunks_exact_mut(2)).take(self.decimator_order / 2) {
+                let denominator = 1.0 + a1 + a2;
+                z.fill(input / denominator);
+                input *= 4.0 / denominator;
             }
         }
 

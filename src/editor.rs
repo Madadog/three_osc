@@ -896,8 +896,8 @@ fn filter(
         filter.resonance.value(),
         // As the synth applies it
         filter_env.amount.value().powi(2),
-        // At the rate the voices' filters run at
-        gui.live.sample_rate * oversampling.factor() as f32,
+        gui.live.sample_rate,
+        oversampling.factor(),
     );
     let response = &mut gui.state.filter_response;
     let live_cutoff = gui.live.monitor.cutoff();

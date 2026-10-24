@@ -170,23 +170,24 @@ How much aliasing is left, from `benchmark_aliasing`: the share of a held note's
 | Sine, phase modulated (50%) by a sine, C7 | -1 dB | -2 dB | -89 dB | -89 dB |
 | Sine, frequency modulated (30%) by a sine, C7 | -8 dB | -91 dB | -91 dB | -91 dB |
 | Sine, ring modulated (100%) by a saw, C6 | -34 dB | -89 dB | -89 dB | -89 dB |
-| Saw through the Ladder filter at 5 kHz, drive 10, C6 | -49 dB | -60 dB | -84 dB | -88 dB |
+| Saw through the Ladder filter at 5 kHz, drive 4, C6 | -67 dB | -72 dB | -72 dB | -87 dB |
+| Saw through the Ladder filter at 5 kHz, drive 10, C6 | -49 dB | -50 dB | -50 dB | -73 dB |
 
-The bandlimited saw has nothing to lose; the strongly phase modulated C7, with sidebands up to about 80 kHz, needs 4x; and the Ladder filter, already 3x oversampled on its own, aliases less to start with but still needs 4x to clean up its distortion.
+The bandlimited saw has nothing to lose, and the strongly phase modulated C7, with sidebands up to about 80 kHz, needs 4x. The Ladder filter runs oversampled on its own, at three times the sample rate (see Tips and Tricks), and only as much on top of the voices' oversampling as it needs to stay at least that fast: 2x on top of 2x, and nothing on top of 4x or 8x. So at 2x and 4x it runs at four times the sample rate, which is clean up to a drive of about 2 (-88 dB at all three settings), while a hard driven Ladder needs 8x. (Running it 3x on top of every setting would take the drive 10 case to -60, -84 and -88 dB, for half as much again of its CPU at 2x and three times as much at 4x and 8x.)
 
 The cost, from `benchmark_oversampling` (8 notes at 44.1 kHz on a 2.1 GHz Xeon, time per sample of output, with how many times the cost without oversampling):
 
 | Patch | Off | 2x | 4x | 8x |
 |---|---|---|---|---|
-| Default (1 saw, Digital filter) | 56 ns | 115 ns (2.1x) | 238 ns (4.3x) | 480 ns (8.6x) |
-| Default, no filter | 40 ns | 88 ns (2.2x) | 178 ns (4.4x) | 380 ns (9.4x) |
-| Default, Ladder filter | 168 ns | 319 ns (1.9x) | 655 ns (3.9x) | 1297 ns (7.7x) |
-| Phase modulation (2 sines) | 111 ns | 218 ns (2.0x) | 430 ns (3.9x) | 903 ns (8.1x) |
-| 3 x saw, unison 8 | 301 ns | 588 ns (2.0x) | 1219 ns (4.0x) | 2457 ns (8.2x) |
-| 3 x saw, unison 8, stereo | 325 ns | 631 ns (1.9x) | 1274 ns (3.9x) | 2636 ns (8.1x) |
-| 3 x saw, unison 8, Ladder filter | 406 ns | 827 ns (2.0x) | 1712 ns (4.2x) | 3412 ns (8.4x) |
+| Default (1 saw, Digital filter) | 53 ns | 110 ns (2.1x) | 222 ns (4.2x) | 447 ns (8.5x) |
+| Default, no filter | 41 ns | 87 ns (2.1x) | 174 ns (4.3x) | 355 ns (8.7x) |
+| Default, Ladder filter | 159 ns | 253 ns (1.6x) | 337 ns (2.1x) | 643 ns (4.0x) |
+| Phase modulation (2 sines) | 98 ns | 203 ns (2.1x) | 427 ns (4.4x) | 857 ns (8.8x) |
+| 3 x saw, unison 8 | 287 ns | 565 ns (2.0x) | 1162 ns (4.0x) | 2251 ns (7.8x) |
+| 3 x saw, unison 8, stereo | 289 ns | 595 ns (2.1x) | 1299 ns (4.5x) | 2594 ns (9.0x) |
+| 3 x saw, unison 8, Ladder filter | 391 ns | 674 ns (1.7x) | 1371 ns (3.5x) | 2765 ns (7.1x) |
 
-Nearly all of the cost is the voices rendering two, four or eight times as many samples; the decimators themselves take 5.8, 15 and 34 ns per sample of stereo output at 2x, 4x and 8x. So 2x, at twice the CPU, takes care of most modulation, and 8x is for the extreme cases.
+Nearly all of the cost is the voices rendering two, four or eight times as many samples; the decimators themselves take 5.3, 14 and 30 ns per sample of stereo output at 2x, 4x and 8x. The Ladder costs less than that, since it drops its own oversampling as the voices' goes up (with it 3x on top of every setting, the default patch through the Ladder took 319, 655 and 1297 ns). So 2x, at twice the CPU, takes care of most modulation, and 8x is for the extreme cases.
 
 ### Oscillator kernels and SIMD
 Each oscillator renders a whole control rate block in one kernel call: the unison voices' phases advance as vectors, every sample reads and interpolates the wavetable at each voice and sums the voices into the block (with AVX2, eight samples' sums across the voices are worked out together), and a modulated oscillator reads its modulator's block sample for sample (the oscillators are rendered from the last to the first, so the modulation is still instantaneous). With fewer than 8 unison voices the vectors run across time instead: each holds 8 consecutive samples of one voice, whose phases have a closed form (or are added up one by one under frequency modulation), so nothing has to be summed across a vector's lanes at every sample, and the gain ramp and the additions to the output go a vector at a time too. That makes a single voice more than three times cheaper than with the vectors across voices. Phases are 32-bit fixed point: one cycle is 2^32, so they wrap for free and pitch resolves to 2^-32 cycles per sample, and a phase splits into a table index and a fraction with a shift and a mask (wavetable cycles are powers of two long).
@@ -202,7 +203,7 @@ Older versions of Three Osc were LV2 plugins. nih-plug has no LV2 export, so the
 * The absolute sine / exponential wave is like a saw wave where the harmonics decrease volume at -12dB per octave instead of -6 dB per octave (i.e. it's a saw wave tracked by a soft filter). Similarly, the triangle wave is like a square wave where the harmonics diminish at -12dB per octave instead of -6dB.
 * Increasing envelope slope makes it steeper, decreasing it does the opposite. Slope = 0 gives perfectly linear slopes, which are not perceptually linear. Slope = 1 gives perceptually-linear (logarithmic) volume decay.
 * The Ladder and RC filter models are both capable of self-resonance at resonance >= 9.0. Underdriving the filters (i.e. drive below 1) and sweeping them very slowly gives a 'harmonic snap' effect.
-* The Ladder filter runs 3x oversampled, with its input properly upsampled and its output decimated so that its distortion doesn't alias. Its cutoff can't go higher than about 12.6 kHz at a 44.1 kHz sample rate (13.7 kHz at 48 kHz), so even fully open it softens the top octave (15 kHz comes out about 11 dB below 1 kHz at 44.1 kHz). At 88.2 kHz and above (or with the voices oversampled) it opens up fully. It runs in single precision, like the original module's 32-bit build: its output is within about -110 dB of a double precision version.
+* The Ladder filter runs 3x oversampled, with its input properly upsampled and its output decimated so that its distortion doesn't alias. Its cutoff can't go higher than about 12.6 kHz at a 44.1 kHz sample rate (13.7 kHz at 48 kHz), so even fully open it softens the top octave (15 kHz comes out about 11 dB below 1 kHz at 44.1 kHz). At 88.2 kHz and above it opens up fully. With the voices oversampled it only runs as much faster again as it needs to stay at three times the sample rate or more: 2x on top of the voices' 2x, and not at all on top of 4x or 8x. Its cutoff then reaches 16.8 kHz at 2x and 4x, and opens up fully at 8x. It runs in single precision, like the original module's 32-bit build: its output is within about -110 dB of a double precision version.
 * Setting octave detune to -0.0028 gives near perfect fifths, while 0.0342 gives near perfect major thirds.
 * FM changes frequency with the modulator's waveform, PM changes frequency with the derivative of the modulator's waveform. (I.E. PM by triangle == FM by square wave)
 

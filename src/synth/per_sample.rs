@@ -422,6 +422,7 @@ impl Voice {
                 sample_rate,
                 controller.filter_type,
             );
+            filter.set_ladder_oversampling(context.ladder_oversampling);
             filter.set_filter_type(controller.filter_type);
         };
         configure(&mut self.filter);
