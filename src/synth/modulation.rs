@@ -12,8 +12,10 @@
 
 use nih_plug::prelude::Enum;
 
-/// Something that can drive a modulation route. The LFOs and the random source are bipolar
-/// (-1 to 1), everything else goes from 0 to 1.
+use super::oscillator::{MULTIPLIER_RANGE, OCTAVE_RANGE};
+
+/// Something that can drive a modulation route. The LFOs, the random source and the oscillators
+/// are bipolar (-1 to 1), everything else goes from 0 to 1.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModSource {
     #[id = "none"]
@@ -52,10 +54,19 @@ pub enum ModSource {
     Aftertouch,
     #[id = "random"]
     Random,
+    #[id = "osc1"]
+    #[name = "Osc 1"]
+    Osc1,
+    #[id = "osc2"]
+    #[name = "Osc 2"]
+    Osc2,
+    #[id = "osc3"]
+    #[name = "Osc 3"]
+    Osc3,
 }
 
 /// Number of [`ModSource`] variants.
-pub const N_SOURCES: usize = 13;
+pub const N_SOURCES: usize = 16;
 /// Number of modulation routes (slots in the matrix).
 pub const N_SLOTS: usize = 16;
 /// Number of LFOs.
@@ -69,6 +80,9 @@ impl ModSource {
     }
     pub fn envelope(index: usize) -> Self {
         [Self::Env1, Self::Env2][index]
+    }
+    pub fn osc(index: usize) -> Self {
+        [Self::Osc1, Self::Osc2, Self::Osc3][index]
     }
     /// A short description for the GUI.
     pub fn help(self) -> &'static str {
@@ -89,6 +103,14 @@ impl ModSource {
             Self::ModWheel => "The MIDI modulation wheel (controller 1), from 0 to 1.",
             Self::Aftertouch => "MIDI channel or polyphonic aftertouch, from 0 to 1.",
             Self::Random => "A random value from -1 to 1, drawn when the note starts.",
+            Self::Osc1 | Self::Osc2 | Self::Osc3 => {
+                "The oscillator's wave, from -1 to 1 (its unison voices averaged), before its \
+                 Amplitude, so a silent oscillator can modulate too. It reaches the routes a \
+                 control rate block (32 samples) late, since the oscillators play after the \
+                 modulation is worked out, so an oscillator modulating its own pitch is fed \
+                 back through that delay. At the Block modulation rate it is only read once \
+                 per block: modulation at audio rates wants the Sample rate (Advanced tab)."
+            }
         }
     }
 }
@@ -111,6 +133,12 @@ pub enum ModTarget {
     #[id = "osc1_pitch"]
     #[name = "Osc 1 Pitch"]
     Osc1Pitch,
+    #[id = "osc1_octave"]
+    #[name = "Osc 1 Octave"]
+    Osc1Octave,
+    #[id = "osc1_multiplier"]
+    #[name = "Osc 1 Freq. Mult"]
+    Osc1Multiplier,
     #[id = "osc1_position"]
     #[name = "Osc 1 Position"]
     Osc1Position,
@@ -135,6 +163,12 @@ pub enum ModTarget {
     #[id = "osc2_pitch"]
     #[name = "Osc 2 Pitch"]
     Osc2Pitch,
+    #[id = "osc2_octave"]
+    #[name = "Osc 2 Octave"]
+    Osc2Octave,
+    #[id = "osc2_multiplier"]
+    #[name = "Osc 2 Freq. Mult"]
+    Osc2Multiplier,
     #[id = "osc2_position"]
     #[name = "Osc 2 Position"]
     Osc2Position,
@@ -159,6 +193,12 @@ pub enum ModTarget {
     #[id = "osc3_pitch"]
     #[name = "Osc 3 Pitch"]
     Osc3Pitch,
+    #[id = "osc3_octave"]
+    #[name = "Osc 3 Octave"]
+    Osc3Octave,
+    #[id = "osc3_multiplier"]
+    #[name = "Osc 3 Freq. Mult"]
+    Osc3Multiplier,
     #[id = "osc3_position"]
     #[name = "Osc 3 Position"]
     Osc3Position,
@@ -227,7 +267,7 @@ pub enum ModTarget {
 }
 
 /// Number of [`ModTarget`] variants.
-pub const N_TARGETS: usize = 42;
+pub const N_TARGETS: usize = 48;
 
 /// How a target's control moves under modulation, in the control's own units: a modulation of
 /// 1 is a source at its full value (1, or -1 for the bipolar ones) at an amount of 100%.
@@ -268,6 +308,10 @@ impl ModTarget {
     pub const LFO_RATE_OCTAVES: f32 = 4.0;
     /// How far a full amount moves an oscillator's pan: its whole range, from left to right.
     pub const PAN_RANGE: f32 = 2.0;
+    /// Octaves the octave controls move at a full amount: their whole range.
+    pub const OCTAVE_SPAN: f32 = (OCTAVE_RANGE.1 - OCTAVE_RANGE.0) as f32;
+    /// Steps the frequency multipliers move at a full amount: their whole range.
+    pub const MULTIPLIER_SPAN: f32 = (MULTIPLIER_RANGE.1 - MULTIPLIER_RANGE.0) as f32;
     /// Octaves the chorus rate moves at a full amount.
     pub const CHORUS_RATE_OCTAVES: f32 = 4.0;
     /// Octaves the delay time moves at a full amount.
@@ -275,6 +319,12 @@ impl ModTarget {
 
     pub fn osc_pitch(osc: usize) -> Self {
         [Self::Osc1Pitch, Self::Osc2Pitch, Self::Osc3Pitch][osc]
+    }
+    pub fn osc_octave(osc: usize) -> Self {
+        [Self::Osc1Octave, Self::Osc2Octave, Self::Osc3Octave][osc]
+    }
+    pub fn osc_multiplier(osc: usize) -> Self {
+        [Self::Osc1Multiplier, Self::Osc2Multiplier, Self::Osc3Multiplier][osc]
     }
     pub fn osc_position(osc: usize) -> Self {
         [Self::Osc1Position, Self::Osc2Position, Self::Osc3Position][osc]
@@ -313,6 +363,8 @@ impl ModTarget {
         match self {
             Self::Pitch | Self::Osc1Pitch | Self::Osc2Pitch | Self::Osc3Pitch => Scaling::Linear(Self::PITCH_SEMITONES),
             Self::FinePitch => Scaling::Linear(Self::FINE_PITCH_SEMITONES),
+            Self::Osc1Octave | Self::Osc2Octave | Self::Osc3Octave => Scaling::Linear(Self::OCTAVE_SPAN),
+            Self::Osc1Multiplier | Self::Osc2Multiplier | Self::Osc3Multiplier => Scaling::Linear(Self::MULTIPLIER_SPAN),
             Self::Volume => Scaling::Gain,
             // The amplitude and unison detune sliders are in percent
             Self::Osc1Amp | Self::Osc2Amp | Self::Osc3Amp => Scaling::Linear(100.0),
@@ -338,6 +390,15 @@ impl ModTarget {
                 "Pitch, by up to an octave (12 semitones) at 100%."
             }
             Self::FinePitch => "Pitch, by up to a semitone at 100%.",
+            Self::Osc1Octave | Self::Osc2Octave | Self::Osc3Octave => {
+                "The oscillator's octave, by the slider's whole range (16 octaves) at 100%, so \
+                 6.25% for an octave. It moves in whole octaves, within the slider's range."
+            }
+            Self::Osc1Multiplier | Self::Osc2Multiplier | Self::Osc3Multiplier => {
+                "The frequency multiplier, by the slider's whole range (128 steps) at 100%, so \
+                 about 0.8% a step. It moves in whole steps (x2, x3... or /2, /3...), within \
+                 the slider's range."
+            }
             Self::Volume => "The note's volume, scaled from 0 at -100% to double at 100%.",
             Self::Cutoff => "The filter cutoff, by up to 10 octaves at 100%.",
             Self::Resonance => "The filter resonance, by up to 10 times at 100%.",

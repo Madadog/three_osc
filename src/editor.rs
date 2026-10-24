@@ -571,7 +571,7 @@ fn oscillator(
     let mut display = |ui: &mut Ui| {
         displays::wave(ui, &preview, position, start, silent);
     };
-    section(ui, title, None, Display::Above(&mut display), |ui| {
+    section(ui, title, Some(ModSource::osc(index)), Display::Above(&mut display), |ui| {
         combo(
             ui,
             &osc.wave,
@@ -622,12 +622,23 @@ fn oscillator(
             matrix,
             setter,
         );
-        slider(ui, &osc.octave, "Oscillator detune in octaves.", setter);
-        slider(
+        mod_slider(
+            ui,
+            &osc.octave,
+            "Oscillator detune in octaves. Modulation moves it in whole octaves.",
+            ModTarget::osc_octave(index),
+            matrix,
+            setter,
+        );
+        mod_slider(
             ui,
             &osc.multiplier,
             "Oscillator pitch multiplier / divider. Positive values multiply pitch, while \
-             negative values divide. A value of 0 means this control is bypassed.",
+             negative values divide. A value of 0 means this control is bypassed. Modulation \
+             moves it in whole steps, through the harmonics (x2, x3...) or subharmonics (/2, \
+             /3...).",
+            ModTarget::osc_multiplier(index),
+            matrix,
             setter,
         );
         if let Some(modulation) = modulation {
@@ -702,8 +713,11 @@ fn lfo(ui: &mut Ui, index: usize, lfo: &LfoParams, matrix: &Matrix, setter: &Par
             mod_slider(
                 ui,
                 &lfo.rate,
-                "How fast the LFO oscillates. Each note has its own copy of the LFO, started \
-                 when the note starts.",
+                "How fast the LFO oscillates, up to 1 kHz. Each note has its own copy of the \
+                 LFO, started when the note starts. At the Block modulation rate (see the \
+                 Advanced tab), modulation is worked out every 32 samples, so an LFO much faster \
+                 than a few hundred Hz steps and aliases there: audio-rate LFOs want the Sample \
+                 rate.",
                 ModTarget::lfo_rate(index),
                 matrix,
                 setter,
@@ -1134,7 +1148,8 @@ fn modulation_matrix(ui: &mut Ui, matrix: &Matrix, setter: &ParamSetter) {
                 ui.label(RichText::new("Modulation Matrix").strong()).on_hover_text(
                     "Each row routes a source to a target. At 100% a source's full swing moves \
                      a slider across its whole length, pitch by an octave, and the filter \
-                     cutoff by 10 octaves. Drag a source's handle onto a slider to fill in a \
+                     cutoff by 10 octaves. Drag a source's handle (the LFOs', the envelopes', \
+                     the oscillators' and those in More Sources) onto a slider to fill in a \
                      row.",
                 );
                 ui.separator();

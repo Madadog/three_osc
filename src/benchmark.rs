@@ -261,8 +261,9 @@ fn benchmark_control_rate() {
 #[test]
 #[ignore]
 fn benchmark_modulation_rate() {
+    use crate::synth::modulation::{ModSource, ModTarget, Route};
     type Setup = fn(&mut ThreeOscPlugin);
-    let patches: [(&str, Setup); 7] = [
+    let patches: [(&str, Setup); 9] = [
         ("default patch (1 saw, 8 notes)", |_| {}),
         ("default patch, no filter", |plugin| {
             plugin.synth.filter_controller.filter_model = FilterModel::None;
@@ -271,6 +272,13 @@ fn benchmark_modulation_rate() {
             plugin.synth.filter_controller.filter_model = FilterModel::LadderFilter;
         }),
         ("default patch, 4 modulation routes", four_routes),
+        // An oscillator as a source: the silent osc 2 has to play, and its wave is kept
+        ("default patch, silent osc 2 on the cutoff", |plugin| {
+            plugin.synth.routes.push(Route { source: ModSource::Osc2, target: ModTarget::Cutoff, amount: 0.3 });
+        }),
+        ("default patch, silent osc 2 on osc 1 pitch", |plugin| {
+            plugin.synth.routes.push(Route { source: ModSource::Osc2, target: ModTarget::Osc1Pitch, amount: 0.1 });
+        }),
         ("3 x saw, unison 8", |plugin| plugin.synth.oscillators.iter_mut().for_each(supersaw)),
         ("3 x saw, unison 8, ladder filter", |plugin| {
             plugin.synth.oscillators.iter_mut().for_each(supersaw);

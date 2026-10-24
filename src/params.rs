@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use crate::synth::effects::{self, EffectSettings};
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
-use crate::synth::oscillator::{Interpolation, OscWave, WavePreview};
+use crate::synth::oscillator::{multiplier_ratio, Interpolation, OscWave, WavePreview, MULTIPLIER_RANGE, OCTAVE_RANGE};
 use crate::synth::oversampling::Oversampling;
 use crate::synth::tuning::{Tuning, KEYS};
-use crate::synth::{ModulationRate, Polyphony};
+use crate::synth::{ModulationRate, Polyphony, LFO_MAX_HZ, LFO_MIN_HZ};
 
 /// Waveforms available to the LFO.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,8 +600,15 @@ impl OscParams {
             )
             .with_unit(" st")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
-            octave: IntParam::new("Octave", 0, IntRange::Linear { min: -8, max: 8 }),
-            multiplier: IntParam::new("Freq. Mult", 0, IntRange::Linear { min: -64, max: 64 })
+            octave: IntParam::new("Octave", 0, IntRange::Linear { min: OCTAVE_RANGE.0, max: OCTAVE_RANGE.1 }),
+            multiplier: IntParam::new(
+                "Freq. Mult",
+                0,
+                IntRange::Linear {
+                    min: MULTIPLIER_RANGE.0,
+                    max: MULTIPLIER_RANGE.1,
+                },
+            )
                 .with_value_to_string(v2s_multiplier())
                 .with_string_to_value(s2v_multiplier()),
             voices: IntParam::new("Unison", 1, IntRange::Linear { min: 1, max: 32 }),
@@ -813,9 +820,11 @@ impl LfoParams {
                 "Rate",
                 5.0,
                 FloatRange::Skewed {
-                    min: 0.01,
-                    max: 100.0,
-                    factor: FloatRange::skew_factor(-2.0),
+                    min: LFO_MIN_HZ,
+                    max: LFO_MAX_HZ,
+                    // (Strongly skewed, so the usual rates of a few Hz keep about as much of
+                    // the slider as they had when it went up to 100 Hz)
+                    factor: FloatRange::skew_factor(-2.75),
                 },
             )
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
@@ -1262,16 +1271,24 @@ fn s2v_multiplier() -> Arc<dyn Fn(&str) -> Option<i32> + Send + Sync> {
 
 /// Converts a multiplier parameter value to the pitch multiplier used by the synth.
 pub fn multiplier_to_pitch_multiplier(multiplier: i32) -> f32 {
-    if multiplier >= 0 {
-        1.0 + multiplier as f32
-    } else {
-        1.0 / (1.0 - multiplier as f32)
-    }
+    multiplier_ratio(multiplier as f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The LFOs go up to 1 kHz, with the usual rates of a few Hz still taking up a good part of
+    /// the slider.
+    #[test]
+    fn lfo_rates_reach_audio_rates() {
+        let rate = LfoParams::new().rate;
+        assert_eq!(rate.preview_plain(1.0), 1000.0);
+        assert_eq!(rate.preview_plain(0.0), 0.01);
+        let at = |hz: f32| rate.preview_normalized(hz);
+        assert!((0.4..0.5).contains(&at(5.0)), "{}", at(5.0));
+        assert!(at(10.0) - at(0.1) > 0.25, "{} to {}", at(0.1), at(10.0));
+    }
 
     #[test]
     fn multiplier_formatting_round_trips() {

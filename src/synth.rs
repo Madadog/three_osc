@@ -367,11 +367,14 @@ impl ThreeOsc {
     }
     /// Everything the voices need from the synth to render themselves, for the current settings.
     fn voice_context(&self, stereo: bool, active: [bool; 3]) -> VoiceContext<'_> {
-        let sources_used = std::array::from_fn(|source| {
+        let sources_used: [bool; N_SOURCES] = std::array::from_fn(|source| {
             self.routes
                 .iter()
                 .any(|route| route.source.to_index() == source)
         });
+        // Oscillators that are modulation sources play even when they're silent
+        let sourced = std::array::from_fn(|i| sources_used[ModSource::osc(i).to_index()]);
+        let active = std::array::from_fn(|i| active[i] || sourced[i]);
         let per_sample = self.modulation_rate == ModulationRate::Sample;
         // The portamento after each number of samples within a block, worked out in double
         // precision (at high rates, one sample's is too close to 1 for single precision)
@@ -402,6 +405,7 @@ impl ThreeOsc {
             ladder_oversampling: filter::ladder_oversampling(self.oversampled.factor()),
             routes_by_target: RoutesByTarget::new(&self.routes),
             active,
+            sourced,
             simd: self.simd,
             interpolation: self.interpolation,
         }
@@ -596,6 +600,9 @@ struct VoiceContext<'a> {
     /// Whether each oscillator needs to be rendered at all: silent oscillators that don't
     /// modulate anything are skipped.
     active: [bool; 3],
+    /// Whether each oscillator is a modulation source, whose wave the voices keep for the
+    /// routes (see [`Voice::osc_history`]).
+    sourced: [bool; 3],
     simd: SimdLevel,
     interpolation: Interpolation,
 }
@@ -669,6 +676,11 @@ pub struct Voice {
     /// Buffers for the oscillators modulating each other, kept here so that they aren't
     /// cleared for every block.
     scratch: Scratch,
+    /// The last [`CONTROL_BLOCK_SAMPLES`] samples of each oscillator's wave (its unison voices
+    /// averaged, before its gain) while it is a modulation source. The modulation is worked out
+    /// before the oscillators play, so the routes from an oscillator read it from here, a
+    /// block's worth of samples late: sample `n` of a block reads `osc_history[i][n]`.
+    osc_history: [[f32; CONTROL_BLOCK_SAMPLES]; 3],
     /// The control values of each sample of the block, when the modulation runs at the sample
     /// rate (the ramps above are then left alone).
     samples: SampleControls,
@@ -709,6 +721,9 @@ struct Scratch {
     /// The modulator's output scaled by the depth of each kind of modulation (FM, PM and AM,
     /// see [`Modulation`]).
     amounts: [[f32; CONTROL_BLOCK_SAMPLES]; 3],
+    /// The wave of an oscillator that is a modulation source but doesn't modulate the one
+    /// before it.
+    source: [f32; CONTROL_BLOCK_SAMPLES],
 }
 impl Voice {
     pub fn from_midi_note(index: u8, pitch: f32, velocity: u8, osc: &[OscillatorParams], random: f32) -> Self {
@@ -757,7 +772,9 @@ impl Voice {
             scratch: Scratch {
                 modulators: [[0.0; CONTROL_BLOCK_SAMPLES]; 2],
                 amounts: [[0.0; CONTROL_BLOCK_SAMPLES]; 3],
+                source: [0.0; CONTROL_BLOCK_SAMPLES],
             },
+            osc_history: [[0.0; CONTROL_BLOCK_SAMPLES]; 3],
             samples: SampleControls::new(),
         }
     }
@@ -818,7 +835,7 @@ impl Voice {
             let rate_mod = self.mods[ModTarget::lfo_rate(i).to_index()];
             let mut freq = lfo.freq;
             if rate_mod != 0.0 {
-                freq *= fastmath::exp2(rate_mod * ModTarget::LFO_RATE_OCTAVES);
+                freq = (freq * fastmath::exp2(rate_mod * ModTarget::LFO_RATE_OCTAVES)).clamp(LFO_MIN_HZ, LFO_MAX_HZ);
             }
             let phase = self.lfos[i].add_phase(freq / sample_rate * block_len as f32);
             if used(ModSource::lfo(i)) {
@@ -838,6 +855,12 @@ impl Voice {
         sources[ModSource::ModWheel.to_index()] = context.mod_wheel;
         sources[ModSource::Aftertouch.to_index()] = context.aftertouch.max(self.pressure);
         sources[ModSource::Random.to_index()] = self.random;
+        // The oscillators a block's worth of samples before the end of this one
+        for i in 0..3 {
+            if used(ModSource::osc(i)) {
+                sources[ModSource::osc(i).to_index()] = self.osc_history[i][block_len - 1];
+            }
+        }
         sources
     }
     /// Recalculates the control rate state for the next `block_len` samples: the pitch, the
@@ -899,6 +922,11 @@ impl Voice {
             let mut target_delta = osc.total_pitch_multiplier() * delta;
             if semitones != 0.0 {
                 target_delta *= fastmath::exp2(semitones / 12.0);
+            }
+            let octave_mod = modulation(ModTarget::osc_octave(i));
+            let multiplier_mod = modulation(ModTarget::osc_multiplier(i));
+            if octave_mod != 0.0 || multiplier_mod != 0.0 {
+                target_delta *= osc.stepped_pitch_factor(octave_mod, multiplier_mod);
             }
             self.osc_note[i] = WavetableNotes::cycles_to_note(target_delta, sample_rate);
 
@@ -1011,7 +1039,7 @@ impl Voice {
         }
 
         // The two modulator buffers take turns, by swapping the references to them
-        let Scratch { modulators: [modulator, modulator_next], amounts } = &mut self.scratch;
+        let Scratch { modulators: [modulator, modulator_next], amounts, source } = &mut self.scratch;
         let (mut modulator, mut modulator_next) = (modulator, modulator_next);
         let samples = &self.samples;
         // Which kinds of modulation (FM, PM, AM) each oscillator has from the next one
@@ -1030,7 +1058,8 @@ impl Voice {
             } else {
                 self.osc_gain[i] == 0.0 && self.osc_gain_step[i] == 0.0
             };
-            if !context.active[i] || (silent && !modulates_next) {
+            let sourced = context.sourced[i];
+            if !context.active[i] || (silent && !modulates_next && !sourced) {
                 // Its output would be silent, and it isn't modulating anything that matters
                 have_modulator = false;
                 continue;
@@ -1129,6 +1158,8 @@ impl Voice {
                     },
                     mono: if modulates_next {
                         Some((&mut modulator_next[start..end], 1.0))
+                    } else if sourced {
+                        Some((&mut source[start..end], 1.0))
                     } else {
                         None
                     },
@@ -1147,6 +1178,16 @@ impl Voice {
                 // The ramps continue from where the block left them
                 self.osc_delta[i] += self.osc_delta_step[i] * block_len as f32;
                 self.osc_gain[i] += self.osc_gain_step[i] * block_len as f32;
+            }
+            if sourced {
+                // For the routes to read later, with the unison voices averaged
+                let wave = if modulates_next { &modulator_next[..block_len] } else { &source[..block_len] };
+                let scale = 1.0 / osc.unison_voices() as f32;
+                let history = &mut self.osc_history[i];
+                history.copy_within(block_len.., 0);
+                for (kept, sample) in history[CONTROL_BLOCK_SAMPLES - block_len..].iter_mut().zip(wave) {
+                    *kept = sample * scale;
+                }
             }
             have_modulator = modulates_next;
             std::mem::swap(&mut modulator, &mut modulator_next);
@@ -1524,6 +1565,10 @@ pub mod envelopes {
         }
     }
 }
+
+/// The slowest and fastest an LFO can run, in Hz, modulated or not.
+pub const LFO_MIN_HZ: f32 = 0.01;
+pub const LFO_MAX_HZ: f32 = 1000.0;
 
 /// A low frequency oscillator's settings. Each voice runs its own copy of every LFO, started
 /// when the note starts, and the LFOs' outputs are modulation sources (see [`modulation`]).

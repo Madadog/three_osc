@@ -16,8 +16,10 @@ use super::envelopes::AdsrEnvelope;
 use super::fastmath::{self, x8};
 use super::filter::{Filter, FilterContainer, FilterModel, SvfSimper};
 use super::modulation::{ModSource, ModTarget, Route, Sources, N_LFOS, N_SLOTS, N_SOURCES, N_TARGETS};
-use super::oscillator::{frame_indices, WavetableNotes};
-use super::{modulated_pan_gains, Voice, VoiceContext, CONTROL_BLOCK_SAMPLES, FM_DEPTH, PM_DEPTH_CYCLES};
+use super::oscillator::{frame_indices, OscillatorParams, WavetableNotes, MULTIPLIER_RANGE, OCTAVE_RANGE};
+use super::{
+    modulated_pan_gains, Voice, VoiceContext, CONTROL_BLOCK_SAMPLES, FM_DEPTH, LFO_MAX_HZ, LFO_MIN_HZ, PM_DEPTH_CYCLES,
+};
 
 /// Vectors of eight samples in a control rate block.
 const BLOCK_VECTORS: usize = CONTROL_BLOCK_SAMPLES / 8;
@@ -241,6 +243,23 @@ impl Modulated<'_> {
     fn first(&self) -> f32 {
         first(self.at(0))
     }
+}
+
+/// [`OscillatorParams::stepped_pitch_factor()`] for eight samples' modulation.
+fn stepped_pitch_factor8(osc: &OscillatorParams, octave_mod: f32x8, multiplier_mod: f32x8) -> f32x8 {
+    let splat = f32x8::splat;
+    let (low, high) = OCTAVE_RANGE;
+    let octave = (splat(osc.octave as f32) + octave_mod * splat(ModTarget::OCTAVE_SPAN))
+        .round()
+        .fast_max(splat(low as f32))
+        .fast_min(splat(high as f32));
+    let (low, high) = MULTIPLIER_RANGE;
+    let step = (splat(osc.multiplier as f32) + multiplier_mod * splat(ModTarget::MULTIPLIER_SPAN))
+        .round()
+        .fast_max(splat(low as f32))
+        .fast_min(splat(high as f32));
+    let ratio = step.simd_ge(f32x8::ZERO).select(splat(1.0) + step, splat(1.0) / (splat(1.0) - step));
+    x8::exp2(octave - splat(osc.octave as f32)) * ratio / splat(osc.pitch_multiplier)
 }
 
 /// Whether a target's modulation changes within the block.
@@ -535,9 +554,16 @@ impl Voice {
             // What can change within the block. An oscillator without any of it is rendered
             // from its first sample's values, which are all that is filled in for it.
             let osc_pitch_mod = modulation(ModTarget::osc_pitch(i));
+            let octave_mod = modulation(ModTarget::osc_octave(i));
+            let multiplier_mod = modulation(ModTarget::osc_multiplier(i));
+            let stepped = octave_mod.is_some() || multiplier_mod.is_some();
             let amp_mod = modulation(ModTarget::osc_amp(i));
             let position_mod = modulation(ModTarget::osc_position(i));
-            let pitch_varies = sliding || shared_varies || varies(&osc_pitch_mod);
+            let pitch_varies = sliding
+                || shared_varies
+                || varies(&osc_pitch_mod)
+                || varies(&octave_mod)
+                || varies(&multiplier_mod);
             let gain_varies = drive_varies || varies(&amp_mod);
             let position_varies = varies(&position_mod);
             let fill = pitch_varies || gain_varies || position_varies;
@@ -554,13 +580,18 @@ impl Voice {
             // block takes a dearer path than it needs.)
             let osc_delta = |v: usize| {
                 let osc_delta = splat(osc.total_pitch_multiplier()) * delta[v];
-                match &osc_pitch_mod {
+                let osc_delta = match &osc_pitch_mod {
                     Some(osc_pitch_mod) => {
                         let semitones = shared_semitones[v] + osc_pitch_mod.at(v) * splat(ModTarget::PITCH_SEMITONES);
                         osc_delta * x8::exp2(semitones / splat(12.0))
                     }
                     None if shared_routed => osc_delta * shared_factor[v],
                     None => osc_delta,
+                };
+                if stepped {
+                    osc_delta * stepped_pitch_factor8(osc, at(&octave_mod, v), at(&multiplier_mod, v))
+                } else {
+                    osc_delta
                 }
             };
             let mut changes = false;
@@ -805,6 +836,15 @@ impl Voice {
                 constant[source.to_index()] = true;
             }
         }
+        // The oscillators, a block's worth of samples late (see `Voice::osc_history`)
+        for (i, history) in self.osc_history.iter().enumerate() {
+            let source = ModSource::osc(i);
+            if used(source) {
+                for (v, values) in sources[source.to_index()].iter_mut().enumerate().take(vectors) {
+                    *values = f32x8::new(history[v * 8..][..8].try_into().unwrap());
+                }
+            }
+        }
 
         if context.routes_by_target.modulate_lfo_rates() {
             self.update_lfos_one_by_one(context, block_len);
@@ -854,7 +894,7 @@ impl Voice {
             for (i, lfo) in context.lfos.iter().enumerate() {
                 let mut freq = lfo.freq;
                 if rates[i] != 0.0 {
-                    freq *= fastmath::exp2(rates[i] * ModTarget::LFO_RATE_OCTAVES);
+                    freq = (freq * fastmath::exp2(rates[i] * ModTarget::LFO_RATE_OCTAVES)).clamp(LFO_MIN_HZ, LFO_MAX_HZ);
                 }
                 self.lfos[i].add_phase(freq / context.sample_rate);
             }

@@ -237,6 +237,21 @@ pub fn unison_detune_index(i: usize) -> i32 {
     i as i32 - ((i % 2) * i * 2) as i32
 }
 
+/// The range of the octave controls.
+pub const OCTAVE_RANGE: (i32, i32) = (-8, 8);
+/// The range of the frequency multipliers' steps, see [`multiplier_ratio()`].
+pub const MULTIPLIER_RANGE: (i32, i32) = (-64, 64);
+
+/// The pitch ratio of a frequency multiplier step: above 0 it multiplies the pitch by one more
+/// than the step, below 0 it divides it by one more than the step's size, and 0 leaves it alone.
+pub fn multiplier_ratio(step: f32) -> f32 {
+    if step >= 0.0 {
+        1.0 + step
+    } else {
+        1.0 / (1.0 - step)
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Each voice generating a wave reads OscillatorParams once per sample,
 /// and applies its current parameters to the generated wave.
@@ -246,6 +261,8 @@ pub struct OscillatorParams {
     // (Freq. Multiplier and Pitch Bend) which expose multiple controls in the gui.
     pub semitone: f32,
     pub octave: i32,
+    /// The frequency multiplier's step, and its ratio (see [`multiplier_ratio()`]).
+    pub multiplier: i32,
     pub pitch_multiplier: f32,
 
     total_multiplier: f32,
@@ -300,6 +317,17 @@ impl OscillatorParams {
     }
     pub fn total_pitch_multiplier(&self) -> f32 {
         self.total_multiplier
+    }
+    /// How far modulating the octave and the frequency multiplier moves the pitch, as a ratio:
+    /// each control moved by its modulation (a full one moves it the slider's whole length),
+    /// to the nearest whole step within the control's range.
+    pub fn stepped_pitch_factor(&self, octave_mod: f32, multiplier_mod: f32) -> f32 {
+        use super::modulation::ModTarget;
+        let (low, high) = OCTAVE_RANGE;
+        let octave = (self.octave as f32 + octave_mod * ModTarget::OCTAVE_SPAN).round().clamp(low as f32, high as f32);
+        let (low, high) = MULTIPLIER_RANGE;
+        let step = (self.multiplier as f32 + multiplier_mod * ModTarget::MULTIPLIER_SPAN).round().clamp(low as f32, high as f32);
+        (octave - self.octave as f32).exp2() * multiplier_ratio(step) / self.pitch_multiplier
     }
     pub fn calc_unison_amp(&self) -> f32 {
         1.0 / (self.voice_count as f32).sqrt()
@@ -422,6 +450,7 @@ impl Default for OscillatorParams {
             amp: 1.0,
             semitone: Default::default(),
             octave: Default::default(),
+            multiplier: 0,
             pitch_multiplier: 1.0,
             total_multiplier: 1.0,
             voice_count: 1,
@@ -2710,6 +2739,33 @@ impl<const N: usize> AdditiveOsc<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Modulating the octave and the frequency multiplier moves the pitch in whole steps, from
+    /// wherever the controls are, and no further than their ends.
+    #[test]
+    fn octave_and_multiplier_modulation_moves_in_whole_steps() {
+        use crate::synth::modulation::ModTarget;
+        let octave = |octaves: f32| octaves / ModTarget::OCTAVE_SPAN;
+        let step = |steps: f32| steps / ModTarget::MULTIPLIER_SPAN;
+        let mut osc = OscillatorParams::default();
+        assert_eq!(osc.stepped_pitch_factor(0.0, 0.0), 1.0);
+        assert_eq!(osc.stepped_pitch_factor(octave(1.0), 0.0), 2.0);
+        assert_eq!(osc.stepped_pitch_factor(octave(0.45), 0.0), 1.0);
+        assert_eq!(osc.stepped_pitch_factor(octave(0.5), 0.0), 2.0);
+        assert_eq!(osc.stepped_pitch_factor(octave(-2.2), 0.0), 0.25);
+        assert_eq!(osc.stepped_pitch_factor(1.0, 0.0), 256.0);
+        assert_eq!(osc.stepped_pitch_factor(-1.0, 0.0), 1.0 / 256.0);
+        assert_eq!(osc.stepped_pitch_factor(0.0, step(2.0)), 3.0);
+        assert_eq!(osc.stepped_pitch_factor(0.0, step(-2.0)), 1.0 / 3.0);
+        assert_eq!(osc.stepped_pitch_factor(octave(1.0), step(1.0)), 4.0);
+        // From an octave up and x3 (step 2): only as far as the ends, and steps below x1 divide
+        osc.octave = 7;
+        osc.multiplier = 2;
+        osc.pitch_multiplier = multiplier_ratio(2.0);
+        assert_eq!(osc.stepped_pitch_factor(octave(3.0), 0.0), 2.0);
+        assert_eq!(osc.stepped_pitch_factor(0.0, step(-3.0)), 0.5 / 3.0);
+        assert_eq!(osc.stepped_pitch_factor(0.0, 1.0), 65.0 / 3.0);
+    }
 
     /// A slow LFO updated at every sample advances its phase by steps far smaller than the
     /// phase, which still add up to the right time.

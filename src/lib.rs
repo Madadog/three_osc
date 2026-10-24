@@ -342,7 +342,8 @@ fn apply_osc_params(osc: &mut OscillatorParams, params: &OscParams, global_pitch
     osc.pan = values.get(&params.pan);
     osc.semitone = values.get(&params.semitone) + global_pitch;
     osc.octave = values.get(&params.octave);
-    osc.pitch_multiplier = multiplier_to_pitch_multiplier(values.get(&params.multiplier));
+    osc.multiplier = values.get(&params.multiplier);
+    osc.pitch_multiplier = multiplier_to_pitch_multiplier(osc.multiplier);
     osc.voice_count = values.get(&params.voices) as u8;
     // The synth cubes the detune amount, after any modulation
     osc.voices_detune = values.get(&params.super_detune) / 100.0;
@@ -1266,6 +1267,94 @@ mod tests {
         }
     }
 
+    /// Modulating an oscillator's octave or frequency multiplier changes its pitch by whole
+    /// steps, at either modulation rate: a sine an octave (just short of one, which rounds up)
+    /// up or two down, or at three times or half its pitch.
+    #[test]
+    fn octave_and_multiplier_modulation_change_the_pitch() {
+        // The frequency of a sine from its upward zero crossings, over the second half
+        fn frequency(samples: &[f32], rate: f32) -> f32 {
+            let crossings: Vec<f32> = (samples.len() / 2..samples.len() - 1)
+                .filter(|&n| samples[n] < 0.0 && samples[n + 1] >= 0.0)
+                .map(|n| n as f32 + samples[n] / (samples[n] - samples[n + 1]))
+                .collect();
+            rate * (crossings.len() - 1) as f32 / (crossings[crossings.len() - 1] - crossings[0])
+        }
+        let c4 = 440.0 * 2.0_f32.powf(-9.0 / 12.0);
+        let cases = [
+            (ModTarget::Osc1Octave, 0.9 / ModTarget::OCTAVE_SPAN, 2.0),
+            (ModTarget::Osc1Octave, -2.0 / ModTarget::OCTAVE_SPAN, 0.25),
+            (ModTarget::Osc1Multiplier, 2.0 / ModTarget::MULTIPLIER_SPAN, 3.0),
+            (ModTarget::Osc1Multiplier, -1.0 / ModTarget::MULTIPLIER_SPAN, 0.5),
+        ];
+        let mut plugin = ThreeOscPlugin::default();
+        let patch = [
+            ("osc1_wave", serde_json::Value::from("sine")),
+            ("fil1_model", serde_json::Value::from("none")),
+            ("vol_sustain", serde_json::Value::from(1.0)),
+        ];
+        for rate in [synth::ModulationRate::Block, synth::ModulationRate::Sample] {
+            for (target, amount, ratio) in cases {
+                set_up(&mut plugin, &patch, "off");
+                plugin.synth.modulation_rate = rate;
+                plugin.synth.mod_wheel = 1.0;
+                plugin.synth.routes.push(Route { source: ModSource::ModWheel, target, amount });
+                let (left, _) = render_note(&mut plugin, 60, 0.5, 0.5);
+                let measured = frequency(&left, plugin.synth.sample_rate as f32);
+                assert!((measured / (c4 * ratio) - 1.0).abs() < 0.002, "{rate:?}, {target:?} by {amount}: {measured} Hz");
+            }
+        }
+    }
+
+    /// An oscillator can be a modulation source even when it's silent: a sine routed to the
+    /// volume amplitude modulates the note, putting sidebands either side of it at half the
+    /// route's amount, at the Sample modulation rate (and something like it at the Block
+    /// rate, which only reads it once per block).
+    #[test]
+    fn oscillators_modulate_as_sources() {
+        // The level of a frequency in the second half of a signal (under a Hann window, so that
+        // other frequencies don't leak in), relative to a full scale sine
+        fn level(samples: &[f32], frequency: f32, rate: f32) -> f32 {
+            let samples = &samples[samples.len() / 2..];
+            let (mut sin, mut cos) = (0.0, 0.0);
+            for (n, sample) in samples.iter().enumerate() {
+                let window = 0.5 - 0.5 * (std::f32::consts::TAU * n as f32 / samples.len() as f32).cos();
+                let t = std::f32::consts::TAU * frequency * n as f32 / rate;
+                sin += sample * window * t.sin();
+                cos += sample * window * t.cos();
+            }
+            4.0 * (sin * sin + cos * cos).sqrt() / samples.len() as f32
+        }
+        let c4 = 440.0 * 2.0_f32.powf(-9.0 / 12.0);
+        let mut plugin = ThreeOscPlugin::default();
+        let rate = plugin.synth.sample_rate as f32;
+        // Oscillator 2 a sine at a fifth below (x2 then divided by 3), silent
+        let patch = [
+            ("osc1_wave", serde_json::Value::from("sine")),
+            ("osc2_multiplier", serde_json::Value::from(-2)),
+            ("osc2_octave", serde_json::Value::from(1)),
+            ("fil1_model", serde_json::Value::from("none")),
+            ("vol_sustain", serde_json::Value::from(1.0)),
+        ];
+        let modulator = c4 * 2.0 / 3.0;
+        for (rate_mode, tolerance) in [(synth::ModulationRate::Sample, 0.02), (synth::ModulationRate::Block, 0.3)] {
+            set_up(&mut plugin, &patch, "off");
+            plugin.synth.modulation_rate = rate_mode;
+            plugin.synth.routes.push(Route { source: ModSource::Osc2, target: ModTarget::Volume, amount: 0.5 });
+            let (left, _) = render_note(&mut plugin, 60, 1.0, 1.0);
+            assert!(left.iter().all(|sample| sample.is_finite()));
+            let carrier = level(&left, c4, rate);
+            for sideband in [c4 - modulator, c4 + modulator] {
+                let relative = level(&left, sideband, rate) / carrier;
+                assert!((relative - 0.25).abs() < 0.25 * tolerance, "{rate_mode:?}, {sideband} Hz: {relative}");
+            }
+        }
+        // ...and without the route, there's nothing there
+        set_up(&mut plugin, &patch, "off");
+        let (left, _) = render_note(&mut plugin, 60, 1.0, 1.0);
+        assert!(level(&left, c4 + modulator, rate) / level(&left, c4, rate) < 1e-3);
+    }
+
     /// Portamento glides at the same speed whatever the host's sample rate and the oversampling:
     /// how far a glide has got after so many seconds doesn't depend on how many samples those
     /// are.
@@ -1746,6 +1835,17 @@ mod tests {
                 use synth::oversampling::Oversampling;
                 plugin.synth.oversampling =
                     [Oversampling::Off, Oversampling::Two, Oversampling::Four, Oversampling::Eight][rng.usize(0..4)];
+            }
+            // Now and then new routes, from any source to any target
+            if rng.usize(0..16) == 0 {
+                plugin.synth.routes.clear();
+                for _ in 0..rng.usize(0..=4) {
+                    plugin.synth.routes.push(Route {
+                        source: ModSource::from_index(rng.usize(0..synth::modulation::N_SOURCES)),
+                        target: ModTarget::from_index(rng.usize(0..synth::modulation::N_TARGETS)),
+                        amount: rng.f32() * 2.0 - 1.0,
+                    });
+                }
             }
             // Now and then a block at the sample rate, which is much slower
             plugin.synth.modulation_rate = if rng.usize(0..8) == 0 {
