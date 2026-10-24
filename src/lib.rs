@@ -190,10 +190,12 @@ impl ThreeOscPlugin {
         synth.bend_range = values.get(&global.bend_range) as f32;
         synth.polyphony = values.get(&global.polyphony).to_polyphony();
         synth.oversampling = values.get(&global.oversampling).to_oversampling();
-        // Scaling: This is a lerp per sample at the voices' rate, and must be proportional to it
-        // ... the '0.002' is just user-friendly control scaling.
-        let voice_rate = synth.sample_rate as f32 * synth.oversampling.factor() as f32;
-        synth.portamento_rate = 1.0 - values.get(&global.portamento_rate).powf(0.002 * voice_rate / 44100.0);
+        // The share of the way to the note the pitch glides at each of the voices' samples, so
+        // that each second leaves the control's value to the power of 88.2 of the way to go
+        // (0.002 at each sample at 44.1 kHz; the numbers are just user-friendly control scaling)
+        let voice_rate = synth.sample_rate * synth.oversampling.factor() as f64;
+        let per_second = (values.get(&global.portamento_rate) as f64).ln() * 0.002 * 44100.0;
+        synth.portamento_rate = -(per_second / voice_rate).exp_m1() as f32;
         synth.portamento_offset = values.get(&global.pitch_offset);
         // multiplies delta: smaller = higher pitch
         synth.octave_detune = 1.0 - values.get(&global.octave_detune);
@@ -1251,6 +1253,62 @@ mod tests {
                 assert!((-2.5..5.0).contains(&delay), "{filter}, {oversampling:?}: {delay} samples behind");
                 before = after;
             }
+        }
+    }
+
+    /// Portamento glides at the same speed whatever the host's sample rate and the oversampling:
+    /// how far a glide has got after so many seconds doesn't depend on how many samples those
+    /// are.
+    #[test]
+    fn portamento_takes_the_same_time_at_any_rate() {
+        // The pitch of a sine over the `window` seconds up to `at` seconds in, in semitones above
+        // `reference` Hz, from its zero crossings
+        fn semitones(samples: &[f32], rate: f64, at: f64, window: f64, reference: f64) -> f64 {
+            let crossings: Vec<f64> = (((at - window) * rate) as usize..(at * rate) as usize)
+                .filter(|&n| samples[n] < 0.0 && samples[n + 1] >= 0.0)
+                .map(|n| (n as f64 + (samples[n] / (samples[n] - samples[n + 1])) as f64) / rate)
+                .collect();
+            let frequency = (crossings.len() - 1) as f64 / (crossings[crossings.len() - 1] - crossings[0]);
+            12.0 * (frequency / reference).log2()
+        }
+        let c5 = 440.0 * 2.0_f64.powf(3.0 / 12.0);
+        let patch = [
+            ("osc1_wave", serde_json::Value::from("sine")),
+            ("fil1_model", serde_json::Value::from("none")),
+            ("vol_sustain", serde_json::Value::from(1.0)),
+            ("polyphony", serde_json::Value::from("legato")),
+            ("portamento_rate", serde_json::Value::from(0.9)),
+        ];
+        let times = [0.03, 0.1, 0.2, 0.3];
+        let mut reference = None;
+        for (rate, oversamplings) in [(44100.0, &["off", "2x", "4x", "8x"][..]), (48000.0, &["off", "4x"]), (96000.0, &["off"])] {
+            let mut plugin = ThreeOscPlugin {
+                synth: ThreeOsc::new(rate),
+                ..Default::default()
+            };
+            for oversampling in oversamplings {
+                set_up(&mut plugin, &patch, oversampling);
+                // C4 for a moment, then up to C5
+                let mut left = vec![0.0; (0.4 * rate) as usize];
+                let mut right = left.clone();
+                let change = (0.05 * rate) as usize;
+                plugin.synth.note_on(60, 100);
+                plugin.synth.run(&mut left[..change], &mut right[..change]);
+                plugin.synth.note_on(72, 100);
+                plugin.synth.run(&mut left[change..], &mut right[change..]);
+                let glide = times.map(|at| semitones(&left[change..], rate, at, 0.02, c5));
+                let reference = *reference.get_or_insert(glide);
+                for (at, (pitch, expected)) in times.iter().zip(glide.iter().zip(reference)) {
+                    assert!((pitch - expected).abs() < 0.02, "{rate} Hz, {oversampling}, {at} s: {glide:?}, not {reference:?}");
+                }
+            }
+        }
+        // ...and at the speed it always had at 44.1 kHz: each second leaves 0.9^88.2 of the way it
+        // had to go (here, around the middle of each window)
+        let reference = reference.unwrap();
+        for (at, pitch) in times.iter().zip(reference) {
+            let expected = -12.0 * 0.9_f64.powf(88.2 * (at - 0.01));
+            assert!((pitch - expected).abs() < 0.3, "{at} s: {pitch}, not about {expected}");
         }
     }
 

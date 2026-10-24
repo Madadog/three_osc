@@ -77,6 +77,7 @@ pub struct ThreeOsc {
     pub bend_range: f32,
     pub polyphony: Polyphony,
     pub octave_detune: f32,
+    /// The share of the way to its note a voice's pitch glides at each of its samples.
     pub portamento_rate: f32,
     pub portamento_offset: f32,
     pub lfos: [LfoParams; N_LFOS],
@@ -372,10 +373,13 @@ impl ThreeOsc {
                 .any(|route| route.source.to_index() == source)
         });
         let per_sample = self.modulation_rate == ModulationRate::Sample;
-        // The portamento after each number of samples within a block
+        // The portamento after each number of samples within a block, worked out in double
+        // precision (at high rates, one sample's is too close to 1 for single precision)
         let mut portamento_powers = [1.0; CONTROL_BLOCK_SAMPLES + 1];
-        for n in 1..=CONTROL_BLOCK_SAMPLES {
-            portamento_powers[n] = portamento_powers[n - 1] * (1.0 - self.portamento_rate);
+        let mut power = 1.0;
+        for portamento in &mut portamento_powers[1..] {
+            power *= 1.0 - self.portamento_rate as f64;
+            *portamento = power as f32;
         }
 
         VoiceContext {
@@ -393,8 +397,6 @@ impl ThreeOsc {
             stereo,
             stereo_width: self.stereo_width,
             octave_detune: self.octave_detune,
-            portamento_rate: self.portamento_rate,
-            portamento_block: (1.0 - self.portamento_rate).powi(CONTROL_BLOCK_SAMPLES as i32),
             portamento_powers,
             per_sample,
             routes_by_target: RoutesByTarget::new(&self.routes),
@@ -581,9 +583,6 @@ struct VoiceContext<'a> {
     /// [`ThreeOsc::stereo_width`].
     stereo_width: f32,
     octave_detune: f32,
-    portamento_rate: f32,
-    /// The portamento rate applied over a whole control rate block.
-    portamento_block: f32,
     /// The portamento applied over each number of samples within a block.
     portamento_powers: [f32; CONTROL_BLOCK_SAMPLES + 1],
     /// Whether the modulation runs at the sample rate, see [`ModulationRate`].
@@ -849,11 +848,7 @@ impl Voice {
         let first_block = block_start == 0;
 
         // Portamento, applied for the whole block at once
-        self.semitone_detune *= if block_len == CONTROL_BLOCK_SAMPLES {
-            context.portamento_block
-        } else {
-            partial_block_portamento(context.portamento_rate, block_len)
-        };
+        self.semitone_detune *= context.portamento_powers[block_len];
         self.pitch_multiply = context.octave_detune;
         let delta = self.delta(sample_rate);
 
@@ -1219,15 +1214,6 @@ impl Voice {
         }
         self.gain = gain + step * block_len as f32;
     }
-}
-
-/// The portamento over a block shorter than a control rate block (at the end of a buffer, or
-/// before an event). Out of line, so that the compiler doesn't work it out for every block just
-/// in case.
-#[cold]
-#[inline(never)]
-fn partial_block_portamento(rate: f32, block_len: usize) -> f32 {
-    (1.0 - rate).powi(block_len as i32)
 }
 
 /// Blocks shorter than this run the Digital filter one voice at a time rather than in lockstep.
