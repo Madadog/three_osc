@@ -17,6 +17,7 @@ use nih_plug_egui::EguiState;
 use serde::{Deserialize, Serialize};
 
 use crate::synth::effects::{self, EffectSettings};
+use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::filter::{FilterModel, FilterType};
 use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
 use crate::synth::oscillator::{multiplier_ratio, Interpolation, OscWave, WavePreview, MULTIPLIER_RANGE, OCTAVE_RANGE};
@@ -757,7 +758,7 @@ impl Default for FilterEnvParams {
     }
 }
 
-/// An ADSR envelope with an adjustable slope.
+/// An ADSR envelope with an adjustable slope for each stage.
 #[derive(Params)]
 pub struct EnvelopeParams {
     /// Attack time in seconds.
@@ -772,10 +773,31 @@ pub struct EnvelopeParams {
     /// Release time in seconds.
     #[id = "release"]
     pub release: FloatParam,
-    /// Slope of the envelope segments: 0 is linear, positive is logarithmic (punchy), negative is
-    /// exponential.
-    #[id = "slope"]
-    pub slope: FloatParam,
+    /// The slope of each stage's curve: 0 is a straight line, positive makes the stage change
+    /// quickly at its start (punchy), negative slowly, see
+    /// [`AdsrEnvelope::set_slopes()`][crate::synth::envelopes::AdsrEnvelope::set_slopes()].
+    #[id = "attack_slope"]
+    pub attack_slope: FloatParam,
+    #[id = "decay_slope"]
+    pub decay_slope: FloatParam,
+    #[id = "release_slope"]
+    pub release_slope: FloatParam,
+}
+
+/// The envelopes' single slopes from before each stage had its own, by id, with the ids of the
+/// attack, decay and release slopes that took their place (see
+/// [`AdsrEnvelope::slopes_for()`][crate::synth::envelopes::AdsrEnvelope::slopes_for()]).
+pub const LEGACY_SLOPES: [(&str, [&str; 3]); 4] = [
+    ("vol_slope", ["vol_attack_slope", "vol_decay_slope", "vol_release_slope"]),
+    ("fil1_slope", ["fil1_attack_slope", "fil1_decay_slope", "fil1_release_slope"]),
+    ("env_slope_1", ["env_attack_slope_1", "env_decay_slope_1", "env_release_slope_1"]),
+    ("env_slope_2", ["env_attack_slope_2", "env_decay_slope_2", "env_release_slope_2"]),
+];
+
+/// A slope of an envelope stage, from -8 to 8.
+fn slope_param(name: &str, default: f32) -> FloatParam {
+    FloatParam::new(name, default, FloatRange::Linear { min: -8.0, max: 8.0 })
+        .with_value_to_string(formatters::v2s_f32_rounded(2))
 }
 
 impl EnvelopeParams {
@@ -789,15 +811,10 @@ impl EnvelopeParams {
             sustain: amount_param("Sustain", sustain),
             // A zero length release would divide by zero in the envelope.
             release: time_param("Release", release, 0.001),
-            slope: FloatParam::new(
-                "Slope",
-                1.0,
-                FloatRange::Linear {
-                    min: -8.0,
-                    max: 8.0,
-                },
-            )
-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            // The curves the envelopes always had by default
+            attack_slope: slope_param("Attack Slope", AdsrEnvelope::slopes_for(1.0)[0]),
+            decay_slope: slope_param("Decay Slope", AdsrEnvelope::slopes_for(1.0)[1]),
+            release_slope: slope_param("Release Slope", AdsrEnvelope::slopes_for(1.0)[2]),
         }
     }
 }

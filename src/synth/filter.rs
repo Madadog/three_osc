@@ -283,6 +283,7 @@ impl FilterContainer {
 impl FilterContainer {
     /// Sets how many times the voices' rate the Ladder filter runs at (the other models run at
     /// the voices' rate), see [`ladder_oversampling()`].
+    #[inline]
     pub fn set_ladder_oversampling(&mut self, factor: i32) {
         if let FilterContainer::LadderFilter(ladder) = self {
             ladder.set_oversampling_factor(factor);

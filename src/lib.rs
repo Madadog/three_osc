@@ -368,7 +368,24 @@ fn apply_envelope_values(envelope: &mut AdsrEnvelope, params: &EnvelopeParams, v
     envelope.decay_time = values.get(&params.decay);
     envelope.sustain_level = values.get(&params.sustain);
     envelope.release_time = values.get(&params.release);
-    envelope.set_slope(values.get(&params.slope));
+    envelope.set_slopes([
+        values.get(&params.attack_slope),
+        values.get(&params.decay_slope),
+        values.get(&params.release_slope),
+    ]);
+}
+
+/// Splits the single slope of each envelope in state saved before each stage had its own into
+/// the three slopes that make the same curves (unless they are there already).
+fn upgrade_slopes(params: &mut std::collections::BTreeMap<String, nih_plug::wrapper::state::ParamValue>) {
+    use nih_plug::wrapper::state::ParamValue;
+    for (old, new) in params::LEGACY_SLOPES {
+        if let Some(ParamValue::F32(slope)) = params.remove(old) {
+            for (id, value) in new.iter().zip(AdsrEnvelope::slopes_for(slope)) {
+                params.entry(id.to_string()).or_insert(ParamValue::F32(value));
+            }
+        }
+    }
 }
 
 /// Converts nih-plug's `[0, 1]` velocity to the 7-bit MIDI velocity the synth engine uses.
@@ -442,6 +459,10 @@ impl Plugin for ThreeOscPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn filter_state(state: &mut PluginState) {
+        upgrade_slopes(&mut state.params);
     }
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
@@ -1353,6 +1374,42 @@ mod tests {
         set_up(&mut plugin, &patch, "off");
         let (left, _) = render_note(&mut plugin, 60, 1.0, 1.0);
         assert!(level(&left, c4 + modulator, rate) / level(&left, c4, rate) < 1e-3);
+    }
+
+    /// State saved with an envelope's single slope loads with the three slopes that make the
+    /// curves it made, under the ids the envelopes have now.
+    #[test]
+    fn saved_slopes_are_split_into_the_stages() {
+        use nih_plug::wrapper::state::ParamValue;
+        let plugin = ThreeOscPlugin::default();
+        let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
+        for (old, new) in params::LEGACY_SLOPES {
+            assert!(!ids.iter().any(|id| id == old), "{old}");
+            assert!(new.iter().all(|new| ids.iter().any(|id| id == new)), "{new:?}");
+        }
+        let mut state = std::collections::BTreeMap::from([
+            (String::from("vol_slope"), ParamValue::F32(-2.0)),
+            (String::from("fil1_slope"), ParamValue::F32(1.0)),
+            // (Already split: kept as it is)
+            (String::from("fil1_attack_slope"), ParamValue::F32(3.0)),
+        ]);
+        upgrade_slopes(&mut state);
+        let value = |id: &str| match state.get(id) {
+            Some(ParamValue::F32(value)) => *value,
+            other => panic!("{id}: {other:?}"),
+        };
+        assert!(!state.contains_key("vol_slope") && !state.contains_key("fil1_slope"));
+        assert_eq!([value("vol_attack_slope"), value("vol_decay_slope"), value("vol_release_slope")], [-2.0, -0.5, -0.5]);
+        assert_eq!([value("fil1_attack_slope"), value("fil1_decay_slope"), value("fil1_release_slope")], [3.0, 1.0, 1.0]);
+
+        // The split slopes make exactly the curves the one slope made
+        for slope in [-6.0, -1.0, 0.0, 1.0, 2.5] {
+            let mut envelope = AdsrEnvelope::new(0.1, 0.2, 0.3, 0.5, 0.0);
+            envelope.set_slopes(AdsrEnvelope::slopes_for(slope));
+            let (attack, decay) = if slope >= 0.0 { (-slope / 4.0, slope) } else { (-slope, slope / 4.0) };
+            assert_eq!(envelope.attack_slope, 2.0_f32.powf(attack));
+            assert_eq!([envelope.decay_slope, envelope.release_slope], [2.0_f32.powf(decay); 2]);
+        }
     }
 
     /// Portamento glides at the same speed whatever the host's sample rate and the oversampling:

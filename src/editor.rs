@@ -99,12 +99,14 @@ pub struct EditorState {
     analyser: analyser::Analyser,
 }
 
-/// What the top left of the window shows: the oscillators, or the effects in their place.
-/// Either way the modulation sources stay in view, to be dragged onto the controls.
+/// What the top left of the window shows: the oscillators, or the effects or the advanced
+/// settings in their place. Either way the modulation sources stay in view, to be dragged onto
+/// the controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Oscillators,
     Effects,
+    Advanced,
 }
 
 impl EditorState {
@@ -255,6 +257,14 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
                     effects(ui, size, &params.fx, &matrix, setter, live);
                 });
             }
+            Tab::Advanced => {
+                let size = gui.state.oscillators_size;
+                ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.set_min_size(size);
+                    advanced(ui, &params.global, setter);
+                    wavetable_folder(ui, params, setter, gui);
+                });
+            }
         }
         ui.vertical(|ui| {
             ui.horizontal_top(|ui| {
@@ -269,9 +279,6 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
                 output_section(ui, lfos.height(), gui);
             });
             midi_sources(ui);
-            if gui.state.tab == Tab::Oscillators {
-                wavetable_folder(ui, params, setter, gui);
-            }
         });
     });
 
@@ -321,6 +328,47 @@ fn tabs(ui: &mut Ui, fx: &FxParams, gui: &mut Gui) {
             "The effects after the voices: distortion, chorus, delay and reverb, in that order. \
              They take the oscillators' place, so the modulation sources stay in view to be \
              dragged onto them.",
+        );
+        ui.selectable_value(tab, Tab::Advanced, RichText::new("Advanced").strong()).on_hover_text(
+            "Settings for quality against CPU (the oversampling, how the wavetables are read and \
+             how often the modulation is worked out), and the folder of wavetable files.",
+        );
+    });
+}
+
+/// The settings that trade quality against CPU.
+fn advanced(ui: &mut Ui, global: &GlobalParams, setter: &ParamSetter) {
+    section(ui, "Quality", None, Display::None, |ui| {
+        combo(
+            ui,
+            &global.oversampling,
+            "Runs the voices at 2, 4 or 8 times the sample rate and filters them back down, so \
+             that the sidebands of FM, PM and AM and the filters' distortion above the Nyquist \
+             frequency are filtered out instead of folding back down as aliasing (the waves \
+             themselves are alias-free either way). The voices cost about that many times the \
+             CPU (the Ladder filter less, since it runs oversampled on its own); the effects run \
+             at the sample rate. Presets leave it as it is.",
+            setter,
+        );
+        combo(
+            ui,
+            &global.interpolation,
+            "How the oscillators read their wavetables in between samples. Cubic is the \
+             cleanest. Linear is a little cheaper and adds some aliasing noise on high notes. \
+             None (no interpolation) is the cheapest and the grittiest: it steps between the \
+             samples, which is clearly audible on all but the lowest notes.",
+            setter,
+        );
+        combo(
+            ui,
+            &global.modulation_rate,
+            "How often the envelopes, LFOs, modulation routes, pitch and filter settings are \
+             worked out. Block works them out every 32 samples and glides gains, pitch and the \
+             Digital filter in between, which is plenty for most sounds. Sample works them out at \
+             every sample, for the snappiest envelopes, and LFOs and oscillators modulating at \
+             audio rates. It costs little extra while nothing moves, and up to two or three times \
+             the CPU while modulation does.",
+            setter,
         );
     });
 }
@@ -560,7 +608,7 @@ fn oscillator(
         Some(wavetable) => gui.state.builtin_waves[wavetable].clone(),
         None => file.preview().unwrap_or_else(|| gui.state.builtin_waves[0].clone()),
     };
-    let start = (osc.phase_rand.value() < 100.0).then(|| osc.phase.value() / 100.0);
+    let (phase, phase_rand) = (osc.phase.value() / 100.0, osc.phase_rand.value() / 100.0);
     let silent = osc.amp.value() == 0.0;
     // Where the newest note's modulation has the wavetable position
     let target = ModTarget::osc_position(index);
@@ -569,7 +617,7 @@ fn oscillator(
         None => osc.position.value(),
     };
     let mut display = |ui: &mut Ui| {
-        displays::wave(ui, &preview, position, start, silent);
+        displays::wave(ui, &preview, position, phase, phase_rand, silent);
     };
     section(ui, title, Some(ModSource::osc(index)), Display::Above(&mut display), |ui| {
         combo(
@@ -577,8 +625,8 @@ fn oscillator(
             &osc.wave,
             "The wavetable the oscillator plays. The basic shapes and fixed pulse widths are \
              single frames; PW Sweep and Basic Shapes have several frames that Position morphs \
-             between. File plays a wavetable loaded from a .wav file (see the Wavetable Files \
-             box). All waves are bandlimited (alias-free).",
+             between. File plays a wavetable loaded from a .wav file (see Wavetable Files on the \
+             Advanced tab). All waves are bandlimited (alias-free).",
             setter,
         );
         if osc.wave.value() == OscillatorWave::File {
@@ -731,7 +779,7 @@ fn wavetable_file_rows(ui: &mut Ui, index: usize, file: &WavetableFile, gui: &mu
     ui.label("File").on_hover_text(
         "The .wav file this oscillator plays as a wavetable: one or more single cycles one \
          after the other, 2048 samples each unless the file says otherwise. Pick one from the \
-         wavetable folder here, or type a path into the Wavetable Files box.",
+         wavetable folder here, or type a path into Wavetable Files on the Advanced tab.",
     );
     let current = file.path();
     let current_name = Path::new(&current)
@@ -914,8 +962,18 @@ fn filter(
         oversampling.factor(),
     );
     let response = &mut gui.state.filter_response;
-    let live_cutoff = gui.live.monitor.cutoff();
-    let mut display = |ui: &mut Ui| displays::filter(ui, settings, response, live_cutoff);
+    // The newest note's cutoff, and its resonance as the synth modulates it
+    let monitor = gui.live.monitor;
+    let live = monitor.cutoff().map(|cutoff| {
+        let resonance = match monitor.modulation(ModTarget::Resonance) {
+            Some(modulation) if modulation != 0.0 => {
+                ModTarget::Resonance.scaling().apply(filter.resonance.value(), modulation).clamp(0.1, 10.0)
+            }
+            _ => filter.resonance.value(),
+        };
+        (cutoff, resonance)
+    });
+    let mut display = |ui: &mut Ui| displays::filter(ui, settings, response, live);
     section(ui, title, None, Display::Above(&mut display), |ui| {
         combo(
             ui,
@@ -973,7 +1031,7 @@ fn filter(
 }
 
 fn filter_envelope(ui: &mut Ui, title: &str, env: &FilterEnvParams, setter: &ParamSetter, live: Live) {
-    let mut display = |ui: &mut Ui| envelope_display(ui, &env.envelope, live);
+    let mut display = |ui: &mut Ui| envelope_display(ui, &env.envelope, setter, live);
     section(ui, title, Some(ModSource::FilterEnv), Display::Above(&mut display), |ui| {
         slider(
             ui,
@@ -993,18 +1051,18 @@ fn envelope(
     setter: &ParamSetter,
     live: Live,
 ) {
-    let mut display = |ui: &mut Ui| envelope_display(ui, env, live);
+    let mut display = |ui: &mut Ui| envelope_display(ui, env, setter, live);
     section(ui, title, Some(source), Display::Above(&mut display), |ui| {
         envelope_rows(ui, env, setter)
     });
 }
 
 /// An envelope's shape, worked out the way the synth does it, with where each note playing is
-/// in it.
-fn envelope_display(ui: &mut Ui, params: &EnvelopeParams, live: Live) {
+/// in it, and its handles to drag.
+fn envelope_display(ui: &mut Ui, params: &EnvelopeParams, setter: &ParamSetter, live: Live) {
     let mut envelope = AdsrEnvelope::new(0.0, 0.0, 0.0, 0.0, 0.0);
     crate::apply_envelope_params(&mut envelope, params);
-    displays::envelope(ui, &envelope, MOD_COLOR, &live.voice_times());
+    displays::envelope(ui, &envelope, MOD_COLOR, &live.voice_times(), params, setter);
 }
 
 fn envelope_rows(ui: &mut Ui, env: &EnvelopeParams, setter: &ParamSetter) {
@@ -1034,15 +1092,6 @@ fn envelope_rows(ui: &mut Ui, env: &EnvelopeParams, setter: &ParamSetter) {
         "Time for the envelope to finish after the note is released. Useful for sounds which \
          persist a while after they're played, like bells or chimes. Has mostly no effect when \
          sustain = 0.",
-        setter,
-    );
-    slider(
-        ui,
-        &env.slope,
-        "Controls the steepness of the attack, decay and release slopes either exponentially or \
-         logarithmically. Positive slope means attack and decay will change logarithmically, \
-         resulting in punchier sounds, while negative slope will do the opposite. A slope of 0 \
-         results in exactly linear slopes.",
         setter,
     );
 }
@@ -1114,26 +1163,6 @@ fn global(ui: &mut Ui, title: &str, global: &GlobalParams, matrix: &Matrix, sett
             &global.bend_range,
             "Controls the range of the MIDI pitch wheel in semitones. Useful if you have a MIDI \
              keyboard.",
-            setter,
-        );
-        combo(
-            ui,
-            &global.interpolation,
-            "How the oscillators read their wavetables in between samples. Cubic is the \
-             cleanest. Linear is a little cheaper and adds some aliasing noise on high notes. \
-             None (no interpolation) is the cheapest and the grittiest: it steps between the \
-             samples, which is clearly audible on all but the lowest notes.",
-            setter,
-        );
-        combo(
-            ui,
-            &global.modulation_rate,
-            "How often the envelopes, LFOs, modulation routes, pitch and filter settings are \
-             worked out. Block works them out every 32 samples and glides gains, pitch and the \
-             Digital filter in between, which is plenty for most sounds. Sample works them out at \
-             every sample, for the snappiest envelopes and LFOs fast enough to be heard as \
-             tones. It costs little extra while nothing moves, and up to two or three times the \
-             CPU while modulation does.",
             setter,
         );
     });

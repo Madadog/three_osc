@@ -373,7 +373,7 @@ impl ThreeOsc {
                 .any(|route| route.source.to_index() == source)
         });
         // Oscillators that are modulation sources play even when they're silent
-        let sourced = std::array::from_fn(|i| sources_used[ModSource::osc(i).to_index()]);
+        let sourced: [bool; 3] = std::array::from_fn(|i| sources_used[ModSource::osc(i).to_index()]);
         let active = std::array::from_fn(|i| active[i] || sourced[i]);
         let per_sample = self.modulation_rate == ModulationRate::Sample;
         // The portamento after each number of samples within a block, worked out in double
@@ -406,6 +406,10 @@ impl ThreeOsc {
             routes_by_target: RoutesByTarget::new(&self.routes),
             active,
             sourced,
+            any_sourced: sourced.contains(&true),
+            stepped: std::array::from_fn(|i| {
+                self.targeted(ModTarget::osc_octave(i)) || self.targeted(ModTarget::osc_multiplier(i))
+            }),
             simd: self.simd,
             interpolation: self.interpolation,
         }
@@ -601,8 +605,11 @@ struct VoiceContext<'a> {
     /// modulate anything are skipped.
     active: [bool; 3],
     /// Whether each oscillator is a modulation source, whose wave the voices keep for the
-    /// routes (see [`Voice::osc_history`]).
+    /// routes (see [`Voice::osc_history`]), and whether any is.
     sourced: [bool; 3],
+    any_sourced: bool,
+    /// Whether any route moves each oscillator's octave or frequency multiplier.
+    stepped: [bool; 3],
     simd: SimdLevel,
     interpolation: Interpolation,
 }
@@ -856,9 +863,11 @@ impl Voice {
         sources[ModSource::Aftertouch.to_index()] = context.aftertouch.max(self.pressure);
         sources[ModSource::Random.to_index()] = self.random;
         // The oscillators a block's worth of samples before the end of this one
-        for i in 0..3 {
-            if used(ModSource::osc(i)) {
-                sources[ModSource::osc(i).to_index()] = self.osc_history[i][block_len - 1];
+        if context.any_sourced {
+            for i in 0..3 {
+                if context.sourced[i] {
+                    sources[ModSource::osc(i).to_index()] = self.osc_history[i][block_len - 1];
+                }
             }
         }
         sources
@@ -923,9 +932,9 @@ impl Voice {
             if semitones != 0.0 {
                 target_delta *= fastmath::exp2(semitones / 12.0);
             }
-            let octave_mod = modulation(ModTarget::osc_octave(i));
-            let multiplier_mod = modulation(ModTarget::osc_multiplier(i));
-            if octave_mod != 0.0 || multiplier_mod != 0.0 {
+            if context.stepped[i] {
+                let octave_mod = modulation(ModTarget::osc_octave(i));
+                let multiplier_mod = modulation(ModTarget::osc_multiplier(i));
                 target_delta *= osc.stepped_pitch_factor(octave_mod, multiplier_mod);
             }
             self.osc_note[i] = WavetableNotes::cycles_to_note(target_delta, sample_rate);
@@ -1101,6 +1110,14 @@ impl Voice {
             } else {
                 (samples.osc_delta[i][0], 0.0, samples.osc_gain[i][0], 0.0)
             };
+            // Where the plain wave goes: the oscillator before's modulator, or the routes from it
+            let mut mono = if modulates_next {
+                Some(&mut *modulator_next)
+            } else if sourced {
+                Some(&mut *source)
+            } else {
+                None
+            };
             let mut start = 0;
             while start < block_len {
                 let (end, frames) = if varies {
@@ -1156,13 +1173,7 @@ impl Voice {
                     } else {
                         None
                     },
-                    mono: if modulates_next {
-                        Some((&mut modulator_next[start..end], 1.0))
-                    } else if sourced {
-                        Some((&mut source[start..end], 1.0))
-                    } else {
-                        None
-                    },
+                    mono: mono.as_deref_mut().map(|mono| (&mut mono[start..end], 1.0)),
                 };
                 frames.render_block(
                     &mut self.osc_voice[i],
@@ -1179,15 +1190,9 @@ impl Voice {
                 self.osc_delta[i] += self.osc_delta_step[i] * block_len as f32;
                 self.osc_gain[i] += self.osc_gain_step[i] * block_len as f32;
             }
-            if sourced {
+            if let Some(wave) = mono.filter(|_| sourced) {
                 // For the routes to read later, with the unison voices averaged
-                let wave = if modulates_next { &modulator_next[..block_len] } else { &source[..block_len] };
-                let scale = 1.0 / osc.unison_voices() as f32;
-                let history = &mut self.osc_history[i];
-                history.copy_within(block_len.., 0);
-                for (kept, sample) in history[CONTROL_BLOCK_SAMPLES - block_len..].iter_mut().zip(wave) {
-                    *kept = sample * scale;
-                }
+                keep_history(&mut self.osc_history[i], &wave[..block_len], 1.0 / osc.unison_voices() as f32);
             }
             have_modulator = modulates_next;
             std::mem::swap(&mut modulator, &mut modulator_next);
@@ -1266,6 +1271,16 @@ impl Voice {
 /// The ladder's one voice path is so much slower than its lockstep kernel that the ladder stays
 /// in lockstep even for a single sample.
 const SVF_LOCKSTEP_MIN_BLOCK: usize = 4;
+
+/// Moves an oscillator's kept wave (see [`Voice::osc_history`]) on by a block, `wave` scaled.
+#[inline(never)]
+fn keep_history(history: &mut [f32; CONTROL_BLOCK_SAMPLES], wave: &[f32], scale: f32) {
+    let block_len = wave.len();
+    history.copy_within(block_len.., 0);
+    for (kept, sample) in history[CONTROL_BLOCK_SAMPLES - block_len..].iter_mut().zip(wave) {
+        *kept = sample * scale;
+    }
+}
 
 /// Renders a control rate block of every voice at the voices' rate, adding it into the output:
 /// their oscillators, then their filters, then their amplitude envelopes.
@@ -1500,10 +1515,15 @@ pub mod envelopes {
         pub decay_time: f32,
         pub release_time: f32,
         pub sustain_level: f32,
-        pub slope: f32,
+        /// The exponents of the attack, decay and release curves, see
+        /// [`set_slopes()`][Self::set_slopes()].
         pub attack_slope: f32,
+        pub decay_slope: f32,
+        pub release_slope: f32,
     }
     impl AdsrEnvelope {
+        /// An envelope with the stages' slopes [`slopes_for()`][Self::slopes_for()] the one
+        /// `slope`.
         pub fn new(
             attack_time: f32,
             decay_time: f32,
@@ -1511,29 +1531,44 @@ pub mod envelopes {
             sustain_level: f32,
             slope: f32,
         ) -> Self {
-            Self {
+            let mut envelope = Self {
                 attack_time,
                 decay_time,
                 release_time,
                 sustain_level,
-                slope: Self::slope(slope),
-                attack_slope: Self::slope(-slope),
-            }
+                attack_slope: 1.0,
+                decay_slope: 1.0,
+                release_slope: 1.0,
+            };
+            envelope.set_slope(slope);
+            envelope
         }
-        /// 0 is linear, positive is biased towards zero, negative is biased towards max.
-        fn slope(slope: f32) -> f32 {
-            2.0_f32.powf(slope)
-        }
-        pub fn set_slope(&mut self, slope: f32) {
-            // The inverted / negative slope flares up too quickly compared to the
-            // positive slope, so we divide the negative slope by an arbitrary number
+        /// The attack, decay and release slopes that make the curves one slope made, as the
+        /// envelopes had before each stage had its own: positive slopes make the attack a
+        /// little punchier and the decay and release more so, negative ones the other way
+        /// round (the opposite curves change too quickly otherwise).
+        pub fn slopes_for(slope: f32) -> [f32; 3] {
             if slope.is_sign_positive() {
-                self.slope = Self::slope(slope);
-                self.attack_slope = Self::slope(-slope / 4.0);
+                [slope / 4.0, slope, slope]
             } else {
-                self.slope = Self::slope(slope / 4.0);
-                self.attack_slope = Self::slope(-slope);
+                [slope, slope / 4.0, slope / 4.0]
             }
+        }
+        /// Sets each stage's curve from its slope: 0 is a straight line, and positive slopes
+        /// make a stage change quickly at its start and slowly at its end (a punchy attack, a
+        /// decay or release that drops quickly and then tails off), negative ones the other way
+        /// round. Each step of 1 doubles or halves the exponent of the curve.
+        pub fn set_slopes(&mut self, [attack, decay, release]: [f32; 3]) {
+            self.attack_slope = Self::exponent(-attack);
+            self.decay_slope = Self::exponent(decay);
+            self.release_slope = Self::exponent(release);
+        }
+        /// Sets the stages' slopes from one slope, see [`slopes_for()`][Self::slopes_for()].
+        pub fn set_slope(&mut self, slope: f32) {
+            self.set_slopes(Self::slopes_for(slope));
+        }
+        fn exponent(slope: f32) -> f32 {
+            2.0_f32.powf(slope)
         }
         /// Returns the envelope CV (between 0.0 and 1.0) associated with the given index
         ///
@@ -1546,7 +1581,7 @@ pub mod envelopes {
             } else if index - self.attack_time < self.decay_time {
                 fastmath::pow(
                     1.0 - (index - self.attack_time) / self.decay_time,
-                    self.slope,
+                    self.decay_slope,
                 ) * (1.0 - self.sustain_level)
                     + self.sustain_level
             } else {
@@ -1559,7 +1594,7 @@ pub mod envelopes {
                 0.0
             } else {
                 let level = self.sample_held(release_index);
-                fastmath::pow(1.0 - (index - release_index) / self.release_time, self.slope)
+                fastmath::pow(1.0 - (index - release_index) / self.release_time, self.release_slope)
                     * level
             }
         }

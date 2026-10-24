@@ -28,9 +28,11 @@
     "reverb_mix": 0.2,
     "reverb_on": true,
     "reverb_size": 0.5,
+    "vol_attack_slope": 0.5,
     "vol_decay": 2.5,
+    "vol_decay_slope": 2.0,
     "vol_release": 0.4,
-    "vol_slope": 2.0,
+    "vol_release_slope": 2.0,
     "vol_sustain": 0.25
   }
 }

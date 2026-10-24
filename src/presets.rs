@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::params::{OscillatorWave, ThreeOscParams};
+use crate::synth::envelopes::AdsrEnvelope;
 
 /// The factory presets, in the order they are listed.
 const FACTORY: &[&str] = &[
@@ -202,13 +203,14 @@ impl Targets {
     pub fn new(preset: &Preset, params: &ThreeOscParams, enum_ids: &EnumIds) -> Self {
         let mut problems = Vec::new();
         let map = params.param_map();
+        let preset_params = upgraded(&preset.params);
         let values = map
             .iter()
             .filter(|(id, _, _)| in_presets(id))
             .map(|(id, ptr, _)| {
                 // Safety: the pointers point into `params`, which outlives this
                 let default = unsafe { ptr.default_normalized_value() };
-                let target = match preset.params.get(id) {
+                let target = match preset_params.get(id) {
                     Some(value) => unsafe { normalized(*ptr, id, value, enum_ids) }.unwrap_or_else(|| {
                         problems.push(format!("{id} can't be {value}"));
                         default
@@ -218,7 +220,7 @@ impl Targets {
                 (*ptr, target)
             })
             .collect();
-        for id in preset.params.keys() {
+        for id in preset_params.keys() {
             if !map.iter().any(|(known, _, _)| known == id) {
                 problems.push(format!("there's no parameter {id}"));
             }
@@ -246,6 +248,24 @@ impl Targets {
                     || params.wavetable_file(osc).path() == self.files[osc]
             })
     }
+}
+
+/// A preset's parameters, with the single slope of each envelope in presets saved before each
+/// stage had its own split into the three slopes that make the same curves (see
+/// [`crate::params::LEGACY_SLOPES`]).
+fn upgraded(params: &BTreeMap<String, Value>) -> std::borrow::Cow<'_, BTreeMap<String, Value>> {
+    if !crate::params::LEGACY_SLOPES.iter().any(|(old, _)| params.contains_key(*old)) {
+        return std::borrow::Cow::Borrowed(params);
+    }
+    let mut params = params.clone();
+    for (old, new) in crate::params::LEGACY_SLOPES {
+        if let Some(slope) = params.remove(old).and_then(|slope| slope.as_f64()) {
+            for (id, value) in new.iter().zip(AdsrEnvelope::slopes_for(slope as f32)) {
+                params.entry(id.to_string()).or_insert(Value::from(value as f64));
+            }
+        }
+    }
+    std::borrow::Cow::Owned(params)
 }
 
 /// A preset's value for a parameter, as its normalized value, or `None` if the parameter can't
@@ -421,6 +441,34 @@ mod tests {
         assert!(targets.problems.is_empty(), "{:?}", targets.problems);
         assert!(targets.values.iter().all(|(ptr, _)| *ptr != params.global.oversampling.as_ptr()));
         assert!(targets.matches(&params));
+    }
+
+    /// Presets saved with an envelope's single slope load with the three slopes that make the
+    /// same curves.
+    #[test]
+    fn presets_with_one_slope_load_its_curves() {
+        let params = ThreeOscParams::default();
+        let mut preset = Preset {
+            name: String::from("Old"),
+            ..Default::default()
+        };
+        preset.params.insert(String::from("vol_slope"), Value::from(2.0));
+        preset.params.insert(String::from("env_slope_2"), Value::from(-4.0));
+        let targets = Targets::new(&preset, &params, &EnumIds::new());
+        assert!(targets.problems.is_empty(), "{:?}", targets.problems);
+        let map = params.param_map();
+        let plain = |id: &str| {
+            let (_, ptr, _) = map.iter().find(|(known, _, _)| known == id).unwrap();
+            let (_, target) = targets.values.iter().find(|(other, _)| other == ptr).unwrap();
+            unsafe { ptr.preview_plain(*target) }
+        };
+        assert_eq!([plain("vol_attack_slope"), plain("vol_decay_slope"), plain("vol_release_slope")], [0.5, 2.0, 2.0]);
+        assert_eq!(
+            [plain("env_attack_slope_2"), plain("env_decay_slope_2"), plain("env_release_slope_2")],
+            [-4.0, -1.0, -1.0]
+        );
+        // The others keep their defaults
+        assert_eq!([plain("fil1_attack_slope"), plain("fil1_decay_slope")], [0.25, 1.0]);
     }
 
     #[test]

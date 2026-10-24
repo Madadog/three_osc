@@ -8,6 +8,9 @@ use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
+use nih_plug::prelude::{FloatParam, Param, ParamSetter};
+
+use crate::params::EnvelopeParams;
 use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::filter::{
     ladder_oversampling, Filter, FilterContainer, FilterController, FilterModel, FilterType, LadderFilter,
@@ -32,8 +35,13 @@ const FILTER_HEIGHT: f32 = 76.0;
 /// background. Returns the display's response (for its hover text), a painter clipped to it and
 /// the area to plot in.
 fn frame(ui: &mut Ui, height: f32) -> (egui::Response, Painter, Rect) {
+    frame_sensing(ui, height, Sense::hover())
+}
+
+/// A [`frame()`] that senses what `sense` says, for displays that can be dragged.
+fn frame_sensing(ui: &mut Ui, height: f32, sense: Sense) -> (egui::Response, Painter, Rect) {
     let size = egui::vec2(ui.available_width(), height);
-    let (response, painter) = ui.allocate_painter(size, Sense::hover());
+    let (response, painter) = ui.allocate_painter(size, sense);
     let rect = response.rect;
     let visuals = ui.visuals();
     painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
@@ -76,27 +84,32 @@ fn x_at(rect: Rect, fraction: f32) -> f32 {
     rect.left() + fraction * rect.width()
 }
 
-/// One cycle of an oscillator's wave at its wavetable position. `phase` marks where the wave
-/// starts, when the start isn't fully random. A silent oscillator is drawn dimmed.
-pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: Option<f32>, silent: bool) {
+/// One cycle of an oscillator's wave at its wavetable position, starting where notes start
+/// (its Phase, in cycles), so the wave moves along as the Phase does. When a random part of a
+/// cycle is added to each note's start (Phase Rand, short of a whole cycle), the stretch the
+/// notes start in is shaded. A silent oscillator is drawn dimmed.
+pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase_rand: f32, silent: bool) {
     let (response, painter, rect) = frame(ui, WAVE_HEIGHT);
-    response.on_hover_text(if phase.is_some() {
-        "One cycle of the wave, at the wavetable position. The line marks where it starts (Phase)."
-    } else {
-        "One cycle of the wave, at the wavetable position."
-    });
+    response.on_hover_text(
+        "One cycle of the wave, at the wavetable position, from where notes start (the Phase). \
+         The shaded stretch is where Phase Rand lets them start.",
+    );
     let centre = rect.center().y;
     guide(&painter, Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
-    if let Some(phase) = phase {
-        let x = x_at(rect, phase);
-        guide(&painter, Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom()));
+    if phase_rand > 0.0 && phase_rand < 1.0 {
+        let random = Rect::from_x_y_ranges(rect.left()..=x_at(rect, phase_rand), rect.y_range());
+        painter.rect_filled(random, 0.0, SIGNAL_COLOR.gamma_multiply(0.08));
     }
     let cycle = preview.cycle(position);
-    // The cycle's first sample again at the end, where the next cycle starts
+    // From the phase on, interpolated between the cycle's samples, so that the wave moves
+    // smoothly with it, and round to where the next cycle starts
     let len = cycle.len();
+    let start = phase.rem_euclid(1.0) * len as f32;
     let points = (0..=len)
         .map(|i| {
-            let sample = cycle[i % len];
+            let at = start + i as f32;
+            let (index, fraction) = (at.floor() as usize, at.fract());
+            let sample = cycle[index % len] * (1.0 - fraction) + cycle[(index + 1) % len] * fraction;
             Pos2::new(x_at(rect, i as f32 / len as f32), centre - sample * rect.height() / 2.0)
         })
         .collect();
@@ -129,58 +142,92 @@ pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>) {
     }
 }
 
-/// An envelope's shape as the envelope display draws it: attack, decay, a stretch of sustain,
-/// then the release. The stages are as wide as the square roots of their times, so that short
-/// stages stay visible next to long ones; within a stage, time runs evenly, so the curves have
-/// their true shapes.
+/// An envelope's shape as the envelope display draws it: the attack, the decay down to the
+/// sustain level (a point, where held notes wait) and the release. Each stage is as wide as the
+/// square root of its time times a scale, which fits the stages to the width (except while a
+/// point is being dragged, when it stays as it was, so that the point follows the pointer), so
+/// that short stages stay visible next to long ones; within a stage, time runs evenly, so the
+/// curves have their true shapes.
 struct EnvelopeShape<'a> {
     envelope: &'a AdsrEnvelope,
-    /// Where the decay, the sustain and the release start, as fractions of the width.
-    boundaries: [f32; 3],
-    release_width: f32,
+    /// A stage's width (as a fraction of the display's) per square root of a second.
+    scale: f32,
+    /// The attack's, the decay's and the release's widths.
+    widths: [f32; 3],
 }
 
 impl<'a> EnvelopeShape<'a> {
-    /// The share of the width the sustain gets.
-    const SUSTAIN_WIDTH: f32 = 0.2;
+    /// When the decay or the release falls through less than this share of the height, its
+    /// slope handle works over the whole height instead, so that it stays in reach.
+    const MIN_SPAN: f32 = 0.1;
 
+    fn roots(envelope: &AdsrEnvelope) -> [f32; 3] {
+        [envelope.attack_time, envelope.decay_time, envelope.release_time].map(|time| time.max(0.0).sqrt())
+    }
+
+    /// The shape fitted to the width.
     fn new(envelope: &'a AdsrEnvelope) -> Self {
-        let times = [envelope.attack_time, envelope.decay_time, envelope.release_time];
-        let roots = times.map(|time| time.max(0.0).sqrt());
-        let total: f32 = roots.iter().sum();
-        let sustain = if total > 0.0 { Self::SUSTAIN_WIDTH } else { 1.0 };
-        let [attack, decay, release] = roots.map(|root| if total > 0.0 { root / total * (1.0 - sustain) } else { 0.0 });
+        let total: f32 = Self::roots(envelope).iter().sum();
+        Self::with_scale(envelope, if total > 0.0 { 1.0 / total } else { 0.0 })
+    }
+
+    fn with_scale(envelope: &'a AdsrEnvelope, scale: f32) -> Self {
         Self {
             envelope,
-            boundaries: [attack, attack + decay, attack + decay + sustain],
-            release_width: release,
+            scale,
+            widths: Self::roots(envelope).map(|root| root * scale),
+        }
+    }
+
+    fn decay_start(&self) -> f32 {
+        self.widths[0]
+    }
+
+    /// Where the sustain point is, and the release starts.
+    fn release_start(&self) -> f32 {
+        self.widths[0] + self.widths[1]
+    }
+
+    fn end(&self) -> f32 {
+        self.release_start() + self.widths[2]
+    }
+
+    /// How long a stage this wide lasts, in seconds.
+    fn time_for(&self, width: f32) -> f32 {
+        if self.scale > 0.0 {
+            (width.max(0.0) / self.scale).powi(2)
+        } else {
+            0.0
+        }
+    }
+
+    /// Where a held note is across the width, `time` seconds into it: in the sustain, at the
+    /// sustain point.
+    fn held_fraction(&self, time: f32) -> f32 {
+        let envelope = self.envelope;
+        let (attack, decay) = (envelope.attack_time, envelope.decay_time);
+        if time < attack {
+            self.widths[0] * time / attack
+        } else if time - attack < decay {
+            self.decay_start() + self.widths[1] * (time - attack) / decay
+        } else {
+            self.release_start()
         }
     }
 
     /// Where a note is on the display, `time` seconds into it and released at `released`
-    /// seconds (if it has been): the fraction of the width and its level. A held note in the
-    /// sustain is at the sustain's start, and a released note runs through the release (from
-    /// its own level, which is below the drawn curve if it was released before the sustain).
-    /// `None` once the release is over.
+    /// seconds (if it has been): the fraction of the width and its level. A released note
+    /// carries on from where it was when it was released, across as far as the release is
+    /// wide and down from its own level (so a note released before the sustain falls on its
+    /// own, lower, curve). `None` once the release is over.
     fn locate(&self, time: f32, released: Option<f32>) -> Option<(f32, f32)> {
         let envelope = self.envelope;
-        let (attack, decay) = (envelope.attack_time, envelope.decay_time);
-        let [decay_start, sustain_start, release_start] = self.boundaries;
         match released {
-            None => {
-                let fraction = if time < attack {
-                    decay_start * time / attack
-                } else if time - attack < decay {
-                    decay_start + (sustain_start - decay_start) * (time - attack) / decay
-                } else {
-                    sustain_start
-                };
-                Some((fraction, envelope.sample_held(time)))
-            }
+            None => Some((self.held_fraction(time), envelope.sample_held(time))),
             Some(released) => {
                 let since = time - released;
                 (since < envelope.release_time).then(|| {
-                    let fraction = release_start + self.release_width * since / envelope.release_time;
+                    let fraction = self.held_fraction(released) + self.widths[2] * since / envelope.release_time;
                     (fraction, envelope.sample_released(released, time))
                 })
             }
@@ -191,49 +238,306 @@ impl<'a> EnvelopeShape<'a> {
     fn level(&self, fraction: f32) -> f32 {
         let envelope = self.envelope;
         let (attack, decay) = (envelope.attack_time, envelope.decay_time);
-        let [decay_start, sustain_start, release_start] = self.boundaries;
+        let (decay_start, release_start) = (self.decay_start(), self.release_start());
         if fraction < decay_start {
             envelope.sample_held(attack * fraction / decay_start)
-        } else if fraction < sustain_start {
-            envelope.sample_held(attack + decay * (fraction - decay_start) / (sustain_start - decay_start))
-        } else if fraction < release_start || self.release_width <= 0.0 {
+        } else if fraction < release_start {
+            envelope.sample_held(attack + decay * (fraction - decay_start) / self.widths[1])
+        } else if self.widths[2] <= 0.0 {
             envelope.sample_held(attack + decay)
         } else {
             let released = attack + decay;
-            let into = ((fraction - release_start) / self.release_width).min(1.0);
+            let into = ((fraction - release_start) / self.widths[2]).min(1.0);
             envelope.sample_released(released, released + envelope.release_time * into)
+        }
+    }
+
+    /// Whether a slope handle's curve falls through too little of the height to bend, so that
+    /// the handle works over the whole height instead (see [`decay_span()`]).
+    ///
+    /// [`decay_span()`]: Self::decay_span()
+    fn spans_whole_height(&self, handle: EnvelopeHandle) -> bool {
+        let sustain = self.envelope.sustain_level;
+        match handle {
+            EnvelopeHandle::DecaySlope => 1.0 - sustain < Self::MIN_SPAN,
+            EnvelopeHandle::ReleaseSlope => sustain < Self::MIN_SPAN,
+            _ => false,
+        }
+    }
+
+    /// The curve a slope handle that works over the whole height bends, from the top of the
+    /// height to the bottom across its stage: the fraction of the width and the level at
+    /// `steps` points.
+    fn whole_height_curve(&self, handle: EnvelopeHandle, steps: usize) -> Vec<(f32, f32)> {
+        let envelope = self.envelope;
+        let (start, width, exponent) = match handle {
+            EnvelopeHandle::DecaySlope => (self.decay_start(), self.widths[1], envelope.decay_slope),
+            _ => (self.release_start(), self.widths[2], envelope.release_slope),
+        };
+        (0..=steps)
+            .map(|step| {
+                let into = step as f32 / steps as f32;
+                (start + width * into, (1.0 - into).powf(exponent))
+            })
+            .collect()
+    }
+
+    /// The levels the decay's slope handle moves between: the decay's, or the whole height
+    /// when that is too small to reach.
+    fn decay_span(&self) -> (f32, f32) {
+        let sustain = self.envelope.sustain_level;
+        if 1.0 - sustain < Self::MIN_SPAN {
+            (1.0, 0.0)
+        } else {
+            (1.0, sustain)
+        }
+    }
+
+    /// The levels the release's slope handle moves between, like [`decay_span()`].
+    ///
+    /// [`decay_span()`]: Self::decay_span()
+    fn release_span(&self) -> (f32, f32) {
+        let sustain = self.envelope.sustain_level;
+        if sustain < Self::MIN_SPAN {
+            (1.0, 0.0)
+        } else {
+            (sustain, 0.0)
+        }
+    }
+
+    /// Where a handle is: the fraction of the width and the level. A slope handle sits on its
+    /// stage's curve, halfway through the stage.
+    fn handle(&self, handle: EnvelopeHandle) -> (f32, f32) {
+        let envelope = self.envelope;
+        // Halfway through, a stage's curve has gone 0.5 to the power of its exponent of the way
+        let halfway = |exponent: f32| 0.5_f32.powf(exponent);
+        let between = |(top, bottom): (f32, f32), exponent: f32| bottom + (top - bottom) * halfway(exponent);
+        match handle {
+            EnvelopeHandle::Attack => (self.decay_start(), 1.0),
+            EnvelopeHandle::Sustain => (self.release_start(), envelope.sustain_level),
+            EnvelopeHandle::Release => (self.end(), 0.0),
+            EnvelopeHandle::AttackSlope => (self.widths[0] / 2.0, halfway(envelope.attack_slope)),
+            EnvelopeHandle::DecaySlope => (
+                self.decay_start() + self.widths[1] / 2.0,
+                between(self.decay_span(), envelope.decay_slope),
+            ),
+            EnvelopeHandle::ReleaseSlope => (
+                self.release_start() + self.widths[2] / 2.0,
+                between(self.release_span(), envelope.release_slope),
+            ),
         }
     }
 }
 
-/// An envelope's shape, see [`EnvelopeShape`], with a dot for each note playing: its time into
-/// the note and the time it was released at (if it has been), in seconds.
-pub fn envelope(ui: &mut Ui, envelope: &AdsrEnvelope, color: Color32, notes: &[(f32, Option<f32>)]) {
-    let (response, painter, rect) = frame(ui, ENVELOPE_HEIGHT);
-    response.on_hover_text(
-        "The envelope's shape: attack, decay, sustain (for as long as the note is held) and \
-         release. The stages are drawn as wide as the square roots of their times, so that short \
-         ones stay visible next to long ones. The dots are the notes playing.",
-    );
-    let shape = EnvelopeShape::new(envelope);
+/// The points of an envelope display that can be dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeHandle {
+    /// The top of the attack: its time.
+    Attack,
+    /// The sustain point: the decay's time across, and the sustain level up and down.
+    Sustain,
+    /// The end of the release: its time.
+    Release,
+    /// The middle of a stage's curve: its slope.
+    AttackSlope,
+    DecaySlope,
+    ReleaseSlope,
+}
+
+impl EnvelopeHandle {
+    /// The points first, which win over the slope handles when they overlap.
+    const ALL: [Self; 6] = [
+        Self::Attack,
+        Self::Sustain,
+        Self::Release,
+        Self::AttackSlope,
+        Self::DecaySlope,
+        Self::ReleaseSlope,
+    ];
+
+    fn is_slope(self) -> bool {
+        matches!(self, Self::AttackSlope | Self::DecaySlope | Self::ReleaseSlope)
+    }
+
+    /// The parameters it moves.
+    fn params(self, params: &EnvelopeParams) -> Vec<&FloatParam> {
+        match self {
+            Self::Attack => vec![&params.attack],
+            Self::Sustain => vec![&params.decay, &params.sustain],
+            Self::Release => vec![&params.release],
+            Self::AttackSlope => vec![&params.attack_slope],
+            Self::DecaySlope => vec![&params.decay_slope],
+            Self::ReleaseSlope => vec![&params.release_slope],
+        }
+    }
+
+    fn cursor(self) -> egui::CursorIcon {
+        match self {
+            Self::Attack | Self::Release => egui::CursorIcon::ResizeHorizontal,
+            Self::Sustain => egui::CursorIcon::Move,
+            _ => egui::CursorIcon::ResizeVertical,
+        }
+    }
+}
+
+/// A drag of an envelope display's handle, kept in egui's memory while it lasts.
+#[derive(Debug, Clone, Copy)]
+struct EnvelopeDrag {
+    handle: EnvelopeHandle,
+    /// The shape's scale when the drag started, kept so that the dragged point follows the
+    /// pointer.
+    scale: f32,
+    /// Where the drag started, and the dragged slope's value then.
+    start: Pos2,
+    start_slope: f32,
+}
+
+/// How far a pixel of dragging moves a slope.
+const SLOPE_PER_PIXEL: f32 = 0.04;
+/// Stages narrower than this many pixels don't show their slope handles, which would sit on
+/// top of the points.
+const MIN_BENDABLE_PIXELS: f32 = 6.0;
+/// How close to a handle the pointer has to be to take hold of it, in pixels.
+const GRAB_RADIUS: f32 = 7.0;
+
+/// An envelope's shape, see [`EnvelopeShape`], with a dot for each note playing (its time into
+/// the note and the time it was released at, if it has been, in seconds), and handles to drag:
+/// the attack's top, the sustain point and the release's end set the times and the sustain
+/// level, and a handle in the middle of each stage's curve bends it (its slope). The changes
+/// go through the host, as moving the sliders would.
+pub fn envelope(
+    ui: &mut Ui,
+    envelope: &AdsrEnvelope,
+    color: Color32,
+    notes: &[(f32, Option<f32>)],
+    params: &EnvelopeParams,
+    setter: &ParamSetter,
+) {
+    let (response, painter, rect) = frame_sensing(ui, ENVELOPE_HEIGHT, Sense::click_and_drag());
+    let drag_id = response.id.with("drag");
+    let drag: Option<EnvelopeDrag> = ui.memory(|memory| memory.data.get_temp(drag_id));
+    let shape = match drag {
+        Some(drag) => EnvelopeShape::with_scale(envelope, drag.scale),
+        None => EnvelopeShape::new(envelope),
+    };
     let bottom = rect.bottom();
-    for boundary in shape.boundaries {
+    let to_screen = |(fraction, level): (f32, f32)| Pos2::new(x_at(rect, fraction), bottom - level * rect.height());
+    // A slope handle shows when its stage is wide enough to bend, and the decay's when there's
+    // a decay at all
+    let bendable = |stage: usize| shape.widths[stage] * rect.width() >= MIN_BENDABLE_PIXELS;
+    let shown = |handle: &EnvelopeHandle| match handle {
+        EnvelopeHandle::AttackSlope => bendable(0),
+        EnvelopeHandle::DecaySlope => bendable(1) && envelope.sustain_level < 0.999,
+        EnvelopeHandle::ReleaseSlope => bendable(2),
+        _ => true,
+    };
+    let nearest = |pointer: Pos2| {
+        EnvelopeHandle::ALL
+            .into_iter()
+            .filter(shown)
+            .map(|handle| (handle, to_screen(shape.handle(handle)).distance(pointer)))
+            .filter(|(_, distance)| *distance <= GRAB_RADIUS)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(handle, _)| handle)
+    };
+    let hovered = response.hover_pos().and_then(nearest);
+
+    // Dragging: a point follows the pointer across (and the sustain point up and down) at the
+    // scale the drag started at, and a slope moves with how far the pointer has moved up or down
+    if response.drag_started() {
+        let origin = ui.input(|input| input.pointer.press_origin());
+        if let Some((handle, start)) = origin.and_then(|origin| nearest(origin).map(|handle| (handle, origin))) {
+            let start_slope = match handle {
+                EnvelopeHandle::AttackSlope => params.attack_slope.value(),
+                EnvelopeHandle::DecaySlope => params.decay_slope.value(),
+                EnvelopeHandle::ReleaseSlope => params.release_slope.value(),
+                _ => 0.0,
+            };
+            for param in handle.params(params) {
+                setter.begin_set_parameter(param);
+            }
+            let drag = EnvelopeDrag { handle, scale: shape.scale, start, start_slope };
+            ui.memory_mut(|memory| memory.data.insert_temp(drag_id, drag));
+        }
+    }
+    if let (Some(drag), Some(pointer)) = (drag, response.interact_pointer_pos()) {
+        let fraction = (pointer.x - rect.left()) / rect.width();
+        let level = ((bottom - pointer.y) / rect.height()).clamp(0.0, 1.0);
+        let set = |param: &FloatParam, value: f32| setter.set_parameter(param, param.preview_plain(param.preview_normalized(value)));
+        // Down makes the decay and release punchier, up the attack
+        let slope = |sign: f32| drag.start_slope + sign * (pointer.y - drag.start.y) * SLOPE_PER_PIXEL;
+        match drag.handle {
+            EnvelopeHandle::Attack => set(&params.attack, shape.time_for(fraction)),
+            EnvelopeHandle::Sustain => {
+                set(&params.decay, shape.time_for(fraction - shape.decay_start()));
+                set(&params.sustain, level);
+            }
+            EnvelopeHandle::Release => set(&params.release, shape.time_for(fraction - shape.release_start())),
+            EnvelopeHandle::AttackSlope => set(&params.attack_slope, slope(-1.0)),
+            EnvelopeHandle::DecaySlope => set(&params.decay_slope, slope(1.0)),
+            EnvelopeHandle::ReleaseSlope => set(&params.release_slope, slope(1.0)),
+        }
+    }
+    if response.drag_stopped() {
+        if let Some(drag) = drag {
+            for param in drag.handle.params(params) {
+                setter.end_set_parameter(param);
+            }
+            ui.memory_mut(|memory| memory.data.remove::<EnvelopeDrag>(drag_id));
+        }
+    }
+    // A double click puts a handle's controls back to their defaults
+    if response.double_clicked() {
+        if let Some(handle) = hovered {
+            for param in handle.params(params) {
+                setter.begin_set_parameter(param);
+                setter.set_parameter(param, param.default_plain_value());
+                setter.end_set_parameter(param);
+            }
+        }
+    }
+    let active = drag.map(|drag| drag.handle).or(hovered);
+    if let Some(handle) = active {
+        ui.ctx().set_cursor_icon(handle.cursor());
+    }
+    // (Not while dragging, when it would only get in the way)
+    if drag.is_none() {
+        response.on_hover_text(
+            "The envelope's shape: attack, decay down to the sustain level (where held notes \
+             wait) and release. The stages are drawn as wide as the square roots of their times, \
+             so that short ones stay visible next to long ones. Drag the points to set the times \
+             and the sustain level, and the small handles in the middle of the stages to bend \
+             their curves (their slopes: up for a punchier attack, down for a punchier decay or \
+             release). Double-click one to reset it. The dots are the notes playing.",
+        );
+    }
+
+    for boundary in [shape.decay_start(), shape.release_start()] {
         let x = x_at(rect, boundary);
         guide(&painter, Pos2::new(x, rect.top()), Pos2::new(x, bottom));
     }
     // A point per pixel, plus the stage boundaries themselves for crisp corners
     let steps = (rect.width() as usize).max(2);
     let mut fractions: Vec<f32> = (0..=steps).map(|step| step as f32 / steps as f32).collect();
-    fractions.extend(shape.boundaries);
+    fractions.extend([shape.decay_start(), shape.release_start(), shape.end()].into_iter().filter(|fraction| *fraction <= 1.0));
     fractions.sort_by(f32::total_cmp);
-    let points = fractions
-        .into_iter()
-        .map(|fraction| Pos2::new(x_at(rect, fraction), bottom - shape.level(fraction) * rect.height()))
-        .collect();
+    let points = fractions.into_iter().map(|fraction| to_screen((fraction, shape.level(fraction)))).collect();
     curve(&painter, points, bottom, color, 1.5);
+    // The curve a whole height slope handle bends, while it is hovered or dragged
+    if let Some(handle) = active.filter(|handle| shape.spans_whole_height(*handle)) {
+        let points = shape.whole_height_curve(handle, 32).into_iter().map(to_screen).collect();
+        painter.add(Shape::line(points, Stroke::new(1.0_f32, color.gamma_multiply(0.5))));
+    }
+    for handle in EnvelopeHandle::ALL.into_iter().filter(shown) {
+        let at = to_screen(shape.handle(handle));
+        let lit = active == Some(handle);
+        let radius = if handle.is_slope() { 2.5 } else { 3.5 };
+        let fill = if lit { color } else { ui.visuals().extreme_bg_color };
+        painter.circle(at, radius + if lit { 1.0 } else { 0.0 }, fill, Stroke::new(1.0_f32, color));
+    }
     for &(time, released) in notes {
-        if let Some((fraction, level)) = shape.locate(time, released) {
-            live_dot(&painter, Pos2::new(x_at(rect, fraction), bottom - level * rect.height()));
+        if let Some(located) = shape.locate(time, released) {
+            live_dot(&painter, to_screen(located));
         }
     }
 }
@@ -428,6 +732,8 @@ pub struct FilterResponse {
     /// The response at each point, in dB, and at the envelope's peak.
     levels: Vec<f32>,
     envelope_levels: Option<Vec<f32>>,
+    /// The response at the newest note's cutoff and resonance, and what it was measured for.
+    live: Option<(FilterSettings, Vec<f32>)>,
     fft: Option<Arc<dyn Fft<f32>>>,
 }
 
@@ -445,8 +751,33 @@ impl FilterResponse {
             settings: None,
             levels: Vec::new(),
             envelope_levels: None,
+            live: None,
             fft: None,
         }
+    }
+
+    /// The response at a playing note's cutoff and resonance. A cutoff within a quarter of a
+    /// semitone, and a resonance within a hundredth, of the last one's keeps that response
+    /// rather than measuring again (once a frame at most, and at most half a millisecond, see
+    /// `benchmark_filter_response()`).
+    fn update_live(&mut self, settings: FilterSettings, cutoff: f32, resonance: f32) -> &[f32] {
+        let cutoff = ((cutoff.max(1.0).log2() * 48.0).round() / 48.0).exp2();
+        let resonance = (resonance * 100.0).round() / 100.0;
+        let live = FilterSettings {
+            cutoff,
+            resonance,
+            envelope_cutoff: None,
+            ..settings
+        };
+        if self.live.as_ref().map(|(measured, _)| *measured) != Some(live) {
+            let fft = self
+                .fft
+                .get_or_insert_with(|| FftPlanner::new().plan_fft_forward(Self::LEN))
+                .clone();
+            let levels = Self::measure(&live, &[cutoff], &*fft).remove(0);
+            self.live = Some((live, levels));
+        }
+        self.live.as_ref().map(|(_, levels)| &levels[..]).unwrap_or_default()
     }
 
     fn update(&mut self, settings: FilterSettings) {
@@ -592,16 +923,17 @@ fn process_blocks(filters: &mut [FilterContainer], blocks: &mut [[f32; FilterRes
 
 /// The filter's frequency response, from 20 Hz to 20 kHz, with its cutoff marked, and the
 /// response at the peak of the filter envelope drawn more faintly when the envelope moves the
-/// cutoff. `live_cutoff` is the newest note's cutoff, with its envelope and modulation.
-pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterResponse, live_cutoff: Option<f32>) {
+/// cutoff. `live` is the newest note's cutoff and resonance, with its envelope, keytracking and
+/// modulation: while a note plays, its response is drawn over the controls' and moves with it.
+pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterResponse, live: Option<(f32, f32)>) {
     response.update(settings);
     let (hover, painter, rect) = frame(ui, FILTER_HEIGHT);
     hover.on_hover_text(
         "The filter's frequency response, from 20 Hz to 20 kHz (the line marks the cutoff), \
          measured from the filter itself with a quiet signal, so the drive's distortion doesn't \
          show. The fainter curve is the response at the peak of the filter envelope. With \
-         keytracking, the cutoff is for the note A4. The dot is the newest note's cutoff, as \
-         its envelope, keytracking and modulation move it.",
+         keytracking, the cutoff is for the note A4. While notes play, the light curve is the \
+         newest note's response, with its envelope, keytracking and modulation moving it.",
     );
     let x_for = |hz: f32| x_at(rect, (hz / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln());
     let y_for = |db: f32| {
@@ -631,24 +963,30 @@ pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterRespon
             .map(|(point, level)| Pos2::new(x_for(point_frequency(point)), y_for(*level)))
             .collect()
     };
+    let filtered = !matches!(settings.model, FilterModel::None);
+    let live = live.filter(|_| filtered);
     if let Some(levels) = &response.envelope_levels {
         painter.add(Shape::line(points(levels), Stroke::new(1.0_f32, SIGNAL_COLOR.gamma_multiply(0.45))));
     }
-    if !matches!(settings.model, FilterModel::None) {
+    if filtered {
         let x = x_for(settings.cutoff.clamp(LOW_HZ, HIGH_HZ));
         painter.line_segment(
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
             Stroke::new(1.0_f32, SIGNAL_COLOR.gamma_multiply(0.5)),
         );
     }
-    curve(&painter, points(&response.levels), rect.bottom(), SIGNAL_COLOR, 1.5);
-    if let Some(cutoff) = live_cutoff.filter(|_| !matches!(settings.model, FilterModel::None)) {
+    // The controls' response, behind the playing note's when there is one
+    let levels = response.levels.clone();
+    let color = if live.is_some() { SIGNAL_COLOR.gamma_multiply(0.6) } else { SIGNAL_COLOR };
+    curve(&painter, points(&levels), rect.bottom(), color, 1.5);
+    if let Some((cutoff, resonance)) = live {
+        let levels = response.update_live(settings, cutoff, resonance).to_vec();
+        painter.add(Shape::line(points(&levels), Stroke::new(1.5_f32, LIVE_COLOR)));
+        // A dot on it at the note's cutoff
         let x = x_for(cutoff.clamp(LOW_HZ, HIGH_HZ));
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(1.0_f32, LIVE_COLOR.gamma_multiply(0.6)),
-        );
-        live_dot(&painter, Pos2::new(x, y_for(0.0)));
+        let point = (((cutoff / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln()) * (RESPONSE_POINTS - 1) as f32).round();
+        let level = levels.get(point.clamp(0.0, (RESPONSE_POINTS - 1) as f32) as usize).copied().unwrap_or(0.0);
+        live_dot(&painter, Pos2::new(x, y_for(level)));
     }
 }
 
@@ -714,31 +1052,56 @@ mod tests {
     use super::*;
     use crate::synth::oscillator::{builtin_spectra, CycleRenderer};
 
-    /// The envelope display goes through the envelope's levels at the stage boundaries.
+    /// The envelope display goes through the envelope's levels at the stage boundaries, with
+    /// the sustain a point, and puts its handles at the corners and on the curves.
     #[test]
     fn envelope_shape_follows_the_envelope() {
         // Attack, decay, release, sustain, slope
         let envelope = AdsrEnvelope::new(0.01, 0.25, 0.3, 0.6, 1.0);
         let shape = EnvelopeShape::new(&envelope);
-        let [decay_start, sustain_start, release_start] = shape.boundaries;
-        assert!(0.0 < decay_start && decay_start < sustain_start && sustain_start < release_start);
-        assert!(release_start < 1.0);
-        // The stages are as wide as the square roots of their times
-        let width = |time: f32| time.sqrt() / (0.01_f32.sqrt() + 0.25_f32.sqrt() + 0.3_f32.sqrt()) * 0.8;
+        let (decay_start, release_start) = (shape.decay_start(), shape.release_start());
+        assert!(0.0 < decay_start && decay_start < release_start && release_start < 1.0);
+        assert!((shape.end() - 1.0).abs() < 1e-6);
+        // The stages are as wide as the square roots of their times, and fill the width
+        let width = |time: f32| time.sqrt() / (0.01_f32.sqrt() + 0.25_f32.sqrt() + 0.3_f32.sqrt());
         assert!((decay_start - width(0.01)).abs() < 1e-6);
-        assert!((sustain_start - decay_start - width(0.25)).abs() < 1e-6);
-        assert!((shape.release_width - width(0.3)).abs() < 1e-6);
+        assert!((release_start - decay_start - width(0.25)).abs() < 1e-6);
+        assert!((shape.widths[2] - width(0.3)).abs() < 1e-6);
+        assert!((shape.time_for(width(0.25)) - 0.25).abs() < 1e-5);
 
         // (The envelope's power function is approximate)
         assert!(shape.level(0.0) < 1e-6);
         assert!((shape.level(decay_start) - 1.0).abs() < 1e-4);
-        assert!((shape.level(sustain_start) - 0.6).abs() < 1e-4);
-        assert!((shape.level((sustain_start + release_start) / 2.0) - 0.6).abs() < 1e-6);
         assert!((shape.level(release_start) - 0.6).abs() < 1e-4);
         assert!(shape.level(1.0) < 1e-6);
         // The decay falls and the release falls
         assert!(shape.level(decay_start + 0.05) < 1.0);
         assert!(shape.level(release_start + 0.05) < 0.6);
+
+        // The points are at the corners, and the slope handles on the curves, halfway across
+        let close = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-3;
+        assert!(close(shape.handle(EnvelopeHandle::Attack), (decay_start, 1.0)));
+        assert!(close(shape.handle(EnvelopeHandle::Sustain), (release_start, 0.6)));
+        assert!(close(shape.handle(EnvelopeHandle::Release), (1.0, 0.0)));
+        for (handle, start, end) in [
+            (EnvelopeHandle::AttackSlope, 0.0, decay_start),
+            (EnvelopeHandle::DecaySlope, decay_start, release_start),
+            (EnvelopeHandle::ReleaseSlope, release_start, 1.0),
+        ] {
+            let (fraction, level) = shape.handle(handle);
+            assert!((fraction - (start + end) / 2.0).abs() < 1e-6, "{handle:?}");
+            assert!((shape.level(fraction) - level).abs() < 2e-3, "{handle:?}");
+        }
+
+        // Without a sustain to release from, the release's handle bends a curve over the whole
+        // height, through the handle
+        let plucked = AdsrEnvelope::new(0.0, 0.3, 0.2, 0.0, 1.0);
+        let shape = EnvelopeShape::new(&plucked);
+        assert!(shape.spans_whole_height(EnvelopeHandle::ReleaseSlope));
+        assert!(!shape.spans_whole_height(EnvelopeHandle::DecaySlope));
+        let curve = shape.whole_height_curve(EnvelopeHandle::ReleaseSlope, 32);
+        assert!(close(curve[16], shape.handle(EnvelopeHandle::ReleaseSlope)));
+        assert!(close(curve[0], (shape.release_start(), 1.0)) && close(curve[32], (shape.end(), 0.0)));
 
         // A zero length attack starts at the top, and without any stages it's all sustain
         let instant = AdsrEnvelope::new(0.0, 0.5, 0.1, 0.2, 1.0);
@@ -747,6 +1110,69 @@ mod tests {
         let shape = EnvelopeShape::new(&flat);
         for fraction in [0.0, 0.3, 1.0] {
             assert!((shape.level(fraction) - 0.7).abs() < 1e-6, "{fraction}");
+        }
+    }
+
+    /// Notes move through the envelope display: a held one waits at the sustain point, and a
+    /// released one carries on from wherever it was, rather than jumping to the release.
+    #[test]
+    fn released_notes_carry_on_from_where_they_were() {
+        let envelope = AdsrEnvelope::new(0.1, 0.25, 0.4, 0.6, 1.0);
+        let shape = EnvelopeShape::new(&envelope);
+        let held = |time: f32| shape.locate(time, None).unwrap();
+        assert!((held(0.05).0 - shape.decay_start() / 2.0).abs() < 1e-6);
+        assert_eq!(held(10.0).0, shape.release_start());
+        // Released halfway through the attack: no jump, then as far across as the release is
+        // wide, falling to nothing
+        for released in [0.05, 0.2, 3.0] {
+            let at_release = shape.locate(released, Some(released)).unwrap();
+            assert!((at_release.0 - held(released).0).abs() < 1e-6 && (at_release.1 - held(released).1).abs() < 1e-4);
+            let halfway = shape.locate(released + 0.2, Some(released)).unwrap();
+            assert!((halfway.0 - (held(released).0 + shape.widths[2] / 2.0)).abs() < 1e-6);
+            assert!(halfway.1 < at_release.1);
+            assert!(shape.locate(released + 0.4, Some(released)).is_none());
+        }
+        // While a point is dragged the scale stays put: times map to the same widths
+        let frozen = EnvelopeShape::with_scale(&envelope, shape.scale);
+        assert_eq!(frozen.widths, shape.widths);
+        assert!((frozen.time_for(frozen.widths[1]) - 0.25).abs() < 1e-5);
+    }
+
+    /// The playing note's response follows its cutoff and resonance, without measuring again
+    /// for a cutoff that has barely moved.
+    #[test]
+    fn live_filter_response_follows_the_note() {
+        let settings = FilterSettings::new(FilterModel::SvfSimperFilter, FilterType::Lowpass, 1000.0, 0.7, 0.0, 44100.0, 1);
+        let mut response = FilterResponse::new();
+        let at_2k = response.update_live(settings, 2000.0, 0.7).to_vec();
+        let measured = response.live.as_ref().unwrap().0;
+        response.update_live(settings, 2001.0, 0.7);
+        assert_eq!(response.live.as_ref().unwrap().0, measured);
+        // An octave higher lets more through above the cutoff, and resonance makes a peak
+        let at_4k = response.update_live(settings, 4000.0, 0.7).to_vec();
+        assert!(level_at(&at_4k, 4000.0) > level_at(&at_2k, 4000.0) + 6.0);
+        let resonant = response.update_live(settings, 2000.0, 8.0).to_vec();
+        assert!(level_at(&resonant, 2000.0) > level_at(&at_2k, 2000.0) + 6.0);
+    }
+
+    /// How long measuring a filter's response takes, for each model at a few settings, which
+    /// is what animating the curve costs for each new cutoff or resonance.
+    #[test]
+    #[ignore]
+    fn benchmark_filter_response() {
+        let fft = FftPlanner::new().plan_fft_forward(FilterResponse::LEN);
+        println!();
+        for model in [FilterModel::SvfSimperFilter, FilterModel::RcFilter, FilterModel::LadderFilter] {
+            for (cutoff, resonance) in [(100.0, 0.7), (1000.0, 0.7), (1000.0, 5.0), (10000.0, 0.7)] {
+                let settings = FilterSettings::new(model, FilterType::Lowpass, cutoff, resonance, 0.0, 44100.0, 1);
+                let start = std::time::Instant::now();
+                let rounds = 20;
+                for _ in 0..rounds {
+                    std::hint::black_box(FilterResponse::measure(&settings, &[cutoff], &*fft));
+                }
+                let ms = start.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+                println!("{model:?} at {cutoff} Hz, resonance {resonance}: {ms:.3} ms");
+            }
         }
     }
 

@@ -180,7 +180,7 @@ impl AdsrEnvelope {
         let since_attack = index - attack;
         let sustain = splat(self.sustain_level);
         let decay = |since_attack: f32x8| {
-            let curve = x8::pow(splat(1.0) - since_attack / splat(self.decay_time), splat(self.slope));
+            let curve = x8::pow(splat(1.0) - since_attack / splat(self.decay_time), splat(self.decay_slope));
             curve * (splat(1.0) - sustain) + sustain
         };
         // The times go up, so when the first is past the attack, they all are, and when the
@@ -199,7 +199,7 @@ impl AdsrEnvelope {
         let in_decay = since_attack.simd_lt(splat(self.decay_time));
         // One power for whichever stage each sample is in
         let base = in_attack.select(index / attack, splat(1.0) - since_attack / splat(self.decay_time));
-        let exponent = in_attack.select(splat(self.attack_slope), splat(self.slope));
+        let exponent = in_attack.select(splat(self.attack_slope), splat(self.decay_slope));
         let curve = x8::pow(base, exponent);
         let decaying = curve * (splat(1.0) - sustain) + sustain;
         in_attack.select(curve, in_decay.select(decaying, sustain))
@@ -214,7 +214,7 @@ impl AdsrEnvelope {
             return f32x8::ZERO;
         }
         let since = index - splat(release_index);
-        let curve = x8::pow(splat(1.0) - since / splat(self.release_time), splat(self.slope)) * splat(level);
+        let curve = x8::pow(splat(1.0) - since / splat(self.release_time), splat(self.release_slope)) * splat(level);
         since.simd_ge(splat(self.release_time)).select(f32x8::ZERO, curve)
     }
 }
@@ -554,8 +554,10 @@ impl Voice {
             // What can change within the block. An oscillator without any of it is rendered
             // from its first sample's values, which are all that is filled in for it.
             let osc_pitch_mod = modulation(ModTarget::osc_pitch(i));
-            let octave_mod = modulation(ModTarget::osc_octave(i));
-            let multiplier_mod = modulation(ModTarget::osc_multiplier(i));
+            let (octave_mod, multiplier_mod) = match context.stepped[i] {
+                true => (modulation(ModTarget::osc_octave(i)), modulation(ModTarget::osc_multiplier(i))),
+                false => (None, None),
+            };
             let stepped = octave_mod.is_some() || multiplier_mod.is_some();
             let amp_mod = modulation(ModTarget::osc_amp(i));
             let position_mod = modulation(ModTarget::osc_position(i));
@@ -837,10 +839,9 @@ impl Voice {
             }
         }
         // The oscillators, a block's worth of samples late (see `Voice::osc_history`)
-        for (i, history) in self.osc_history.iter().enumerate() {
-            let source = ModSource::osc(i);
-            if used(source) {
-                for (v, values) in sources[source.to_index()].iter_mut().enumerate().take(vectors) {
+        if context.any_sourced {
+            for (i, history) in self.osc_history.iter().enumerate().filter(|(i, _)| context.sourced[*i]) {
+                for (v, values) in sources[ModSource::osc(i).to_index()].iter_mut().enumerate().take(vectors) {
                     *values = f32x8::new(history[v * 8..][..8].try_into().unwrap());
                 }
             }
@@ -931,6 +932,10 @@ mod tests {
                 envelope.set_slope(slope);
                 envelopes.push(envelope);
             }
+            // Each stage its own way
+            let mut envelope = AdsrEnvelope::new(attack, decay, 0.004, sustain, 0.0);
+            envelope.set_slopes([2.0, -1.5, 4.0]);
+            envelopes.push(envelope);
         }
         envelopes
     }

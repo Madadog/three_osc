@@ -725,10 +725,15 @@ impl LadderFilter {
     /// carrying on from where it was: the resampling filters are redesigned, and start as
     /// though the input and the output had been steady at their last values rather than from
     /// silence.
+    #[inline]
     pub fn set_oversampling_factor(&mut self, factor: i32) {
-        if factor == self.oversampling_factor {
-            return;
+        if factor != self.oversampling_factor {
+            self.change_oversampling_factor(factor);
         }
+    }
+    #[cold]
+    #[inline(never)]
+    fn change_oversampling_factor(&mut self, factor: i32) {
         self.oversampling_factor = factor;
         self.update_decimator();
         self.set_integration_rate();
