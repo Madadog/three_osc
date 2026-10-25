@@ -1,40 +1,34 @@
 //! The plugin's GUI, built with egui through `nih_plug_egui`.
 //!
-//! It's a deliberately simple "everything on one page" layout: the three oscillators, the
-//! LFOs and the output's spectrogram and meters (see [`analyser`]) across the top, and the
-//! filter, envelopes, global controls and the modulation matrix underneath. The effects are on
-//! a tab that takes the oscillators' place, so that the modulation sources stay in view, and the
-//! presets and the tuning are in the title bar (see [`title_bar`] and [`tuning_window`]). Every control is a
-//! [`ParamSlider`] (or a combo box for the enumerated parameters) bound directly to a
-//! parameter, so host automation and the GUI stay in sync. Hovering a control's label shows
-//! what it does.
+//! It comes in two themes (see [`theme`]), each a layout of the same controls with its own
+//! look: Studio, knobs grouped in cards that stretch to fill the window (see [`studio`]), and
+//! Classic, the original layout of sliders all on one page (see [`classic`]). Either way the
+//! presets and the tuning are in the title bar (see [`title_bar`] and [`tuning_window`]), every
+//! control is bound directly to a parameter, so host automation and the GUI stay in sync, and
+//! hovering a control shows what it does (see [`help`]).
 //!
-//! Modulation is set up by dragging: every modulation source (the LFOs, the envelopes, and the
-//! MIDI sources) has a handle that can be dragged onto any slider that can be modulated, which
-//! fills in a free slot of the modulation matrix. The matrix itself lists every route, with its
-//! amount, and modulated sliders are marked.
+//! Modulation is set up by dragging: every modulation source (the LFOs, the envelopes, the
+//! oscillators and the MIDI sources) has a handle that can be dragged onto any control that
+//! can be modulated, which fills in a free slot of the modulation matrix.
 //!
 //! The oscillators, LFOs, envelopes, the filter and the effects each have a display of what they
 //! do, see [`displays`]. The displays follow the notes that are playing (see [`Monitor`]): the
 //! envelopes and LFOs show where each note is in them, the waves and the filter move with the
-//! modulation, and a modulated slider shows where the newest note's modulation takes it.
+//! modulation, and a modulated control shows where the newest note's modulation takes it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
-use nih_plug_egui::egui::{self, Color32, RichText, Stroke, StrokeKind, Ui};
+use nih_plug_egui::egui::{self, RichText, Ui};
 use nih_plug_egui::resizable_window::ResizableWindow;
-use nih_plug_egui::widgets::ParamSlider;
 use nih_plug_egui::{create_egui_editor, EguiState};
 
 use crate::params::{
-    ChorusParams, DelayParams, DistortionParams, EnvelopeParams, FilterEnvParams, FilterParams,
-    FxParams, GlobalParams, LfoParams, ModParams, ModSlotParams, OscParams, OscillatorWave,
-    ReverbParams, ThreeOscParams, WavetableFile,
+    EnvelopeParams, FilterEnvParams, FilterParams, ModSlotParams, OscParams, OscillatorWave, ThreeOscParams,
+    WavetableFile,
 };
-use crate::synth::effects::{ChorusSettings, DelaySettings, DistortionSettings, ReverbSettings};
 use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::modulation::{ModSource, ModTarget, Targets, N_SLOTS, N_TARGETS};
 use crate::synth::monitor::Monitor;
@@ -42,9 +36,15 @@ use crate::synth::oscillator::{builtin_spectra, CycleRenderer, WavePreview};
 use crate::synth::oversampling::Oversampling;
 use crate::synth::wavetable_file;
 use crate::{Task, ThreeOscPlugin};
+use theme::Theme;
 
 mod analyser;
+mod classic;
 mod displays;
+mod help;
+mod knob;
+mod studio;
+mod theme;
 mod title_bar;
 mod tuning_window;
 
@@ -52,22 +52,9 @@ mod tuning_window;
 pub const DEFAULT_WIDTH: u32 = 1400;
 pub const DEFAULT_HEIGHT: u32 = 1000;
 
-const SLIDER_WIDTH: f32 = 110.0;
-const COMBO_WIDTH: f32 = 150.0;
-/// Width of the combo boxes in the modulation matrix, which has two per row.
-const MATRIX_COMBO_WIDTH: f32 = 115.0;
-/// The width of a section of controls. Sections are laid out side by side, so they can't be
-/// left to take all the width they are offered (their separators would).
-const SECTION_WIDTH: f32 = 290.0;
-/// The space a framed group takes besides its contents, on each side.
-const FRAME_MARGIN: f32 = 7.0;
-/// The height of a section's title and the separator under it.
-const SECTION_HEADER: f32 = 30.0;
-const MATRIX_WIDTH: f32 = 450.0;
-
 /// The colour of everything to do with modulation: source handles, route markers and the drop
 /// highlights.
-const MOD_COLOR: Color32 = Color32::from_rgb(255, 170, 60);
+const MOD_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 60);
 
 /// The window size used when the plugin is first loaded. The size is stored with the plugin's
 /// state, so resizing the window is remembered.
@@ -76,7 +63,7 @@ pub fn default_state() -> Arc<EguiState> {
 }
 
 /// State that only the GUI needs: the listing of the wavetable folder, the preset and tuning
-/// browsers, and what the displays draw.
+/// browsers, what the displays draw, and what each layout shows.
 pub struct EditorState {
     folder: PathBuf,
     /// The `.wav` files in the folder.
@@ -88,25 +75,17 @@ pub struct EditorState {
     /// when the GUI first opens.
     builtin_waves: Vec<Arc<WavePreview>>,
     filter_response: displays::FilterResponse,
-    /// Whether the oscillators or the effects are shown.
-    tab: Tab,
-    /// The size the oscillators took when they were last shown, which the effects take too, so
-    /// that nothing else moves when the tabs are switched.
-    oscillators_size: egui::Vec2,
     presets: title_bar::PresetBrowser,
     tuning: tuning_window::TuningWindow,
     /// The output section's spectrogram and meters.
     analyser: analyser::Analyser,
-}
-
-/// What the top left of the window shows: the oscillators, or the effects or the advanced
-/// settings in their place. Either way the modulation sources stay in view, to be dragged onto
-/// the controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Oscillators,
-    Effects,
-    Advanced,
+    /// The theme the window's look was last set for, or `None` when a newly opened window still
+    /// needs it set.
+    styled: Option<Theme>,
+    /// Why the theme last picked couldn't be saved, if it couldn't.
+    theme_problem: Option<String>,
+    classic: classic::ClassicState,
+    studio: studio::StudioState,
 }
 
 impl EditorState {
@@ -118,11 +97,13 @@ impl EditorState {
             custom_path: String::new(),
             builtin_waves: Vec::new(),
             filter_response: displays::FilterResponse::new(),
-            tab: Tab::Oscillators,
-            oscillators_size: egui::Vec2::ZERO,
             presets: title_bar::PresetBrowser::new(),
             tuning: tuning_window::TuningWindow::new(),
             analyser: analyser::Analyser::new(),
+            styled: None,
+            theme_problem: None,
+            classic: classic::ClassicState::new(),
+            studio: studio::StudioState::new(),
         }
     }
     fn rescan(&mut self) {
@@ -178,13 +159,19 @@ pub fn create(
     create_egui_editor(
         egui_state.clone(),
         EditorState::new(),
-        |_, _| {},
+        // Each time the window opens it has a new context, which needs the theme's look
+        |_, state| state.styled = None,
         move |egui_ctx, setter, state| {
+            let theme = theme::current();
+            if state.styled != Some(theme) {
+                theme::apply(egui_ctx, theme);
+                state.styled = Some(theme);
+            }
             ResizableWindow::new("three-osc-window")
                 .min_size(egui::vec2(320.0, 240.0))
                 .show(egui_ctx, &egui_state, |ui| {
-                    // The layout has a fixed natural size; if the window is made smaller than
-                    // that the contents scroll instead of being cut off.
+                    // The layout has a natural size; if the window is made smaller than that
+                    // the contents scroll instead of being cut off.
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -196,14 +183,14 @@ pub fn create(
                                     sample_rate: f32::from_bits(sample_rate.load(Ordering::Relaxed)),
                                 },
                             };
-                            draw(ui, &params, setter, &mut gui)
+                            draw(ui, &params, setter, &mut gui, theme)
                         });
                 });
         },
     )
 }
 
-fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
+fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui, theme: Theme) {
     if !gui.state.scanned {
         gui.state.rescan();
     }
@@ -214,1009 +201,52 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
             .map(|(_, spectra)| Arc::new(WavePreview::from_spectra(spectra, &mut renderer)))
             .collect();
     }
-    let matrix = Matrix {
-        slots: &params.mod_slots,
-        monitor: gui.live.monitor,
-    };
-    let live = gui.live;
-
-    title_bar::title_bar(ui, params, setter, gui);
     tuning_window::show(ui.ctx(), params, &mut gui.state.tuning);
-    ui.separator();
-    tabs(ui, &params.fx, gui);
-
-    ui.horizontal_top(|ui| {
-        match gui.state.tab {
-            Tab::Oscillators => {
-                let size = ui
-                    .horizontal_top(|ui| {
-                        for (index, title) in ["Osc 1", "Osc 2", "Osc 3"].into_iter().enumerate() {
-                            let modulation = [Some(&params.osc1_mod), Some(&params.osc2_mod), None][index];
-                            oscillator(
-                                ui,
-                                title,
-                                index,
-                                params.oscillator(index),
-                                modulation,
-                                params.wavetable_file(index),
-                                &matrix,
-                                setter,
-                                gui,
-                            );
-                        }
-                    })
-                    .response
-                    .rect
-                    .size();
-                gui.state.oscillators_size = size;
-            }
-            Tab::Effects => {
-                let size = gui.state.oscillators_size;
-                ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                    ui.set_min_size(size);
-                    effects(ui, size, &params.fx, &matrix, setter, live);
-                });
-            }
-            Tab::Advanced => {
-                let size = gui.state.oscillators_size;
-                ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                    ui.set_min_size(size);
-                    advanced(ui, &params.global, setter);
-                    wavetable_folder(ui, params, setter, gui);
-                });
-            }
-        }
-        ui.vertical(|ui| {
-            ui.horizontal_top(|ui| {
-                let lfos = ui
-                    .vertical(|ui| {
-                        for (i, lfo_params) in params.lfos.iter().enumerate() {
-                            lfo(ui, i, lfo_params, &matrix, setter, live);
-                        }
-                    })
-                    .response
-                    .rect;
-                output_section(ui, lfos.height(), gui);
-            });
-            midi_sources(ui);
-        });
-    });
-
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            let oversampling = params.global.oversampling.value().to_oversampling();
-            filter(ui, "Filter 1", &params.filter, &params.filter_env, oversampling, &matrix, setter, gui);
-            filter_envelope(ui, "Filter 1 Envelope", &params.filter_env, setter, live);
-        });
-        ui.vertical(|ui| {
-            envelope(ui, "Volume Envelope", ModSource::VolumeEnv, &params.vol_env, setter, live);
-            global(ui, "Global", &params.global, &matrix, setter);
-        });
-        ui.vertical(|ui| {
-            for (i, env) in params.mod_envs.iter().enumerate() {
-                envelope(
-                    ui,
-                    &format!("Envelope {}", i + 1),
-                    ModSource::envelope(i),
-                    &env.envelope,
-                    setter,
-                    live,
-                );
-            }
-        });
-        modulation_matrix(ui, &matrix, setter);
-    });
+    match theme {
+        Theme::Studio => studio::draw(ui, params, setter, gui),
+        Theme::Classic => classic::draw(ui, params, setter, gui),
+    }
 }
 
-/// The tabs that switch between the oscillators and the effects.
-fn tabs(ui: &mut Ui, fx: &FxParams, gui: &mut Gui) {
-    ui.horizontal(|ui| {
-        let tab = &mut gui.state.tab;
-        ui.selectable_value(tab, Tab::Oscillators, RichText::new("Oscillators").strong())
-            .on_hover_text("The three oscillators.");
-        let on = [
-            fx.distortion.enabled.value(),
-            fx.chorus.enabled.value(),
-            fx.delay.enabled.value(),
-            fx.reverb.enabled.value(),
-        ]
-        .into_iter()
-        .filter(|on| *on)
-        .count();
-        let label = if on > 0 { format!("FX ({on} on)") } else { String::from("FX") };
-        ui.selectable_value(tab, Tab::Effects, RichText::new(label).strong()).on_hover_text(
-            "The effects after the voices: distortion, chorus, delay and reverb, in that order. \
-             They take the oscillators' place, so the modulation sources stay in view to be \
-             dragged onto them.",
-        );
-        ui.selectable_value(tab, Tab::Advanced, RichText::new("Advanced").strong()).on_hover_text(
-            "Settings for quality against CPU (the oversampling, how the wavetables are read and \
-             how often the modulation is worked out), and the folder of wavetable files.",
-        );
-    });
-}
-
-/// The settings that trade quality against CPU.
-fn advanced(ui: &mut Ui, global: &GlobalParams, setter: &ParamSetter) {
-    section(ui, "Quality", None, Display::None, |ui| {
-        combo(
-            ui,
-            &global.oversampling,
-            "Runs the voices at 2, 4 or 8 times the sample rate and filters them back down, so \
-             that the sidebands of FM, PM and AM and the filters' distortion above the Nyquist \
-             frequency are filtered out instead of folding back down as aliasing (the waves \
-             themselves are alias-free either way). The voices cost about that many times the \
-             CPU (the Ladder filter less, since it runs oversampled on its own); the effects run \
-             at the sample rate. Presets leave it as it is.",
-            setter,
-        );
-        combo(
-            ui,
-            &global.interpolation,
-            "How the oscillators read their wavetables in between samples. Cubic is the \
-             cleanest. Linear is a little cheaper and adds some aliasing noise on high notes. \
-             None (no interpolation) is the cheapest and the grittiest: it steps between the \
-             samples, which is clearly audible on all but the lowest notes.",
-            setter,
-        );
-        combo(
-            ui,
-            &global.modulation_rate,
-            "How often the envelopes, LFOs, modulation routes, pitch and filter settings are \
-             worked out. Block works them out every 32 samples and glides gains, pitch and the \
-             Digital filter in between, which is plenty for most sounds. Sample works them out at \
-             every sample, for the snappiest envelopes, and LFOs and oscillators modulating at \
-             audio rates. It costs little extra while nothing moves, and up to two or three times \
-             the CPU while modulation does.",
-            setter,
-        );
-    });
-}
-
-/// The size of an effect's section and its display, for four of them in two rows of two in an
-/// area of the given size.
-#[derive(Clone, Copy)]
-struct EffectLayout {
-    width: f32,
-    display_height: f32,
-}
-
-/// The effects in the order they process the sound, two by two, filling the area the
-/// oscillators take.
-fn effects(ui: &mut Ui, size: egui::Vec2, fx: &FxParams, matrix: &Matrix, setter: &ParamSetter, live: Live) {
-    // The displays show the settings as the newest note's modulation moves them
-    let settings = match live.modulation() {
-        Some(modulation) => fx.settings().modulated(&modulation),
-        None => fx.settings(),
-    };
-    let spacing = ui.spacing().item_spacing;
-    let section_height = (size.y - spacing.y) / 2.0;
-    let layout = EffectLayout {
-        width: ((size.x - spacing.x) / 2.0 - 2.0 * FRAME_MARGIN).max(SECTION_WIDTH),
-        display_height: (section_height - SECTION_HEADER - 2.0 * FRAME_MARGIN).clamp(60.0, 200.0),
-    };
-    ui.vertical(|ui| {
-        ui.horizontal_top(|ui| {
-            distortion(ui, layout, &fx.distortion, &settings.distortion, matrix, setter);
-            chorus(ui, layout, &fx.chorus, &settings.chorus, matrix, setter);
-        });
-        ui.horizontal_top(|ui| {
-            delay(ui, layout, &fx.delay, &settings.delay, matrix, setter);
-            reverb(ui, layout, &fx.reverb, &settings.reverb, matrix, setter);
-        });
-    });
-}
-
-/// The help shared by the effects' modulation targets.
-const EFFECT_MODULATION_HELP: &str = "Modulation dropped here follows the newest note's sources, \
-     since the effects process all the notes together.";
-
-fn distortion(
-    ui: &mut Ui,
-    layout: EffectLayout,
-    params: &DistortionParams,
-    settings: &DistortionSettings,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-) {
-    let mut display = |ui: &mut Ui| {
-        displays::distortion(ui, layout.display_height, settings.drive_db, settings.mix, settings.enabled)
-    };
-    section_sized(ui, "Distortion", layout.width, None, Display::Beside(&mut display), |ui| {
-        toggle(
-            ui,
-            "On",
-            &params.enabled,
-            "Soft clipping (a tanh curve) of the synth's output, anti-aliased so that high \
-             notes stay clean.",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.drive,
-            &format!("How hard the sound is pushed into the clipping, in decibels. {EFFECT_MODULATION_HELP}"),
-            ModTarget::DistortionDrive,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.mix,
-            &format!("From the clean sound at 0% to only the distorted one at 100%. {EFFECT_MODULATION_HELP}"),
-            ModTarget::DistortionMix,
-            matrix,
-            setter,
-        );
-    });
-}
-
-fn chorus(
-    ui: &mut Ui,
-    layout: EffectLayout,
-    params: &ChorusParams,
-    settings: &ChorusSettings,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-) {
-    let mut display = |ui: &mut Ui| displays::chorus(ui, layout.display_height, settings.depth, settings.enabled);
-    section_sized(ui, "Chorus", layout.width, None, Display::Beside(&mut display), |ui| {
-        toggle(
-            ui,
-            "On",
-            &params.enabled,
-            "Mixes in a copy of the sound whose delay sweeps back and forth, a quarter of a cycle \
-             apart in the two channels, for a wider, shimmering sound.",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.rate,
-            &format!("How fast the delay sweeps. {EFFECT_MODULATION_HELP}"),
-            ModTarget::ChorusRate,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.depth,
-            &format!("How far the delay sweeps: up to 6 ms either way of 12 ms. {EFFECT_MODULATION_HELP}"),
-            ModTarget::ChorusDepth,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.mix,
-            &format!("From the dry sound at 0% to only the delayed copy at 100%; 50% is the classic \
-                      chorus. {EFFECT_MODULATION_HELP}"),
-            ModTarget::ChorusMix,
-            matrix,
-            setter,
-        );
-    });
-}
-
-fn delay(
-    ui: &mut Ui,
-    layout: EffectLayout,
-    params: &DelayParams,
-    settings: &DelaySettings,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-) {
-    let mut display = |ui: &mut Ui| {
-        let DelaySettings { enabled, time, feedback, mix, ping_pong } = *settings;
-        displays::delay(ui, layout.display_height, time, feedback, mix, ping_pong, enabled)
-    };
-    section_sized(ui, "Delay", layout.width, None, Display::Beside(&mut display), |ui| {
-        toggle(ui, "On", &params.enabled, "Echoes of the sound.", setter);
-        mod_slider(
-            ui,
-            &params.time,
-            &format!("The time between echoes. Changing it glides the echoes' pitch, like tape. \
-                      {EFFECT_MODULATION_HELP}"),
-            ModTarget::DelayTime,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.feedback,
-            &format!("How much of each echo comes back as the next one. {EFFECT_MODULATION_HELP}"),
-            ModTarget::DelayFeedback,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.mix,
-            &format!("From the dry sound at 0% to only the echoes at 100%. {EFFECT_MODULATION_HELP}"),
-            ModTarget::DelayMix,
-            matrix,
-            setter,
-        );
-        toggle(
-            ui,
-            "Ping-Pong",
-            &params.ping_pong,
-            "The echoes bounce from one channel to the other, starting on the left.",
-            setter,
-        );
-    });
-}
-
-fn reverb(
-    ui: &mut Ui,
-    layout: EffectLayout,
-    params: &ReverbParams,
-    settings: &ReverbSettings,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-) {
-    let mut display = |ui: &mut Ui| {
-        displays::reverb(ui, layout.display_height, settings.size, settings.damping, settings.enabled)
-    };
-    section_sized(ui, "Reverb", layout.width, None, Display::Beside(&mut display), |ui| {
-        toggle(
-            ui,
-            "On",
-            &params.enabled,
-            "A room around the sound (Freeverb: eight combs into four allpasses per channel).",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.size,
-            &format!("How long the reverb rings. {EFFECT_MODULATION_HELP}"),
-            ModTarget::ReverbSize,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.damping,
-            &format!("How much faster the highs die away than the lows. {EFFECT_MODULATION_HELP}"),
-            ModTarget::ReverbDamping,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &params.mix,
-            &format!("From the dry sound at 0% to only the reverb at 100%. {EFFECT_MODULATION_HELP}"),
-            ModTarget::ReverbMix,
-            matrix,
-            setter,
-        );
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn oscillator(
-    ui: &mut Ui,
-    title: &str,
-    index: usize,
-    osc: &OscParams,
-    modulation: Option<&ModParams>,
-    file: &WavetableFile,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-    gui: &mut Gui,
-) {
-    // The file's frames once it has loaded; until then the oscillator plays a sine
-    let preview = match osc.wave.value().wavetable_index() {
-        Some(wavetable) => gui.state.builtin_waves[wavetable].clone(),
-        None => file.preview().unwrap_or_else(|| gui.state.builtin_waves[0].clone()),
-    };
-    let (phase, phase_rand) = (osc.phase.value() / 100.0, osc.phase_rand.value() / 100.0);
-    let silent = osc.amp.value() == 0.0;
-    // Where the newest note's modulation has the wavetable position
-    let target = ModTarget::osc_position(index);
-    let position = match gui.live.monitor.modulation(target) {
-        Some(modulation) => target.scaling().apply(osc.position.value(), modulation).clamp(0.0, 1.0),
-        None => osc.position.value(),
-    };
-    let mut display = |ui: &mut Ui| {
-        displays::wave(ui, &preview, position, phase, phase_rand, silent);
-    };
-    section(ui, title, Some(ModSource::osc(index)), Display::Above(&mut display), |ui| {
-        combo(
-            ui,
-            &osc.wave,
-            "The wavetable the oscillator plays. The basic shapes and fixed pulse widths are \
-             single frames; PW Sweep and Basic Shapes have several frames that Position morphs \
-             between. File plays a wavetable loaded from a .wav file (see Wavetable Files on the \
-             Advanced tab). All waves are bandlimited (alias-free).",
-            setter,
-        );
-        if osc.wave.value() == OscillatorWave::File {
-            wavetable_file_rows(ui, index, file, gui);
-        }
-        mod_slider(
-            ui,
-            &osc.position,
-            "Position within the wavetable. Only has an effect on wavetables with more than one \
-             frame: for PW Sweep it sweeps the pulse width from 50% (a square wave) down to a \
-             very narrow pulse, and Basic Shapes morphs from a sine through the triangle, saw, \
-             exponential and square to ever narrower pulses.",
-            ModTarget::osc_position(index),
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &osc.amp,
-            "Oscillator output volume. Doesn't affect PM, FM or AM.",
-            ModTarget::osc_amp(index),
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &osc.pan,
-            "Where the oscillator sits in the stereo field, from fully left to fully right. Its \
-             unison voices spread out around it by the Stereo Width, less so the further it is \
-             panned, so that they stay within the field. Modulation moves it once per control \
-             rate block.",
-            ModTarget::osc_pan(index),
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &osc.semitone,
-            "Oscillator detune in semitones.",
-            ModTarget::osc_pitch(index),
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &osc.octave,
-            "Oscillator detune in octaves. Modulation moves it in whole octaves.",
-            ModTarget::osc_octave(index),
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &osc.multiplier,
-            "Oscillator pitch multiplier / divider. Positive values multiply pitch, while \
-             negative values divide. A value of 0 means this control is bypassed. Modulation \
-             moves it in whole steps, through the harmonics (x2, x3...) or subharmonics (/2, \
-             /3...).",
-            ModTarget::osc_multiplier(index),
-            matrix,
-            setter,
-        );
-        if let Some(modulation) = modulation {
-            mod_slider(
-                ui,
-                &modulation.pm,
-                "Phase modulation of this oscillator by the oscillator after it.",
-                ModTarget::osc_pm(index).unwrap_or(ModTarget::None),
-                matrix,
-                setter,
-            );
-            mod_slider(
-                ui,
-                &modulation.fm,
-                "Frequency modulation of this oscillator by the oscillator after it. Can be used \
-                 for vibrato effects when the modulator is at a low pitch.",
-                ModTarget::osc_fm(index).unwrap_or(ModTarget::None),
-                matrix,
-                setter,
-            );
-            mod_slider(
-                ui,
-                &modulation.am,
-                "Amplitude modulation of this oscillator by the oscillator after it. Also known as \
-                 'Ring Modulation'. Can be used for telephone sounds and tremolo.",
-                ModTarget::osc_am(index).unwrap_or(ModTarget::None),
-                matrix,
-                setter,
-            );
-        }
-        slider(
-            ui,
-            &osc.voices,
-            "Copies of this oscillator which are overlaid at different pitches. Useful for the \
-             supersaw sound.",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &osc.super_detune,
-            "Unison voice detune. Does nothing if unison = 1.",
-            ModTarget::osc_detune(index),
-            matrix,
-            setter,
-        );
-        slider(
-            ui,
-            &osc.phase,
-            "Point at which the oscillator wave starts. Does nothing when Phase Rand = 100.",
-            setter,
-        );
-        slider(
-            ui,
-            &osc.phase_rand,
-            "Partially or fully randomises the point where the oscillator wave starts. Keep this \
-             fairly high when using Unison.",
-            setter,
-        );
-    });
-}
-
-fn lfo(ui: &mut Ui, index: usize, lfo: &LfoParams, matrix: &Matrix, setter: &ParamSetter, live: Live) {
-    let wave = lfo.wave.value().to_osc_wave();
-    let phase = live.monitor.lfo_phase(index);
-    section(
-        ui,
-        &format!("LFO {}", index + 1),
-        Some(ModSource::lfo(index)),
-        Display::Beside(&mut |ui| displays::lfo(ui, &wave, MOD_COLOR, phase)),
-        |ui| {
-            combo(ui, &lfo.wave, "The LFO's waveform.", setter);
-            mod_slider(
-                ui,
-                &lfo.rate,
-                "How fast the LFO oscillates, up to 1 kHz. Each note has its own copy of the \
-                 LFO, started when the note starts. At the Block modulation rate (see the \
-                 Advanced tab), modulation is worked out every 32 samples, so an LFO much faster \
-                 than a few hundred Hz steps and aliases there: audio-rate LFOs want the Sample \
-                 rate.",
-                ModTarget::lfo_rate(index),
-                matrix,
-                setter,
-            );
-        },
-    );
-}
-
-/// The rows picking an oscillator's wavetable file and showing how its load went.
-fn wavetable_file_rows(ui: &mut Ui, index: usize, file: &WavetableFile, gui: &mut Gui) {
-    ui.label("File").on_hover_text(
-        "The .wav file this oscillator plays as a wavetable: one or more single cycles one \
-         after the other, 2048 samples each unless the file says otherwise. Pick one from the \
-         wavetable folder here, or type a path into Wavetable Files on the Advanced tab.",
-    );
-    let current = file.path();
-    let current_name = Path::new(&current)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut picked = None;
-    egui::ComboBox::from_id_salt(("wavetable file", index))
-        .selected_text(if current.is_empty() {
-            String::from("(none)")
-        } else {
-            current_name
-        })
-        .width(COMBO_WIDTH)
+/// A combo box for switching the theme, with a warning when the choice couldn't be saved.
+fn theme_picker(ui: &mut Ui, gui: &mut Gui) {
+    let current = theme::current();
+    let mut picked = current;
+    egui::ComboBox::from_id_salt("theme")
+        .selected_text(format!("Theme: {}", current.name()))
         .show_ui(ui, |ui| {
-            if gui.state.files.is_empty() {
-                ui.label(RichText::new("No .wav files in the wavetable folder").weak());
+            for theme in Theme::ALL {
+                ui.selectable_value(&mut picked, theme, theme.name())
+                    .on_hover_text(theme.description());
             }
-            for name in &gui.state.files {
-                if ui.selectable_label(current == *name, name).clicked() {
-                    picked = Some(name.clone());
-                }
-            }
-        });
-    ui.end_row();
-    if let Some(name) = picked {
-        load_wavetable_file(file, index, name, gui.executor);
+        })
+        .response
+        .on_hover_text(
+            "Switches between the Studio layout and the Classic one. The choice is kept for \
+             every project, in Settings.json in Documents/Three Osc.",
+        );
+    if picked != current {
+        switch_theme(ui, gui, picked);
     }
-    let mut status = file.status();
-    if file.path().is_empty() {
-        status = String::from("No file loaded: plays a sine until one is.");
-    }
-    if !status.is_empty() {
-        ui.label("");
-        ui.add(egui::Label::new(RichText::new(status).small().weak()).wrap());
-        ui.end_row();
-    }
-}
-
-/// Sets an oscillator's wavetable file and starts loading it in the background.
-fn load_wavetable_file(
-    file: &WavetableFile,
-    osc: usize,
-    path: String,
-    executor: &AsyncExecutor<ThreeOscPlugin>,
-) {
-    file.set_path(path);
-    if let Some(generation) = file.claim_load() {
-        file.set_status(String::from("Loading..."));
-        executor.execute_background(Task::LoadWavetable { osc, generation });
+    if let Some(problem) = &gui.state.theme_problem {
+        let clear = ui
+            .add(egui::Label::new(RichText::new("⚠").color(title_bar::ERROR_COLOR)).sense(egui::Sense::click()))
+            .on_hover_text(format!("{problem}\nThe theme is used until the plugin is reloaded. (Click to dismiss.)"))
+            .clicked();
+        if clear {
+            gui.state.theme_problem = None;
+        }
     }
 }
 
-/// The wavetable folder: where the oscillators' File combo boxes look, with a way to load a
-/// file from anywhere else.
-fn wavetable_folder(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
-    ui.push_id("wavetable folder", |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(SECTION_WIDTH);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Wavetable Files").strong()).on_hover_text(
-                        "Put .wav wavetables in this folder and set an oscillator's Wave to \
-                         File to play them. The folder is Documents/Three Osc/Wavetables in your \
-                         home directory, or wherever the THREE_OSC_WAVETABLES environment \
-                         variable points.",
-                    );
-                    if ui.small_button("Rescan").clicked() {
-                        gui.state.rescan();
-                    }
-                });
-                ui.separator();
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(gui.state.folder.to_string_lossy()).small().weak(),
-                    )
-                    .wrap(),
-                );
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut gui.state.custom_path)
-                            .hint_text("Path to a .wav file")
-                            .desired_width(SLIDER_WIDTH + 40.0),
-                    )
-                    .on_hover_text(
-                        "A file outside the folder, loaded into an oscillator with the buttons.",
-                    );
-                    for osc in 0..3 {
-                        if ui
-                            .small_button(format!("Osc {}", osc + 1))
-                            .on_hover_text(
-                                "Loads the file into this oscillator, and sets its Wave to File.",
-                            )
-                            .clicked()
-                            && !gui.state.custom_path.trim().is_empty()
-                        {
-                            let path = gui.state.custom_path.trim().to_string();
-                            load_wavetable_file(params.wavetable_file(osc), osc, path, gui.executor);
-                            set_param(setter, &params.oscillator(osc).wave, OscillatorWave::File);
-                        }
-                    }
-                });
-            });
-        });
-    });
-}
-
-/// The narrowest the output section gets, when the window is too narrow for the layout.
-const OUTPUT_MIN_WIDTH: f32 = 130.0;
-
-/// What the synth plays, after the effects: a spectrogram and the level of each channel. It
-/// fills the rest of the width beside the LFOs, `height` tall.
-fn output_section(ui: &mut Ui, height: f32, gui: &mut Gui) {
-    let width = (ui.available_width() - 2.0 * FRAME_MARGIN).max(OUTPUT_MIN_WIDTH);
-    ui.push_id("output", |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(width);
-                ui.label(RichText::new("Output").strong()).on_hover_text(analyser::HELP);
-                ui.separator();
-                let display_height = height - SECTION_HEADER - 2.0 * FRAME_MARGIN;
-                let live = gui.live;
-                analyser::output(
-                    ui,
-                    &mut gui.state.analyser,
-                    &live.monitor.output,
-                    live.sample_rate,
-                    width,
-                    display_height,
-                );
-            });
-        });
-    });
-}
-
-/// The modulation sources that come from MIDI (and the random one), as a row of drag handles.
-fn midi_sources(ui: &mut Ui) {
-    ui.push_id("midi sources", |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(SECTION_WIDTH);
-                ui.label(RichText::new("More Sources").strong())
-                    .on_hover_text("Drag a source onto a slider to modulate it.");
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    for source in [
-                        ModSource::Velocity,
-                        ModSource::Key,
-                        ModSource::ModWheel,
-                        ModSource::Aftertouch,
-                        ModSource::Random,
-                    ] {
-                        drag_handle(ui, source);
-                    }
-                });
-            });
-        });
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn filter(
-    ui: &mut Ui,
-    title: &str,
-    filter: &FilterParams,
-    filter_env: &FilterEnvParams,
-    oversampling: Oversampling,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-    gui: &mut Gui,
-) {
-    let settings = displays::FilterSettings::new(
-        filter.model.value().to_filter_model(),
-        filter.filter_type.value().to_filter_type(),
-        filter.cutoff.value(),
-        filter.resonance.value(),
-        // As the synth applies it
-        filter_env.amount.value().powi(2),
-        gui.live.sample_rate,
-        oversampling.factor(),
-    );
-    let response = &mut gui.state.filter_response;
-    // The newest note's cutoff, and its resonance as the synth modulates it
-    let monitor = gui.live.monitor;
-    let live = monitor.cutoff().map(|cutoff| {
-        let resonance = match monitor.modulation(ModTarget::Resonance) {
-            Some(modulation) if modulation != 0.0 => {
-                ModTarget::Resonance.scaling().apply(filter.resonance.value(), modulation).clamp(0.1, 10.0)
-            }
-            _ => filter.resonance.value(),
-        };
-        (cutoff, resonance)
-    });
-    let mut display = |ui: &mut Ui| displays::filter(ui, settings, response, live);
-    section(ui, title, None, Display::Above(&mut display), |ui| {
-        combo(
-            ui,
-            &filter.model,
-            "There are 3 filter models: Digital is an SVF identical to an IIR biquad filter \
-             (except stable over large cutoff changes), RC is a darker filter capable of \
-             aggressive self-resonance, and Ladder is based on a famous analog filter and sounds \
-             the best, with its code coming from janne808's Kocmoc Rack Modules project.",
-            setter,
-        );
-        combo(
-            ui,
-            &filter.filter_type,
-            "Lowpass cuts out high frequencies, Highpass cuts out low frequencies, and Bandpass \
-             allows a small band of frequencies at the cutoff point.",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &filter.cutoff,
-            "Changes the frequency at which the filter starts taking effect. Try it out.",
-            ModTarget::Cutoff,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &filter.resonance,
-            "Adds feedback to the filter loop, creating a volume spike at the filter's cutoff \
-             frequency. On the RC and Ladder filters, setting this high enough creates a \
-             self-sustaining sine wave.",
-            ModTarget::Resonance,
-            matrix,
-            setter,
-        );
-        mod_slider(
-            ui,
-            &filter.drive,
-            "Multiplies the amplitude of the filter input, creating distortion inside the RC and \
-             Ladder filters. Does not amplify when Model = None or Digital, to keep volume equal \
-             between filters.",
-            ModTarget::Drive,
-            matrix,
-            setter,
-        );
-        slider(
-            ui,
-            &filter.keytrack,
-            "Amount the filter cutoff is affected by note frequency; Keytrack of 100% means the \
-             filter cutoff will follow the note frequency exactly, making higher notes brighter \
-             and lower notes darker.",
-            setter,
-        );
-    });
-}
-
-fn filter_envelope(ui: &mut Ui, title: &str, env: &FilterEnvParams, setter: &ParamSetter, live: Live) {
-    let mut display = |ui: &mut Ui| envelope_display(ui, &env.envelope, setter, live);
-    section(ui, title, Some(ModSource::FilterEnv), Display::Above(&mut display), |ui| {
-        slider(
-            ui,
-            &env.amount,
-            "Amount the envelope affects the filter cutoff.",
-            setter,
-        );
-        envelope_rows(ui, &env.envelope, setter);
-    });
-}
-
-fn envelope(
-    ui: &mut Ui,
-    title: &str,
-    source: ModSource,
-    env: &EnvelopeParams,
-    setter: &ParamSetter,
-    live: Live,
-) {
-    let mut display = |ui: &mut Ui| envelope_display(ui, env, setter, live);
-    section(ui, title, Some(source), Display::Above(&mut display), |ui| {
-        envelope_rows(ui, env, setter)
-    });
-}
-
-/// An envelope's shape, worked out the way the synth does it, with where each note playing is
-/// in it, and its handles to drag.
-fn envelope_display(ui: &mut Ui, params: &EnvelopeParams, setter: &ParamSetter, live: Live) {
-    let mut envelope = AdsrEnvelope::new(0.0, 0.0, 0.0, 0.0, 0.0);
-    crate::apply_envelope_params(&mut envelope, params);
-    displays::envelope(ui, &envelope, MOD_COLOR, &live.voice_times(), params, setter);
-}
-
-fn envelope_rows(ui: &mut Ui, env: &EnvelopeParams, setter: &ParamSetter) {
-    slider(
-        ui,
-        &env.attack,
-        "Envelope start time. This gives a \"fade in\" effect when controlling volume.",
-        setter,
-    );
-    slider(
-        ui,
-        &env.decay,
-        "Time for envelope to reach sustain level. This gives a \"pluck\" effect when controlling \
-         volume. Does nothing when sustain = 100%.",
-        setter,
-    );
-    slider(
-        ui,
-        &env.sustain,
-        "The level the envelope will remain at while the note is held. Used for sustained sounds, \
-         like flutes or strings. When set to 0 the note ends when decay finishes.",
-        setter,
-    );
-    slider(
-        ui,
-        &env.release,
-        "Time for the envelope to finish after the note is released. Useful for sounds which \
-         persist a while after they're played, like bells or chimes. Has mostly no effect when \
-         sustain = 0.",
-        setter,
-    );
-}
-
-fn global(ui: &mut Ui, title: &str, global: &GlobalParams, matrix: &Matrix, setter: &ParamSetter) {
-    section(ui, title, None, Display::None, |ui| {
-        combo(
-            ui,
-            &global.polyphony,
-            "Polyphonic means an unlimited number of notes can be played simultaneously. \
-             Monophonic means only one note can be played at a time. Legato is the same as \
-             monophonic, except notes are connected; envelopes / oscillator phases won't reset \
-             when gliding between notes.",
-            setter,
-        );
-        slider(
-            ui,
-            &global.portamento_rate,
-            "How slowly note pitch will glide to a new note. In Polyphonic mode, this only \
-             affects Pitch Slide.",
-            setter,
-        );
-        slider(
-            ui,
-            &global.pitch_offset,
-            "Initial pitch shift at the start of a note.",
-            setter,
-        );
-        slider(
-            ui,
-            &global.octave_detune,
-            "Stretches the octave width so that consecutive octaves are further or closer \
-             together. In 12TET (i.e. the chromatic scale), octaves are the only perfect \
-             interval, which means playing them with harsh waves (saw, square, etc) will result \
-             in a louder and harsher sound than playing any other two notes. This control is \
-             meant to fix that.",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &global.output_gain,
-            "Master output volume. Adjust if the synth is too loud / too quiet. Modulation \
-             dropped here controls the volume of each note (Volume (all) in the matrix).",
-            ModTarget::Volume,
-            matrix,
-            setter,
-        );
-        slider(
-            ui,
-            &global.stereo_width,
-            "Spreads each oscillator's unison voices across the stereo field around the \
-             oscillator's Pan, with the lowest pitched voice furthest left and the highest \
-             furthest right. At 0 all of an oscillator's voices are where its Pan puts it (in \
-             the centre, unless panned). An oscillator with Unison = 1 is always just where its \
-             Pan puts it.",
-            setter,
-        );
-        mod_slider(
-            ui,
-            &global.global_pitch,
-            "Pitch detune for the whole synth, in semitones. Modulation dropped here controls \
-             the pitch of every oscillator (Pitch (all) in the matrix).",
-            ModTarget::Pitch,
-            matrix,
-            setter,
-        );
-        slider(
-            ui,
-            &global.bend_range,
-            "Controls the range of the MIDI pitch wheel in semitones. Useful if you have a MIDI \
-             keyboard.",
-            setter,
-        );
-    });
-}
-
-/// The modulation matrix: every slot as a row of source, target and amount.
-fn modulation_matrix(ui: &mut Ui, matrix: &Matrix, setter: &ParamSetter) {
-    ui.push_id("modulation matrix", |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(MATRIX_WIDTH);
-                ui.label(RichText::new("Modulation Matrix").strong()).on_hover_text(
-                    "Each row routes a source to a target. At 100% a source's full swing moves \
-                     a slider across its whole length, pitch by an octave, and the filter \
-                     cutoff by 10 octaves. Drag a source's handle (the LFOs', the envelopes', \
-                     the oscillators' and those in More Sources) onto a slider to fill in a \
-                     row.",
-                );
-                ui.separator();
-                egui::Grid::new("routes")
-                    .num_columns(4)
-                    .spacing([6.0, 4.0])
-                    .show(ui, |ui| {
-                        for (index, slot) in matrix.slots.iter().enumerate() {
-                            matrix_row(ui, index, slot, setter);
-                        }
-                    });
-            });
-        });
-    });
-}
-
-fn matrix_row(ui: &mut Ui, index: usize, slot: &ModSlotParams, setter: &ParamSetter) {
-    let source_help = slot.source.value().help();
-    combo_cell(ui, &slot.source, index, MATRIX_COMBO_WIDTH, source_help, setter);
-    let target_help = slot.target.value().help();
-    combo_cell(ui, &slot.target, index, MATRIX_COMBO_WIDTH, target_help, setter);
-    ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(SLIDER_WIDTH))
-        .on_hover_text("How much of the source is applied to the target, from -100% to 100%.");
-    let in_use = slot.source.value() != ModSource::None || slot.target.value() != ModTarget::None;
-    if ui
-        .add_enabled(in_use, egui::Button::new(RichText::new("×").strong()).small())
-        .on_hover_text("Clears this row.")
-        .clicked()
-    {
-        set_param(setter, &slot.source, ModSource::None);
-        set_param(setter, &slot.target, ModTarget::None);
-        set_param(setter, &slot.amount, 0.0);
-    }
-    ui.end_row();
+/// Switches every editor to `theme`, keeping what went wrong saving it, if anything, to show.
+fn switch_theme(ui: &Ui, gui: &mut Gui, theme: Theme) {
+    gui.state.theme_problem = theme::set(theme).err();
+    ui.ctx().request_repaint();
 }
 
 /// A read-only view of the modulation matrix, plus the editing it needs, and what the synth
-/// plays (for the modulated sliders to show where the newest note's modulation takes them).
+/// plays (for the modulated controls to show where the newest note's modulation takes them).
 struct Matrix<'a> {
     slots: &'a [ModSlotParams; N_SLOTS],
     monitor: &'a Monitor,
@@ -1225,11 +255,24 @@ struct Matrix<'a> {
 impl Matrix<'_> {
     /// The routes that modulate `target`, as `(source, amount)`.
     fn routes_for(&self, target: ModTarget) -> impl Iterator<Item = (ModSource, f32)> + '_ {
-        self.slots.iter().filter_map(move |slot| {
-            let source = slot.source.value();
-            (source != ModSource::None && slot.target.value() == target)
-                .then(|| (source, slot.amount.value()))
+        self.slots_for(target).map(|slot| (slot.source.value(), slot.amount.value()))
+    }
+    /// The slots that route a source to `target` (none, for no target).
+    fn slots_for(&self, target: ModTarget) -> impl Iterator<Item = &ModSlotParams> + '_ {
+        self.slots.iter().filter(move |slot| {
+            target != ModTarget::None && slot.source.value() != ModSource::None && slot.target.value() == target
         })
+    }
+    /// Whether a slot routes a source to a target.
+    fn is_used(slot: &ModSlotParams) -> bool {
+        slot.source.value() != ModSource::None && slot.target.value() != ModTarget::None
+    }
+    /// How many routes `source` drives.
+    fn routes_from(&self, source: ModSource) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.source.value() == source && slot.target.value() != ModTarget::None)
+            .count()
     }
     /// Routes `source` to `target` in the first free slot (unless such a route already exists),
     /// with a starting amount of 50%. Returns whether a slot was found.
@@ -1244,10 +287,7 @@ impl Matrix<'_> {
         if existing {
             return true;
         }
-        let free = self.slots.iter().find(|slot| {
-            slot.source.value() == ModSource::None || slot.target.value() == ModTarget::None
-        });
-        match free {
+        match self.slots.iter().find(|slot| !Self::is_used(slot)) {
             Some(slot) => {
                 set_param(setter, &slot.source, source);
                 set_param(setter, &slot.target, target);
@@ -1259,6 +299,12 @@ impl Matrix<'_> {
             None => false,
         }
     }
+    /// Empties a slot.
+    fn clear(setter: &ParamSetter, slot: &ModSlotParams) {
+        set_param(setter, &slot.source, ModSource::None);
+        set_param(setter, &slot.target, ModTarget::None);
+        set_param(setter, &slot.amount, 0.0);
+    }
 }
 
 /// Sets a parameter from the GUI, with the begin/end gestures the host expects.
@@ -1268,123 +314,14 @@ fn set_param<P: Param>(setter: &ParamSetter, param: &P, value: P::Plain) {
     setter.end_set_parameter(param);
 }
 
-/// A handle that can be dragged onto a modulatable slider to route `source` to it.
-fn drag_handle(ui: &mut Ui, source: ModSource) {
-    let id = ui.id().with(("mod source", source.to_index()));
-    let name = ModSource::variants()[source.to_index()];
-    let response = ui
-        .dnd_drag_source(id, source, |ui| {
-            egui::Frame::new()
-                .fill(MOD_COLOR.gamma_multiply(0.25))
-                .stroke(Stroke::new(1.0_f32, MOD_COLOR))
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(6, 2))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(format!("☰ {name}")).small().strong())
-                            .wrap_mode(egui::TextWrapMode::Extend)
-                            .selectable(false),
-                    );
-                });
-        })
-        .response;
-    response.on_hover_text(format!(
-        "{}\nDrag this onto a slider to modulate it.",
-        source.help()
-    ));
-}
-
-/// Where a section shows the display of what its controls do.
-enum Display<'a> {
-    None,
-    /// Between the title and the controls.
-    Above(&'a mut dyn FnMut(&mut Ui)),
-    /// To the right of the controls, for sections with only a few.
-    Beside(&'a mut dyn FnMut(&mut Ui)),
-}
-
-/// A titled, framed group of controls laid out as a two column (label, control) grid, with a
-/// display of what they do. Sections that are modulation sources get a drag handle next to
-/// their title.
-fn section(
-    ui: &mut Ui,
-    title: &str,
-    source: Option<ModSource>,
-    display: Display,
-    add_rows: impl FnOnce(&mut Ui),
-) {
-    section_sized(ui, title, SECTION_WIDTH, source, display, add_rows)
-}
-
-/// A [`section()`] of the given width.
-fn section_sized(
-    ui: &mut Ui,
-    title: &str,
-    width: f32,
-    source: Option<ModSource>,
-    display: Display,
-    add_rows: impl FnOnce(&mut Ui),
-) {
-    // Widget IDs inside the section are scoped by its title, so the same parameter name (e.g.
-    // "Wave") can appear in several sections.
-    ui.push_id(title, |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(width);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).strong());
-                    if let Some(source) = source {
-                        drag_handle(ui, source);
-                    }
-                });
-                ui.separator();
-                let grid = |ui: &mut Ui| {
-                    egui::Grid::new("controls")
-                        .num_columns(2)
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| add_rows(ui));
-                };
-                match display {
-                    Display::None => grid(ui),
-                    Display::Above(display) => {
-                        display(ui);
-                        grid(ui);
-                    }
-                    Display::Beside(display) => {
-                        ui.horizontal_top(|ui| {
-                            grid(ui);
-                            display(ui);
-                        });
-                    }
-                }
-            });
-        });
-    });
-}
-
-/// A grid row with a label and a check box for a switch.
-fn toggle(ui: &mut Ui, label: &str, param: &BoolParam, help: &str, setter: &ParamSetter) {
-    ui.label(label).on_hover_text(help);
-    let mut on = param.value();
-    if ui.checkbox(&mut on, "").on_hover_text(help).changed() {
-        set_param(setter, param, on);
-    }
-    ui.end_row();
-}
-
-/// A grid row with the parameter's name and a slider for it.
-fn slider<P: Param>(ui: &mut Ui, param: &P, help: &str, setter: &ParamSetter) {
-    ui.label(param.name()).on_hover_text(help);
-    ui.add(ParamSlider::for_param(param, setter).with_width(SLIDER_WIDTH));
-    ui.end_row();
-}
-
-/// A parameter with numeric values, for showing where modulation takes its slider.
+/// A parameter with numeric values, for showing where modulation takes its control.
 trait NumericParam: Param {
-    /// The value the slider shows.
+    /// The value the control shows.
     fn value_f32(&self) -> f32;
-    /// Where a value would put the slider, from 0 to 1.
+    /// Where a value would put the control, from 0 to 1.
     fn normalized_at(&self, value: f32) -> f32;
+    /// The value at a position of the control, from 0 to 1.
+    fn plain_at(&self, normalized: f32) -> f32;
 }
 
 impl NumericParam for FloatParam {
@@ -1393,6 +330,9 @@ impl NumericParam for FloatParam {
     }
     fn normalized_at(&self, value: f32) -> f32 {
         self.preview_normalized(value)
+    }
+    fn plain_at(&self, normalized: f32) -> f32 {
+        self.preview_plain(normalized)
     }
 }
 
@@ -1403,88 +343,9 @@ impl NumericParam for IntParam {
     fn normalized_at(&self, value: f32) -> f32 {
         self.preview_normalized(value.round() as i32)
     }
-}
-
-/// A grid row with a slider for a parameter that modulation sources can be dropped onto, with
-/// a marker listing the routes that modulate it. While a note plays, a modulated slider shows
-/// where the newest note's modulation takes it, from the slider's value to a mark.
-fn mod_slider<P: NumericParam>(
-    ui: &mut Ui,
-    param: &P,
-    help: &str,
-    target: ModTarget,
-    matrix: &Matrix,
-    setter: &ParamSetter,
-) {
-    ui.label(param.name()).on_hover_text(help);
-    ui.horizontal(|ui| {
-        let response = ui.add(ParamSlider::for_param(param, setter).with_width(SLIDER_WIDTH));
-
-        // Highlight the slider while a source is being dragged, and route it on a drop
-        if egui::DragAndDrop::has_payload_of_type::<ModSource>(ui.ctx()) {
-            let hovered = response.dnd_hover_payload::<ModSource>().is_some();
-            let color = if hovered {
-                MOD_COLOR
-            } else {
-                MOD_COLOR.gamma_multiply(0.4)
-            };
-            ui.painter().rect_stroke(
-                response.rect.expand(2.0),
-                3.0,
-                Stroke::new(1.5_f32, color),
-                StrokeKind::Outside,
-            );
-        }
-        if let Some(source) = response.dnd_release_payload::<ModSource>() {
-            matrix.add_route(setter, *source, target);
-        }
-
-        // The routes that modulate this control
-        let routes: Vec<String> = matrix
-            .routes_for(target)
-            .map(|(source, amount)| {
-                format!(
-                    "{} {:+.0}%",
-                    ModSource::variants()[source.to_index()],
-                    amount * 100.0
-                )
-            })
-            .collect();
-        if !routes.is_empty() {
-            // Painted rather than a glyph, which the default proportional fonts may lack
-            let (rect, marker) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 3.5, MOD_COLOR);
-            marker.on_hover_text(format!("Modulated by:\n{}", routes.join("\n")));
-
-            if let Some(modulation) = matrix.monitor.modulation(target) {
-                let value = param.value_f32();
-                let from = param.normalized_at(value);
-                let to = param.normalized_at(target.scaling().apply(value, modulation));
-                let bar = response.rect;
-                let x = |normalized: f32| bar.left() + bar.width() * normalized.clamp(0.0, 1.0);
-                let painter = ui.painter();
-                let y = bar.bottom() - 1.5;
-                painter.line_segment([egui::pos2(x(from), y), egui::pos2(x(to), y)], Stroke::new(3.0_f32, MOD_COLOR));
-                painter.line_segment(
-                    [egui::pos2(x(to), bar.top()), egui::pos2(x(to), bar.bottom())],
-                    Stroke::new(2.0_f32, MOD_COLOR),
-                );
-            }
-        }
-    });
-    ui.end_row();
-}
-
-/// A grid row with the parameter's name and a combo box listing the enum's variants.
-fn combo<T: Enum + PartialEq + Copy + 'static>(
-    ui: &mut Ui,
-    param: &EnumParam<T>,
-    help: &str,
-    setter: &ParamSetter,
-) {
-    ui.label(param.name()).on_hover_text(help);
-    combo_cell(ui, param, 0, COMBO_WIDTH, help, setter);
-    ui.end_row();
+    fn plain_at(&self, normalized: f32) -> f32 {
+        self.preview_plain(normalized) as f32
+    }
 }
 
 /// A combo box listing the enum's variants, without a label.
@@ -1512,4 +373,162 @@ fn combo_cell<T: Enum + PartialEq + Copy + 'static>(
     if selected != current {
         set_param(setter, param, T::from_index(selected));
     }
+}
+
+/// What an oscillator's display shows, see [`displays::wave()`].
+struct WaveDisplay {
+    preview: Arc<WavePreview>,
+    /// Where the newest note's modulation has the wavetable position.
+    position: f32,
+    phase: f32,
+    phase_rand: f32,
+    silent: bool,
+}
+
+impl WaveDisplay {
+    fn new(index: usize, osc: &OscParams, file: &WavetableFile, gui: &Gui) -> Self {
+        // The file's frames once it has loaded; until then the oscillator plays a sine
+        let preview = match osc.wave.value().wavetable_index() {
+            Some(wavetable) => gui.state.builtin_waves[wavetable].clone(),
+            None => file.preview().unwrap_or_else(|| gui.state.builtin_waves[0].clone()),
+        };
+        let target = ModTarget::osc_position(index);
+        let position = match gui.live.monitor.modulation(target) {
+            Some(modulation) => target.scaling().apply(osc.position.value(), modulation).clamp(0.0, 1.0),
+            None => osc.position.value(),
+        };
+        Self {
+            preview,
+            position,
+            phase: osc.phase.value() / 100.0,
+            phase_rand: osc.phase_rand.value() / 100.0,
+            silent: osc.amp.value() == 0.0,
+        }
+    }
+
+    fn show(&self, ui: &mut Ui, height: f32) {
+        displays::wave(ui, &self.preview, self.position, self.phase, self.phase_rand, self.silent, height);
+    }
+}
+
+/// The filter's settings for its display, and the newest note's cutoff and resonance (as the
+/// synth modulates them) while a note plays, see [`displays::filter()`].
+fn filter_display_inputs(
+    filter: &FilterParams,
+    filter_env: &FilterEnvParams,
+    oversampling: Oversampling,
+    live: Live,
+) -> (displays::FilterSettings, Option<(f32, f32)>) {
+    let settings = displays::FilterSettings::new(
+        filter.model.value().to_filter_model(),
+        filter.filter_type.value().to_filter_type(),
+        filter.cutoff.value(),
+        filter.resonance.value(),
+        // As the synth applies it
+        filter_env.amount.value().powi(2),
+        live.sample_rate,
+        oversampling.factor(),
+    );
+    let monitor = live.monitor;
+    let playing = monitor.cutoff().map(|cutoff| {
+        let resonance = match monitor.modulation(ModTarget::Resonance) {
+            Some(modulation) if modulation != 0.0 => {
+                ModTarget::Resonance.scaling().apply(filter.resonance.value(), modulation).clamp(0.1, 10.0)
+            }
+            _ => filter.resonance.value(),
+        };
+        (cutoff, resonance)
+    });
+    (settings, playing)
+}
+
+/// An envelope's shape, worked out the way the synth does it, with where each note playing is
+/// in it, and its handles to drag, `height` tall.
+fn envelope_display(ui: &mut Ui, params: &EnvelopeParams, setter: &ParamSetter, live: Live, height: f32) {
+    let mut envelope = AdsrEnvelope::new(0.0, 0.0, 0.0, 0.0, 0.0);
+    crate::apply_envelope_params(&mut envelope, params);
+    displays::envelope(ui, &envelope, MOD_COLOR, &live.voice_times(), params, setter, height);
+}
+
+/// A combo box picking an oscillator's wavetable file from the wavetable folder.
+fn wavetable_file_combo(ui: &mut Ui, index: usize, file: &WavetableFile, gui: &mut Gui, width: f32) {
+    let current = file.path();
+    let current_name = Path::new(&current)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(("wavetable file", index))
+        .selected_text(if current.is_empty() {
+            String::from("(none)")
+        } else {
+            current_name
+        })
+        .width(width)
+        .show_ui(ui, |ui| {
+            if gui.state.files.is_empty() {
+                ui.label(RichText::new("No .wav files in the wavetable folder").weak());
+            }
+            for name in &gui.state.files {
+                if ui.selectable_label(current == *name, name).clicked() {
+                    picked = Some(name.clone());
+                }
+            }
+        })
+        .response
+        .on_hover_text(help::WAVETABLE_FILE);
+    if let Some(name) = picked {
+        load_wavetable_file(file, index, name, gui.executor);
+    }
+}
+
+/// How an oscillator's wavetable file's load went, if there's anything to say.
+fn wavetable_file_status(file: &WavetableFile) -> Option<String> {
+    let status = if file.path().is_empty() {
+        String::from("No file loaded: plays a sine until one is.")
+    } else {
+        file.status()
+    };
+    (!status.is_empty()).then_some(status)
+}
+
+/// Sets an oscillator's wavetable file and starts loading it in the background.
+fn load_wavetable_file(
+    file: &WavetableFile,
+    osc: usize,
+    path: String,
+    executor: &AsyncExecutor<ThreeOscPlugin>,
+) {
+    file.set_path(path);
+    if let Some(generation) = file.claim_load() {
+        file.set_status(String::from("Loading..."));
+        executor.execute_background(Task::LoadWavetable { osc, generation });
+    }
+}
+
+/// The wavetable folder, where the oscillators' File combo boxes look, with a button to look
+/// again, and a way to load a file from anywhere else. `path_width` is the width of the path
+/// to load from.
+fn wavetable_folder_rows(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui, path_width: f32) {
+    ui.add(egui::Label::new(RichText::new(gui.state.folder.to_string_lossy()).small().weak()).wrap());
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut gui.state.custom_path)
+                .hint_text("Path to a .wav file")
+                .desired_width(path_width),
+        )
+        .on_hover_text(help::WAVETABLE_PATH);
+        for osc in 0..3 {
+            if ui
+                .small_button(format!("Osc {}", osc + 1))
+                .on_hover_text(help::WAVETABLE_LOAD)
+                .clicked()
+                && !gui.state.custom_path.trim().is_empty()
+            {
+                let path = gui.state.custom_path.trim().to_string();
+                load_wavetable_file(params.wavetable_file(osc), osc, path, gui.executor);
+                set_param(setter, &params.oscillator(osc).wave, OscillatorWave::File);
+            }
+        }
+    });
 }

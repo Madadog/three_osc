@@ -1104,6 +1104,14 @@ impl FxParams {
         self.settings_from(&CurrentValues)
     }
 
+    /// How many of the effects are on.
+    pub fn enabled_count(&self) -> usize {
+        [&self.distortion.enabled, &self.chorus.enabled, &self.delay.enabled, &self.reverb.enabled]
+            .into_iter()
+            .filter(|enabled| enabled.value())
+            .count()
+    }
+
     /// The effects' settings with the parameters' values as `values` has them.
     pub fn settings_from(&self, values: &impl ParamValues) -> EffectSettings {
         let (distortion, chorus, delay, reverb) = (&self.distortion, &self.chorus, &self.delay, &self.reverb);

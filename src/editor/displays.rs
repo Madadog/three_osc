@@ -25,11 +25,12 @@ const SIGNAL_COLOR: Color32 = Color32::from_rgb(90, 180, 255);
 /// its LFOs' phases, its filter's cutoff.
 const LIVE_COLOR: Color32 = Color32::from_rgb(255, 238, 205);
 
-const WAVE_HEIGHT: f32 = 50.0;
+/// The heights the Classic layout gives the displays.
+pub const WAVE_HEIGHT: f32 = 50.0;
 /// The LFO displays sit beside their two rows of controls.
-const LFO_HEIGHT: f32 = 46.0;
-const ENVELOPE_HEIGHT: f32 = 46.0;
-const FILTER_HEIGHT: f32 = 76.0;
+pub const LFO_HEIGHT: f32 = 46.0;
+pub const ENVELOPE_HEIGHT: f32 = 46.0;
+pub const FILTER_HEIGHT: f32 = 76.0;
 
 /// Allocates a display `height` pixels tall across the available width and draws its
 /// background. Returns the display's response (for its hover text), a painter clipped to it and
@@ -88,8 +89,8 @@ fn x_at(rect: Rect, fraction: f32) -> f32 {
 /// (its Phase, in cycles), so the wave moves along as the Phase does. When a random part of a
 /// cycle is added to each note's start (Phase Rand, short of a whole cycle), the stretch the
 /// notes start in is shaded. A silent oscillator is drawn dimmed.
-pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase_rand: f32, silent: bool) {
-    let (response, painter, rect) = frame(ui, WAVE_HEIGHT);
+pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase_rand: f32, silent: bool, height: f32) {
+    let (response, painter, rect) = frame(ui, height);
     response.on_hover_text(
         "One cycle of the wave, at the wavetable position, from where notes start (the Phase). \
          The shaded stretch is where Phase Rand lets them start.",
@@ -119,8 +120,8 @@ pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase
 
 /// One cycle of an LFO's waveform, with a dot where the newest note's copy of it is (`phase`, in
 /// cycles).
-pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>) {
-    let (response, painter, rect) = frame(ui, LFO_HEIGHT);
+pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>, height: f32) {
+    let (response, painter, rect) = frame(ui, height);
     response.on_hover_text(
         "One cycle of the LFO, from -100% to 100%. The dot is where the newest note's copy of it is.",
     );
@@ -412,8 +413,9 @@ pub fn envelope(
     notes: &[(f32, Option<f32>)],
     params: &EnvelopeParams,
     setter: &ParamSetter,
+    height: f32,
 ) {
-    let (response, painter, rect) = frame_sensing(ui, ENVELOPE_HEIGHT, Sense::click_and_drag());
+    let (response, painter, rect) = frame_sensing(ui, height, Sense::click_and_drag());
     let drag_id = response.id.with("drag");
     let drag: Option<EnvelopeDrag> = ui.memory(|memory| memory.data.get_temp(drag_id));
     let shape = match drag {
@@ -921,24 +923,120 @@ fn process_blocks(filters: &mut [FilterContainer], blocks: &mut [[f32; FilterRes
     }
 }
 
+/// The controls a filter display can be dragged to set: the cutoff across, and the resonance up
+/// and down.
+pub struct FilterEdit<'a> {
+    pub cutoff: &'a FloatParam,
+    pub resonance: &'a FloatParam,
+    pub setter: &'a ParamSetter<'a>,
+}
+
+/// A drag of a filter display, kept in egui's memory while it lasts: where it has taken the
+/// cutoff, in Hz, and the resonance (from 0 to 1 across its range), before they are clamped.
+#[derive(Debug, Clone, Copy)]
+struct FilterDrag {
+    cutoff: f32,
+    resonance: f32,
+}
+
+/// How many pixels of dragging up or down move the resonance across its whole range.
+const RESONANCE_DRAG_PIXELS: f32 = 160.0;
+
+impl FilterEdit<'_> {
+    /// Drags the cutoff and the resonance relative to where they were, so that grabbing the
+    /// display anywhere doesn't make them jump: the cutoff moves as the display's frequencies
+    /// do, and the resonance by its range per [`RESONANCE_DRAG_PIXELS`]. A double click resets
+    /// them.
+    fn interact(&self, ui: &Ui, response: &egui::Response, rect: Rect) {
+        let drag_id = response.id.with("drag");
+        let params = [self.cutoff, self.resonance];
+        if response.drag_started() {
+            for param in params {
+                self.setter.begin_set_parameter(param);
+            }
+            let drag = FilterDrag {
+                cutoff: self.cutoff.value(),
+                resonance: self.resonance.unmodulated_normalized_value(),
+            };
+            ui.memory_mut(|memory| memory.data.insert_temp(drag_id, drag));
+        }
+        let drag: Option<FilterDrag> = ui.memory(|memory| memory.data.get_temp(drag_id));
+        if let (true, Some(mut drag)) = (response.dragged(), drag) {
+            let delta = response.drag_delta();
+            drag.cutoff *= (HIGH_HZ / LOW_HZ).powf(delta.x / rect.width());
+            drag.resonance -= delta.y / RESONANCE_DRAG_PIXELS;
+            let cutoff = self.cutoff.preview_plain(self.cutoff.preview_normalized(drag.cutoff));
+            self.setter.set_parameter(self.cutoff, cutoff);
+            self.setter.set_parameter(self.resonance, self.resonance.preview_plain(drag.resonance.clamp(0.0, 1.0)));
+            ui.memory_mut(|memory| memory.data.insert_temp(drag_id, drag));
+        }
+        if response.drag_stopped() {
+            for param in params {
+                self.setter.end_set_parameter(param);
+            }
+            ui.memory_mut(|memory| memory.data.remove::<FilterDrag>(drag_id));
+        }
+        if response.double_clicked() {
+            for param in params {
+                self.setter.begin_set_parameter(param);
+                self.setter.set_parameter(param, param.default_plain_value());
+                self.setter.end_set_parameter(param);
+            }
+        }
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+}
+
 /// The filter's frequency response, from 20 Hz to 20 kHz, with its cutoff marked, and the
 /// response at the peak of the filter envelope drawn more faintly when the envelope moves the
 /// cutoff. `live` is the newest note's cutoff and resonance, with its envelope, keytracking and
 /// modulation: while a note plays, its response is drawn over the controls' and moves with it.
-pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterResponse, live: Option<(f32, f32)>) {
+/// With `edit`, the display can be dragged to set the cutoff and the resonance, and has a
+/// handle at the cutoff to show it.
+pub fn filter(
+    ui: &mut Ui,
+    settings: FilterSettings,
+    response: &mut FilterResponse,
+    live: Option<(f32, f32)>,
+    height: f32,
+    edit: Option<FilterEdit>,
+) {
     response.update(settings);
-    let (hover, painter, rect) = frame(ui, FILTER_HEIGHT);
-    hover.on_hover_text(
-        "The filter's frequency response, from 20 Hz to 20 kHz (the line marks the cutoff), \
-         measured from the filter itself with a quiet signal, so the drive's distortion doesn't \
-         show. The fainter curve is the response at the peak of the filter envelope. With \
-         keytracking, the cutoff is for the note A4. While notes play, the light curve is the \
-         newest note's response, with its envelope, keytracking and modulation moving it.",
-    );
+    let sense = if edit.is_some() { Sense::click_and_drag() } else { Sense::hover() };
+    let (hover, painter, rect) = frame_sensing(ui, height, sense);
+    if let Some(edit) = &edit {
+        edit.interact(ui, &hover, rect);
+    }
+    // (Not while dragging, when it would only get in the way)
+    if !hover.dragged() {
+        hover.clone().on_hover_text(format!(
+            "The filter's frequency response, from 20 Hz to 20 kHz (the line marks the cutoff), \
+             measured from the filter itself with a quiet signal, so the drive's distortion \
+             doesn't show. The fainter curve is the response at the peak of the filter envelope. \
+             With keytracking, the cutoff is for the note A4. While notes play, the light curve \
+             is the newest note's response, with its envelope, keytracking and modulation moving \
+             it.{}",
+            if edit.is_some() {
+                " Drag it across to move the cutoff, and up or down for the resonance; \
+                 double-click it to reset them."
+            } else {
+                ""
+            }
+        ));
+    }
     let x_for = |hz: f32| x_at(rect, (hz / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln());
     let y_for = |db: f32| {
         let fraction = (db.clamp(FLOOR_DB, CEILING_DB) - FLOOR_DB) / (CEILING_DB - FLOOR_DB);
         rect.bottom() - fraction * rect.height()
+    };
+    // The level of a response at a frequency, at the point nearest to it
+    let level_at = |levels: &[f32], hz: f32| {
+        let point = ((hz / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln() * (RESPONSE_POINTS - 1) as f32).round();
+        levels.get(point.clamp(0.0, (RESPONSE_POINTS - 1) as f32) as usize).copied().unwrap_or(0.0)
     };
 
     // A guide every decade and at 0 dB, labelled
@@ -979,14 +1077,19 @@ pub fn filter(ui: &mut Ui, settings: FilterSettings, response: &mut FilterRespon
     let levels = response.levels.clone();
     let color = if live.is_some() { SIGNAL_COLOR.gamma_multiply(0.6) } else { SIGNAL_COLOR };
     curve(&painter, points(&levels), rect.bottom(), color, 1.5);
+    if edit.is_some() && filtered {
+        let cutoff = settings.cutoff.clamp(LOW_HZ, HIGH_HZ);
+        let at = Pos2::new(x_for(cutoff), y_for(level_at(&levels, cutoff)));
+        let lit = hover.hovered() || hover.dragged();
+        let fill = if lit { SIGNAL_COLOR } else { ui.visuals().extreme_bg_color };
+        painter.circle(at, if lit { 5.0 } else { 4.0 }, fill, Stroke::new(1.5_f32, SIGNAL_COLOR));
+    }
     if let Some((cutoff, resonance)) = live {
         let levels = response.update_live(settings, cutoff, resonance).to_vec();
         painter.add(Shape::line(points(&levels), Stroke::new(1.5_f32, LIVE_COLOR)));
         // A dot on it at the note's cutoff
         let x = x_for(cutoff.clamp(LOW_HZ, HIGH_HZ));
-        let point = (((cutoff / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln()) * (RESPONSE_POINTS - 1) as f32).round();
-        let level = levels.get(point.clamp(0.0, (RESPONSE_POINTS - 1) as f32) as usize).copied().unwrap_or(0.0);
-        live_dot(&painter, Pos2::new(x, y_for(level)));
+        live_dot(&painter, Pos2::new(x, y_for(level_at(&levels, cutoff))));
     }
 }
 

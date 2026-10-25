@@ -1,5 +1,6 @@
 //! The folders the user's files are kept in: wavetables, tunings and presets each have one in
 //! `Documents/Three Osc` in the home directory, unless an environment variable names another.
+//! The editor's settings are in a file there too.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,12 @@ pub fn tunings() -> PathBuf {
 /// Where the user's presets are saved and listed from (or `THREE_OSC_PRESETS`).
 pub fn presets() -> PathBuf {
     folder("Presets", "THREE_OSC_PRESETS")
+}
+
+/// The file the editor's settings (its theme) are kept in, next to the folders (or
+/// `THREE_OSC_SETTINGS`).
+pub fn settings() -> PathBuf {
+    folder("Settings.json", "THREE_OSC_SETTINGS")
 }
 
 fn folder(name: &str, variable: &str) -> PathBuf {

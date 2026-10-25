@@ -16,7 +16,7 @@ const PRESET_COMBO_WIDTH: f32 = 190.0;
 /// How long after loading a preset its parameters may still be on their way through the host,
 /// in seconds, during which it isn't marked as changed.
 const LOAD_SETTLE_SECONDS: f64 = 0.5;
-const ERROR_COLOR: Color32 = Color32::from_rgb(255, 120, 100);
+pub const ERROR_COLOR: Color32 = Color32::from_rgb(255, 120, 100);
 
 /// The presets the browser lists, and what it is doing.
 pub struct PresetBrowser {
@@ -144,7 +144,8 @@ impl Default for PresetBrowser {
     }
 }
 
-/// The plugin's name and version, the presets and the tuning, and some help at the right.
+/// The Classic layout's title bar: the plugin's name and version, the presets and the tuning,
+/// and the theme and some help at the right.
 pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
     ui.horizontal(|ui| {
         ui.heading("Three Osc");
@@ -154,6 +155,8 @@ pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui
         ui.add_space(10.0);
         super::tuning_window::button(ui, params, &mut gui.state.tuning);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            super::theme_picker(ui, gui);
+            ui.add_space(6.0);
             ui.add(
                 egui::Label::new(
                     RichText::new(
@@ -169,7 +172,7 @@ pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui
 }
 
 /// The preset browser: arrows to step through the presets, a list of them, and saving.
-fn presets(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
+pub fn presets(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
     let time = ui.input(|input| input.time);
     let browser = &mut gui.state.presets;
     if !browser.scanned {

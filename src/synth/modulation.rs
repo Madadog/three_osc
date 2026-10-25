@@ -14,8 +14,8 @@ use nih_plug::prelude::Enum;
 
 use super::oscillator::{MULTIPLIER_RANGE, OCTAVE_RANGE};
 
-/// Something that can drive a modulation route. The LFOs, the random source and the oscillators
-/// are bipolar (-1 to 1), everything else goes from 0 to 1.
+/// Something that can drive a modulation route. The LFOs, the key, the random source and the
+/// oscillators are bipolar (-1 to 1), everything else goes from 0 to 1.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModSource {
     #[id = "none"]
@@ -75,6 +75,9 @@ pub const N_LFOS: usize = 3;
 pub const N_MOD_ENVELOPES: usize = 2;
 
 impl ModSource {
+    /// The sources that come from MIDI, and the random one, which have no controls of their own.
+    pub const MIDI: [Self; 5] = [Self::Velocity, Self::Key, Self::ModWheel, Self::Aftertouch, Self::Random];
+
     pub fn lfo(index: usize) -> Self {
         [Self::Lfo1, Self::Lfo2, Self::Lfo3][index]
     }
@@ -83,6 +86,13 @@ impl ModSource {
     }
     pub fn osc(index: usize) -> Self {
         [Self::Osc1, Self::Osc2, Self::Osc3][index]
+    }
+    /// Whether the source swings from -1 to 1, rather than from 0 to 1.
+    pub fn is_bipolar(self) -> bool {
+        matches!(
+            self,
+            Self::Lfo1 | Self::Lfo2 | Self::Lfo3 | Self::Key | Self::Random | Self::Osc1 | Self::Osc2 | Self::Osc3
+        )
     }
     /// A short description for the GUI.
     pub fn help(self) -> &'static str {
