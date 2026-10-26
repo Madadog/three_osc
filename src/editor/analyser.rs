@@ -342,9 +342,8 @@ fn spectrogram(ui: &mut Ui, analyser: &mut Analyser, width: f32, height: f32) {
         (inner.height() * pixels_per_point).round().max(1.0) as usize,
     );
     let painter = ui.painter_at(rect);
-    let visuals = ui.visuals();
     painter.image(texture.id(), inner, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-    painter.rect_stroke(rect, 3.0, visuals.widgets.noninteractive.bg_stroke, StrokeKind::Inside);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, super::displays::palette(ui.ctx()).edge), StrokeKind::Inside);
 
     // Guides at 100 Hz, 1 kHz and 10 kHz
     let highest = HIGHEST_HZ.min(spectrogram.sample_rate * 0.5);
@@ -381,6 +380,7 @@ fn meters(ui: &mut Ui, analyser: &mut Analyser, width: f32, height: f32) {
     }
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
+    let screen = super::displays::palette(ui.ctx()).screen;
     let label_width = 12.0;
     let readout_width = 38.0;
     let scale = Rect::from_min_max(
@@ -408,7 +408,7 @@ fn meters(ui: &mut Ui, analyser: &mut Analyser, width: f32, height: f32) {
             egui::FontId::proportional(10.0),
             visuals.weak_text_color(),
         );
-        painter.rect_filled(bar, 2.0, visuals.extreme_bg_color);
+        painter.rect_filled(bar, 2.0, screen);
         let peak_db = gain_to_db(meter.level);
         let rms_db = gain_to_db(meter.mean_square.sqrt());
         if peak_db > METER_FLOOR_DB {

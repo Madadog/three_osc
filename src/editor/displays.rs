@@ -18,12 +18,48 @@ use crate::synth::filter::{
 };
 use crate::synth::oscillator::{OscWave, WavePreview};
 
-/// The colour of the oscillator and filter displays (the envelopes and LFOs, which are
-/// modulation sources, use the modulation colour).
-const SIGNAL_COLOR: Color32 = Color32::from_rgb(90, 180, 255);
-/// The colour of what moves with the notes that are playing: where each is in its envelopes,
-/// its LFOs' phases, its filter's cutoff.
-const LIVE_COLOR: Color32 = Color32::from_rgb(255, 238, 205);
+/// The displays' colours, which the theme sets (see [`set_palette()`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    /// The displays' background, and their edge.
+    pub screen: Color32,
+    pub edge: Color32,
+    /// The oscillators', the filter's and the effects' curves. (The envelopes and LFOs, which
+    /// are modulation sources, are drawn in the modulation colour.)
+    pub signal: Color32,
+    /// What moves with the notes that are playing: where each is in its envelopes, its LFOs'
+    /// phases, its filter's response.
+    pub live: Color32,
+    /// The guide lines, and the labels on them.
+    pub guide: Color32,
+    pub label: Color32,
+}
+
+impl Palette {
+    /// Dark screens with blue curves, as the Classic theme has them.
+    pub const DARK: Self = Self {
+        screen: Color32::from_gray(10),
+        edge: Color32::from_gray(60),
+        signal: Color32::from_rgb(90, 180, 255),
+        live: Color32::from_rgb(255, 238, 205),
+        guide: Color32::from_gray(60),
+        label: Color32::from_gray(110),
+    };
+}
+
+fn palette_id() -> egui::Id {
+    egui::Id::new("display palette")
+}
+
+/// Sets the displays' colours.
+pub fn set_palette(ctx: &egui::Context, palette: Palette) {
+    ctx.data_mut(|data| data.insert_temp(palette_id(), palette));
+}
+
+/// The displays' colours.
+pub fn palette(ctx: &egui::Context) -> Palette {
+    ctx.data(|data| data.get_temp(palette_id())).unwrap_or(Palette::DARK)
+}
 
 /// The heights the Classic layout gives the displays.
 pub const WAVE_HEIGHT: f32 = 50.0;
@@ -32,34 +68,53 @@ pub const LFO_HEIGHT: f32 = 46.0;
 pub const ENVELOPE_HEIGHT: f32 = 46.0;
 pub const FILTER_HEIGHT: f32 = 76.0;
 
+/// A display's painter (clipped to it), and the colours to paint with.
+struct Canvas {
+    painter: Painter,
+    palette: Palette,
+}
+
+impl std::ops::Deref for Canvas {
+    type Target = Painter;
+    fn deref(&self) -> &Painter {
+        &self.painter
+    }
+}
+
+impl Canvas {
+    /// A dot for a note that is playing, at a point of the display.
+    fn live_dot(&self, at: Pos2) {
+        self.circle_filled(at, 3.5, self.palette.live);
+        self.circle_stroke(at, 3.5, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
+    }
+
+    /// A faint guide line across or down the display.
+    fn guide(&self, from: Pos2, to: Pos2) {
+        self.line_segment([from, to], Stroke::new(1.0_f32, self.palette.guide));
+    }
+}
+
 /// Allocates a display `height` pixels tall across the available width and draws its
-/// background. Returns the display's response (for its hover text), a painter clipped to it and
+/// background. Returns the display's response (for its hover text), what to paint it with and
 /// the area to plot in.
-fn frame(ui: &mut Ui, height: f32) -> (egui::Response, Painter, Rect) {
+fn frame(ui: &mut Ui, height: f32) -> (egui::Response, Canvas, Rect) {
     frame_sensing(ui, height, Sense::hover())
 }
 
 /// A [`frame()`] that senses what `sense` says, for displays that can be dragged.
-fn frame_sensing(ui: &mut Ui, height: f32, sense: Sense) -> (egui::Response, Painter, Rect) {
+fn frame_sensing(ui: &mut Ui, height: f32, sense: Sense) -> (egui::Response, Canvas, Rect) {
     let size = egui::vec2(ui.available_width(), height);
     let (response, painter) = ui.allocate_painter(size, sense);
     let rect = response.rect;
-    let visuals = ui.visuals();
-    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
-    painter.rect_stroke(rect, 3.0, visuals.widgets.noninteractive.bg_stroke, StrokeKind::Inside);
+    let palette = palette(ui.ctx());
+    painter.rect_filled(rect, 3.0, palette.screen);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, palette.edge), StrokeKind::Inside);
     let plot = rect.shrink2(egui::vec2(4.0, 5.0));
-    (response, painter.with_clip_rect(rect.shrink(1.0)), plot)
-}
-
-/// A dot for a note that is playing, at a point of a display.
-fn live_dot(painter: &Painter, at: Pos2) {
-    painter.circle_filled(at, 3.5, LIVE_COLOR);
-    painter.circle_stroke(at, 3.5, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
-}
-
-/// A faint guide line across or down a display.
-fn guide(painter: &Painter, from: Pos2, to: Pos2) {
-    painter.line_segment([from, to], Stroke::new(1.0_f32, Color32::from_gray(60)));
+    let canvas = Canvas {
+        painter: painter.with_clip_rect(rect.shrink(1.0)),
+        palette,
+    };
+    (response, canvas, plot)
 }
 
 /// Draws a curve through `points`, from left to right, with the area between it and the
@@ -96,10 +151,11 @@ pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase
          The shaded stretch is where Phase Rand lets them start.",
     );
     let centre = rect.center().y;
-    guide(&painter, Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
+    painter.guide(Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
+    let signal = painter.palette.signal;
     if phase_rand > 0.0 && phase_rand < 1.0 {
         let random = Rect::from_x_y_ranges(rect.left()..=x_at(rect, phase_rand), rect.y_range());
-        painter.rect_filled(random, 0.0, SIGNAL_COLOR.gamma_multiply(0.08));
+        painter.rect_filled(random, 0.0, signal.gamma_multiply(0.08));
     }
     let cycle = preview.cycle(position);
     // From the phase on, interpolated between the cycle's samples, so that the wave moves
@@ -114,7 +170,7 @@ pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase
             Pos2::new(x_at(rect, i as f32 / len as f32), centre - sample * rect.height() / 2.0)
         })
         .collect();
-    let color = if silent { SIGNAL_COLOR.gamma_multiply(0.35) } else { SIGNAL_COLOR };
+    let color = if silent { signal.gamma_multiply(0.35) } else { signal };
     curve(&painter, points, centre, color, 1.5);
 }
 
@@ -126,7 +182,7 @@ pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>, heig
         "One cycle of the LFO, from -100% to 100%. The dot is where the newest note's copy of it is.",
     );
     let centre = rect.center().y;
-    guide(&painter, Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
+    painter.guide(Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
     let steps = (rect.width() as usize).max(2) * 2;
     let points = (0..=steps)
         .map(|step| {
@@ -139,7 +195,7 @@ pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>, heig
     curve(&painter, points, centre, color, 1.5);
     if let Some(phase) = phase {
         let phase = phase.rem_euclid(1.0);
-        live_dot(&painter, Pos2::new(x_at(rect, phase), centre - wave.generate(phase) * rect.height() / 2.0));
+        painter.live_dot(Pos2::new(x_at(rect, phase), centre - wave.generate(phase) * rect.height() / 2.0));
     }
 }
 
@@ -516,7 +572,7 @@ pub fn envelope(
 
     for boundary in [shape.decay_start(), shape.release_start()] {
         let x = x_at(rect, boundary);
-        guide(&painter, Pos2::new(x, rect.top()), Pos2::new(x, bottom));
+        painter.guide(Pos2::new(x, rect.top()), Pos2::new(x, bottom));
     }
     // A point per pixel, plus the stage boundaries themselves for crisp corners
     let steps = (rect.width() as usize).max(2);
@@ -534,22 +590,22 @@ pub fn envelope(
         let at = to_screen(shape.handle(handle));
         let lit = active == Some(handle);
         let radius = if handle.is_slope() { 2.5 } else { 3.5 };
-        let fill = if lit { color } else { ui.visuals().extreme_bg_color };
+        let fill = if lit { color } else { painter.palette.screen };
         painter.circle(at, radius + if lit { 1.0 } else { 0.0 }, fill, Stroke::new(1.0_f32, color));
     }
     for &(time, released) in notes {
         if let Some(located) = shape.locate(time, released) {
-            live_dot(&painter, to_screen(located));
+            painter.live_dot(to_screen(located));
         }
     }
 }
 
 /// The colour of an effect's display: dimmed while the effect is off.
-fn effect_color(on: bool) -> Color32 {
+fn effect_color(palette: &Palette, on: bool) -> Color32 {
     if on {
-        SIGNAL_COLOR
+        palette.signal
     } else {
-        SIGNAL_COLOR.gamma_multiply(0.35)
+        palette.signal.gamma_multiply(0.35)
     }
 }
 
@@ -562,9 +618,9 @@ pub fn distortion(ui: &mut Ui, height: f32, drive_db: f32, mix: f32, on: bool) {
          1. The faint line is the clean sound.",
     );
     let centre = rect.center();
-    guide(&painter, Pos2::new(rect.left(), centre.y), Pos2::new(rect.right(), centre.y));
-    guide(&painter, Pos2::new(centre.x, rect.top()), Pos2::new(centre.x, rect.bottom()));
-    guide(&painter, rect.left_bottom(), rect.right_top());
+    painter.guide(Pos2::new(rect.left(), centre.y), Pos2::new(rect.right(), centre.y));
+    painter.guide(Pos2::new(centre.x, rect.top()), Pos2::new(centre.x, rect.bottom()));
+    painter.guide(rect.left_bottom(), rect.right_top());
     let gain = 10.0_f32.powf(drive_db * 0.05);
     let steps = (rect.width() as usize).max(2);
     let points = (0..=steps)
@@ -574,7 +630,7 @@ pub fn distortion(ui: &mut Ui, height: f32, drive_db: f32, mix: f32, on: bool) {
             Pos2::new(x_at(rect, step as f32 / steps as f32), centre.y - output * rect.height() / 2.0)
         })
         .collect();
-    painter.add(Shape::line(points, Stroke::new(1.5_f32, effect_color(on))));
+    painter.add(Shape::line(points, Stroke::new(1.5_f32, effect_color(&painter.palette, on))));
 }
 
 /// One cycle of the chorus's sweep: how the delay of each channel's copy moves (left solid,
@@ -586,7 +642,7 @@ pub fn chorus(ui: &mut Ui, height: f32, depth: f32, on: bool) {
          right's (faint) sweeps, from 6 to 18 ms at full depth.",
     );
     let centre = rect.center().y;
-    guide(&painter, Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
+    painter.guide(Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
     let steps = (rect.width() as usize).max(2);
     let sweep = |offset: f32| -> Vec<Pos2> {
         (0..=steps)
@@ -597,7 +653,7 @@ pub fn chorus(ui: &mut Ui, height: f32, depth: f32, on: bool) {
             })
             .collect()
     };
-    let color = effect_color(on);
+    let color = effect_color(&painter.palette, on);
     painter.add(Shape::line(sweep(0.25), Stroke::new(1.0_f32, color.gamma_multiply(0.5))));
     painter.add(Shape::line(sweep(0.0), Stroke::new(1.5_f32, color)));
 }
@@ -612,11 +668,11 @@ pub fn delay(ui: &mut Ui, height: f32, time: f32, feedback: f32, mix: f32, ping_
         "The sound (the first line) and its echoes over {span:.1} s, each as high as its level{}.",
         if ping_pong { ", the left channel's up and the right's down" } else { "" }
     ));
-    let color = effect_color(on);
+    let color = effect_color(&painter.palette, on);
     let (top, bottom) = (rect.top(), rect.bottom());
     let base = if ping_pong { rect.center().y } else { bottom };
     let height = if ping_pong { rect.height() / 2.0 } else { rect.height() };
-    guide(&painter, Pos2::new(rect.left(), base), Pos2::new(rect.right(), base));
+    painter.guide(Pos2::new(rect.left(), base), Pos2::new(rect.right(), base));
     let tick = |painter: &Painter, at: f32, level: f32, up: bool, color: Color32| {
         let x = x_at(rect, at / span);
         let reach = level.clamp(0.0, 1.0) * height;
@@ -653,7 +709,7 @@ pub fn reverb(ui: &mut Ui, height: f32, size: f32, damping: f32, on: bool) {
          (bottom): the lows (solid) take {rt60:.1} s, the highs (faint) {:.1} s.",
         decay_time(highs)
     ));
-    let color = effect_color(on);
+    let color = effect_color(&painter.palette, on);
     let steps = (rect.width() as usize).max(2);
     let curve_for = |gain: f32| -> Vec<Pos2> {
         (0..=steps)
@@ -1040,15 +1096,16 @@ pub fn filter(
     };
 
     // A guide every decade and at 0 dB, labelled
-    let label_color = Color32::from_gray(110);
+    let label_color = painter.palette.label;
+    let signal = painter.palette.signal;
     let font = egui::FontId::proportional(9.0);
     for (hz, label) in [(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")] {
         let x = x_for(hz);
-        guide(&painter, Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom()));
+        painter.guide(Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom()));
         painter.text(Pos2::new(x + 2.0, rect.bottom()), egui::Align2::LEFT_BOTTOM, label, font.clone(), label_color);
     }
     let zero = y_for(0.0);
-    guide(&painter, Pos2::new(rect.left(), zero), Pos2::new(rect.right(), zero));
+    painter.guide(Pos2::new(rect.left(), zero), Pos2::new(rect.right(), zero));
     painter.text(Pos2::new(rect.left() + 1.0, zero - 1.0), egui::Align2::LEFT_BOTTOM, "0 dB", font, label_color);
 
     // Frequencies above the Nyquist frequency don't exist at this sample rate
@@ -1064,32 +1121,32 @@ pub fn filter(
     let filtered = !matches!(settings.model, FilterModel::None);
     let live = live.filter(|_| filtered);
     if let Some(levels) = &response.envelope_levels {
-        painter.add(Shape::line(points(levels), Stroke::new(1.0_f32, SIGNAL_COLOR.gamma_multiply(0.45))));
+        painter.add(Shape::line(points(levels), Stroke::new(1.0_f32, signal.gamma_multiply(0.45))));
     }
     if filtered {
         let x = x_for(settings.cutoff.clamp(LOW_HZ, HIGH_HZ));
         painter.line_segment(
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(1.0_f32, SIGNAL_COLOR.gamma_multiply(0.5)),
+            Stroke::new(1.0_f32, signal.gamma_multiply(0.5)),
         );
     }
     // The controls' response, behind the playing note's when there is one
     let levels = response.levels.clone();
-    let color = if live.is_some() { SIGNAL_COLOR.gamma_multiply(0.6) } else { SIGNAL_COLOR };
+    let color = if live.is_some() { signal.gamma_multiply(0.6) } else { signal };
     curve(&painter, points(&levels), rect.bottom(), color, 1.5);
     if edit.is_some() && filtered {
         let cutoff = settings.cutoff.clamp(LOW_HZ, HIGH_HZ);
         let at = Pos2::new(x_for(cutoff), y_for(level_at(&levels, cutoff)));
         let lit = hover.hovered() || hover.dragged();
-        let fill = if lit { SIGNAL_COLOR } else { ui.visuals().extreme_bg_color };
-        painter.circle(at, if lit { 5.0 } else { 4.0 }, fill, Stroke::new(1.5_f32, SIGNAL_COLOR));
+        let fill = if lit { signal } else { painter.palette.screen };
+        painter.circle(at, if lit { 5.0 } else { 4.0 }, fill, Stroke::new(1.5_f32, signal));
     }
     if let Some((cutoff, resonance)) = live {
         let levels = response.update_live(settings, cutoff, resonance).to_vec();
-        painter.add(Shape::line(points(&levels), Stroke::new(1.5_f32, LIVE_COLOR)));
+        painter.add(Shape::line(points(&levels), Stroke::new(1.5_f32, painter.palette.live)));
         // A dot on it at the note's cutoff
         let x = x_for(cutoff.clamp(LOW_HZ, HIGH_HZ));
-        live_dot(&painter, Pos2::new(x, y_for(level_at(&levels, cutoff))));
+        painter.live_dot(Pos2::new(x, y_for(level_at(&levels, cutoff))));
     }
 }
 

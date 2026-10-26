@@ -1,8 +1,9 @@
 //! The editor's themes, each a layout of the controls with its own look: Studio (see
-//! [`super::studio`]) and Classic (see [`super::classic`]). Which one the editor shows is a
-//! preference rather than part of a project, so it is kept in a settings file (see
-//! [`folders::settings()`]) for every instance of the plugin, and read when the first editor
-//! opens.
+//! [`super::studio`]), Classic (see [`super::classic`]), Flow (see [`super::flow`]), Rack (see
+//! [`super::rack`]), Focus (see [`super::focus`]), Compact (see [`super::compact`]) and Vintage
+//! (see [`super::vintage`]). Which one the editor shows is a preference rather than part of a
+//! project, so it is kept in a settings file (see [`folders::settings()`]) for every instance of
+//! the plugin, and read when the first editor opens.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use nih_plug_egui::egui;
 use serde::{Deserialize, Serialize};
 
+use super::displays::Palette;
 use crate::folders;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -17,15 +19,33 @@ pub enum Theme {
     #[default]
     Studio,
     Classic,
+    Flow,
+    Rack,
+    Focus,
+    Compact,
+    Vintage,
 }
 
 impl Theme {
-    pub const ALL: [Self; 2] = [Self::Studio, Self::Classic];
+    pub const ALL: [Self; 7] = [
+        Self::Studio,
+        Self::Classic,
+        Self::Flow,
+        Self::Rack,
+        Self::Focus,
+        Self::Compact,
+        Self::Vintage,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Studio => "Studio",
             Self::Classic => "Classic",
+            Self::Flow => "Flow",
+            Self::Rack => "Rack",
+            Self::Focus => "Focus",
+            Self::Compact => "Compact",
+            Self::Vintage => "Vintage",
         }
     }
 
@@ -40,6 +60,35 @@ impl Theme {
                 "The original layout: every control on one page as a slider, with the \
                  modulation matrix always in view and tabs for the effects and the advanced \
                  settings."
+            }
+            Self::Flow => {
+                "The controls in the order the sound flows through them, from left to right, \
+                 drawn as a blueprint: the oscillators (with each one's modulation of the next \
+                 on the arrow between them), the mixer, the filter, the amp, the effects and \
+                 the output, with the other modulation sources in a lane underneath."
+            }
+            Self::Rack => {
+                "Every part of the synth as a module in a rack, like modular hardware: each \
+                 modulation source has an output jack to drag onto a knob, and every route is \
+                 drawn as a patch cable from its jack to its knob. The knobs show their values \
+                 while they're hovered."
+            }
+            Self::Focus => {
+                "One part of the synth at a time, large and explained, on a light page: a \
+                 sidebar lists every part with what it's set to, and searches for any control, \
+                 and the part picked shows what it does, its display, large knobs, its \
+                 modulation routes, and what the control last hovered does."
+            }
+            Self::Compact => {
+                "Every control at once as a small knob that shows its value while it's \
+                 hovered, so the whole synth fits a small window, with one large display for \
+                 the part last touched. Green on black, like a terminal."
+            }
+            Self::Vintage => {
+                "The front panel of an old polysynth, between wooden end cheeks: every control \
+                 is a fader, the choices are lit buttons or displays stepped through with \
+                 arrows, and a scope shows the section last pressed on. The faders get longer, \
+                 and the panel wider, to fill the window."
             }
         }
     }
@@ -99,10 +148,17 @@ fn save(path: &Path, theme: Theme) -> Result<(), String> {
 
 /// Gives the editor the theme's look.
 pub fn apply(ctx: &egui::Context, theme: Theme) {
-    ctx.set_style(match theme {
-        Theme::Studio => super::studio::style(),
-        Theme::Classic => egui::Style::default(),
-    });
+    let (style, palette) = match theme {
+        Theme::Studio => (super::studio::style(), super::studio::PALETTE),
+        Theme::Classic => (egui::Style::default(), Palette::DARK),
+        Theme::Flow => (super::flow::style(), super::flow::PALETTE),
+        Theme::Rack => (super::rack::style(), super::rack::PALETTE),
+        Theme::Focus => (super::focus::style(), super::focus::PALETTE),
+        Theme::Compact => (super::compact::style(), super::compact::PALETTE),
+        Theme::Vintage => (super::vintage::style(), super::vintage::PALETTE),
+    };
+    ctx.set_style(style);
+    super::displays::set_palette(ctx, palette);
 }
 
 #[cfg(test)]

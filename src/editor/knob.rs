@@ -1,5 +1,6 @@
-//! The Studio layout's rotary control for a parameter: a knob with its name above it and its
-//! value below.
+//! A control for a parameter, as the themes other than Classic have them: a knob that turns,
+//! or a fader that slides, with its name above it and its value below (or, in a compact style,
+//! in place of its name while it's hovered).
 //!
 //! Dragging a knob up (or to the right) turns it up, ten times finer with Shift held; the mouse
 //! wheel steps it; a double-click (or Ctrl/Cmd+click) puts it back to its default; and clicking
@@ -7,26 +8,39 @@
 //! modulation routes that move it.
 //!
 //! A knob that can be modulated is a drop target for the modulation sources' handles. Around it
-//! an arc shows how far its routes can move it, with a dot where the newest note's modulation
-//! has it, and it lights up while the handle of a source that modulates it is hovered.
+//! (or beside a fader) an arc shows how far its routes can move it, with a dot where the newest
+//! note's modulation has it, and it lights up while the handle of a source that modulates it is
+//! hovered.
 
+use std::cell::RefCell;
 use std::f32::consts::PI;
 
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::text::{CCursor, CCursorRange};
 use nih_plug_egui::egui::text_edit::TextEditState;
-use nih_plug_egui::egui::{self, Color32, FontId, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, Ui, Vec2};
+use nih_plug_egui::egui::{
+    self, Color32, CornerRadius, FontId, Pos2, Rect, Response, RichText, Sense, Shape as EguiShape, Stroke, StrokeKind,
+    Ui, Vec2,
+};
 use nih_plug_egui::widgets::ParamSlider;
 
+use super::catalog::Colors;
 use super::{set_param, Matrix, NumericParam, MOD_COLOR};
 use crate::synth::modulation::{ModSource, ModTarget, N_SOURCES};
 
-/// What the knobs need besides their parameters: a way to set them, the modulation matrix, and
-/// the modulation source whose routes to light up (the one whose handle is hovered).
+/// What the knobs need besides their parameters: a way to set them, the modulation matrix, the
+/// modulation source whose routes to light up (the one whose handle is hovered), and how the
+/// layout wants them to look.
 pub struct Controls<'a> {
     pub setter: &'a ParamSetter<'a>,
     pub matrix: &'a Matrix<'a>,
     pub highlight: Option<ModSource>,
+    pub style: Style,
+    /// The colour of each group's knobs.
+    pub colors: Colors,
+    /// Where to note down where each knob that can be modulated is, for layouts that draw the
+    /// routes to them.
+    pub positions: Option<&'a RefCell<Vec<(ModTarget, Pos2)>>>,
 }
 
 /// How far a drag turns a knob across its whole range, in pixels.
@@ -41,20 +55,83 @@ const START_ANGLE: f32 = 0.75 * PI;
 const SWEEP: f32 = 1.5 * PI;
 /// The colour of where the newest note's modulation has a knob.
 const LIVE_COLOR: Color32 = Color32::from_rgb(255, 238, 205);
+const MIN_DIAMETER: f32 = 22.0;
+/// The smallest a knob's name or value gets to fit its cell.
+const MIN_FONT_SIZE: f32 = 7.0;
+/// The height of a fader's cap.
+const CAP_HEIGHT: f32 = 12.0;
 
-const LABEL_HEIGHT: f32 = 15.0;
-const VALUE_HEIGHT: f32 = 17.0;
-const MIN_DIAMETER: f32 = 26.0;
-const MAX_DIAMETER: f32 = 44.0;
-const FONT_SIZE: f32 = 11.5;
-
-/// The height of a knob `width` wide, with its name and its value.
-pub fn height(width: f32) -> f32 {
-    LABEL_HEIGHT + diameter(width) + VALUE_HEIGHT + 2.0
+/// What a control looks like.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shape {
+    /// A knob that turns.
+    Rotary,
+    /// A vertical fader whose cap travels this many pixels.
+    Fader(f32),
 }
 
-fn diameter(width: f32) -> f32 {
-    (width * 0.58).clamp(MIN_DIAMETER, MAX_DIAMETER)
+/// How a layout's knobs look: their shape, their text, and what they show.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Style {
+    pub shape: Shape,
+    pub font_size: f32,
+    pub monospace: bool,
+    /// Whether the value is shown under the knob all the time, or only in place of its name
+    /// while it is hovered or turned, which takes less room.
+    pub value_below: bool,
+    /// Whether hovering a knob shows what it does, for layouts that don't show that elsewhere.
+    pub tooltips: bool,
+    /// The largest a knob gets across.
+    pub max_diameter: f32,
+}
+
+impl Style {
+    /// Studio's knobs.
+    pub const STUDIO: Self = Self {
+        shape: Shape::Rotary,
+        font_size: 11.5,
+        monospace: false,
+        value_below: true,
+        tooltips: true,
+        max_diameter: 44.0,
+    };
+
+    fn font(&self) -> FontId {
+        if self.monospace {
+            FontId::monospace(self.font_size)
+        } else {
+            FontId::proportional(self.font_size)
+        }
+    }
+
+    fn label_height(&self) -> f32 {
+        (self.font_size * 1.3).round()
+    }
+
+    fn value_height(&self) -> f32 {
+        if self.value_below {
+            self.label_height() + 2.0
+        } else {
+            0.0
+        }
+    }
+
+    /// How tall the knob, or the fader, is in a cell `width` wide.
+    fn control_height(&self, width: f32) -> f32 {
+        match self.shape {
+            Shape::Rotary => self.diameter(width),
+            Shape::Fader(travel) => travel + CAP_HEIGHT,
+        }
+    }
+
+    fn diameter(&self, width: f32) -> f32 {
+        (width * 0.58).clamp(MIN_DIAMETER.min(self.max_diameter), self.max_diameter)
+    }
+
+    /// The height of a knob `width` wide, with its name and its value.
+    pub fn height(&self, width: f32) -> f32 {
+        self.label_height() + self.control_height(width) + self.value_height() + 2.0
+    }
 }
 
 /// The angle of a knob turned to `normalized`.
@@ -69,7 +146,7 @@ fn arc(painter: &egui::Painter, center: Pos2, radius: f32, from: f32, to: f32, s
     let points = (0..=steps)
         .map(|step| center + radius * Vec2::angled(from + (to - from) * step as f32 / steps as f32))
         .collect();
-    painter.add(Shape::line(points, stroke));
+    painter.add(EguiShape::line(points, stroke));
 }
 
 /// Where a knob's arc starts: at zero, for a parameter that goes either side of it, or else at
@@ -142,23 +219,38 @@ impl<'a, P: NumericParam> Knob<'a, P> {
         self
     }
 
-    /// Adds the knob, `width` wide (and [`height()`] tall).
+    /// Adds the knob, `width` wide (and as tall as the style's [`Style::height()`]).
     pub fn show(self, ui: &mut Ui, width: f32, controls: &Controls) -> Response {
         let Self { param, label, help, target, color } = self;
         let setter = controls.setter;
-        let diameter = diameter(width);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height(width)), Sense::hover());
+        let style = controls.style;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, style.height(width)), Sense::hover());
         let id = ui.id().with(("knob", param.name()));
-        let center = Pos2::new(rect.center().x, rect.top() + LABEL_HEIGHT + diameter / 2.0);
-        // The name is part of what can be grabbed, and the value below is for typing one in
-        let grab = Rect::from_min_max(rect.min, Pos2::new(rect.right(), center.y + diameter / 2.0 + 1.0));
-        let value_rect = Rect::from_min_max(Pos2::new(rect.left(), grab.bottom()), rect.max);
+        let label_rect = Rect::from_min_size(rect.min, egui::vec2(width, style.label_height()));
+        let control_rect = Rect::from_min_size(
+            Pos2::new(rect.left(), label_rect.bottom()),
+            egui::vec2(width, style.control_height(width)),
+        );
+        // The name is part of what can be grabbed, and the value (or, without a value below, the
+        // name) is for typing one in
+        let grab = Rect::from_min_max(
+            if style.value_below { rect.min } else { control_rect.min },
+            Pos2::new(rect.right(), control_rect.bottom() + 1.0),
+        );
+        let value_rect = if style.value_below {
+            Rect::from_min_max(Pos2::new(rect.left(), grab.bottom()), rect.max)
+        } else {
+            label_rect
+        };
         let response = ui.interact(grab, id, Sense::click_and_drag());
         let modulatable = target != ModTarget::None;
         let fine = ui.input(|input| input.modifiers.shift);
+        if let (true, Some(positions)) = (modulatable, controls.positions) {
+            positions.borrow_mut().push((target, control_rect.center()));
+        }
 
         // Dragging turns it from where it was, with the unrounded position kept so that stepped
-        // parameters move evenly
+        // parameters move evenly. A fader's cap follows the pointer.
         let drag_id = id.with("drag");
         if response.drag_started() {
             setter.begin_set_parameter(param);
@@ -167,10 +259,14 @@ impl<'a, P: NumericParam> Knob<'a, P> {
         }
         if response.dragged() {
             let delta = response.drag_delta();
-            let speed = if fine { FINE } else { 1.0 } / DRAG_PIXELS;
+            let (distance, pixels) = match style.shape {
+                Shape::Rotary => (delta.x - delta.y, DRAG_PIXELS),
+                Shape::Fader(travel) => (-delta.y, travel),
+            };
+            let speed = if fine { FINE } else { 1.0 } / pixels;
             let start = ui.memory(|memory| memory.data.get_temp::<f32>(drag_id));
-            let position = (start.unwrap_or_else(|| param.unmodulated_normalized_value()) + (delta.x - delta.y) * speed)
-                .clamp(0.0, 1.0);
+            let position =
+                (start.unwrap_or_else(|| param.unmodulated_normalized_value()) + distance * speed).clamp(0.0, 1.0);
             ui.memory_mut(|memory| memory.data.insert_temp(drag_id, position));
             set_normalized(setter, param, position);
         }
@@ -192,46 +288,60 @@ impl<'a, P: NumericParam> Knob<'a, P> {
 
         // The value, or the field it's being typed into
         let entry_id = id.with("entry");
-        let editing = value_entry(ui, entry_id, value_rect, param, setter);
-        if !editing {
-            let value = ui.interact(value_rect, id.with("value"), Sense::click());
+        let editing = value_entry(ui, entry_id, value_rect, param, setter, style.font());
+        let value = (!editing).then(|| ui.interact(value_rect, id.with("value"), Sense::click()));
+        if let Some(value) = &value {
             if value.clicked() {
                 start_entry(ui, entry_id, param);
             }
-            if value.hovered() {
+        }
+        let value_hovered = value.as_ref().is_some_and(|value| value.hovered());
+        let active = response.hovered() || response.dragged() || value_hovered;
+        let text_color = |strong: bool| if strong { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+        if !editing {
+            if value_hovered {
                 ui.painter().rect_filled(value_rect.shrink2(egui::vec2(4.0, 1.0)), 3.0, ui.visuals().widgets.hovered.bg_fill);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
             }
-            let text = param.normalized_value_to_string(param.modulated_normalized_value(), true);
-            let text_color = if response.dragged() || value.hovered() {
-                ui.visuals().strong_text_color()
+            let shown = if style.value_below || !active {
+                None
             } else {
-                ui.visuals().text_color()
+                Some(param.normalized_value_to_string(param.modulated_normalized_value(), true))
             };
-            ui.painter().text(value_rect.center(), egui::Align2::CENTER_CENTER, text, FontId::proportional(FONT_SIZE), text_color);
-            value.on_hover_text("Click to type in a value.");
+            // The name, or in its place the value while the knob is in use
+            let (text, color) = match shown {
+                Some(text) => (text, text_color(true)),
+                None if active => (label.to_string(), text_color(true)),
+                None => (label.to_string(), ui.visuals().weak_text_color()),
+            };
+            fitted_text(ui.painter(), label_rect, text, style.font(), color);
+            if style.value_below {
+                let text = param.normalized_value_to_string(param.modulated_normalized_value(), true);
+                let color = text_color(response.dragged() || value_hovered);
+                fitted_text(ui.painter(), value_rect, text, style.font(), color);
+            }
+        } else if style.value_below {
+            fitted_text(ui.painter(), label_rect, label.to_string(), style.font(), text_color(true));
         }
 
-        paint(ui, &response, center, diameter, param, target, color, controls);
-        let label_color = if response.hovered() || response.dragged() {
-            ui.visuals().strong_text_color()
-        } else {
-            ui.visuals().weak_text_color()
-        };
-        ui.painter().text(
-            Pos2::new(rect.center().x, rect.top() + LABEL_HEIGHT / 2.0),
-            egui::Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(FONT_SIZE),
-            label_color,
-        );
+        match style.shape {
+            Shape::Rotary => paint_rotary(ui, &response, control_rect, param, target, color, controls),
+            Shape::Fader(_) => paint_fader(ui, &response, control_rect, param, target, color, controls),
+        }
 
         if response.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            let cursor = match style.shape {
+                Shape::Rotary => egui::CursorIcon::ResizeVertical,
+                Shape::Fader(_) => egui::CursorIcon::ResizeRow,
+            };
+            ui.ctx().set_cursor_icon(cursor);
         }
         context_menu(&response, entry_id, param, target, controls);
+        if let (Some(value), true) = (value, style.value_below) {
+            value.on_hover_text("Click to type in a value.");
+        }
         // (Not while it's being turned, when it would only get in the way)
-        if response.dragged() {
+        if response.dragged() || !style.tooltips {
             response
         } else {
             let routes: Vec<String> = controls
@@ -251,6 +361,19 @@ impl<'a, P: NumericParam> Knob<'a, P> {
             })
         }
     }
+}
+
+/// Writes `text` in the middle of `rect`, in a smaller font if it would be wider than the rect.
+fn fitted_text(painter: &egui::Painter, rect: Rect, text: String, font: FontId, color: Color32) {
+    let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+    let room = rect.width() - 2.0;
+    let galley = if galley.size().x > room {
+        let size = (font.size * room / galley.size().x).max(MIN_FONT_SIZE);
+        painter.layout_no_wrap(text, FontId::new(size, font.family), color)
+    } else {
+        galley
+    };
+    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
 }
 
 /// Turns a hovered knob by the mouse wheel's steps: one step of the parameter's at a time if it
@@ -316,7 +439,14 @@ fn start_entry<P: Param>(ui: &Ui, entry_id: egui::Id, param: &P) {
 
 /// The field a value is being typed into, if one is: Enter sets the parameter to it, and
 /// Escape or clicking elsewhere leaves the parameter as it was. Returns whether there is one.
-fn value_entry<P: Param>(ui: &mut Ui, entry_id: egui::Id, rect: Rect, param: &P, setter: &ParamSetter) -> bool {
+fn value_entry<P: Param>(
+    ui: &mut Ui,
+    entry_id: egui::Id,
+    rect: Rect,
+    param: &P,
+    setter: &ParamSetter,
+    font: FontId,
+) -> bool {
     let Some(mut text) = ui.memory(|memory| memory.data.get_temp::<String>(entry_id)) else {
         return false;
     };
@@ -325,7 +455,7 @@ fn value_entry<P: Param>(ui: &mut Ui, entry_id: egui::Id, rect: Rect, param: &P,
         rect,
         egui::TextEdit::singleline(&mut text)
             .id(field)
-            .font(FontId::proportional(FONT_SIZE))
+            .font(font)
             .horizontal_align(egui::Align::Center)
             .margin(egui::Margin::symmetric(2, 1)),
     );
@@ -345,14 +475,42 @@ fn value_entry<P: Param>(ui: &mut Ui, entry_id: egui::Id, rect: Rect, param: &P,
     true
 }
 
-/// Draws a knob: its track, the arc from its origin to its value, its pointer, and its
+/// Lights a knob up (`around` its control) while a source is dragged over it, dimly while one
+/// is dragged at all, and while the handle of a source that modulates it is hovered.
+fn paint_drop_highlight(ui: &Ui, response: &Response, target: ModTarget, controls: &Controls, around: impl FnOnce(Color32)) {
+    if target == ModTarget::None {
+        return;
+    }
+    let dragged = egui::DragAndDrop::has_payload_of_type::<ModSource>(ui.ctx());
+    let lit = response.dnd_hover_payload::<ModSource>().is_some()
+        || controls
+            .highlight
+            .is_some_and(|source| controls.matrix.routes_for(target).any(|(routed, _)| routed == source));
+    if dragged || lit {
+        around(if lit { MOD_COLOR } else { MOD_COLOR.gamma_multiply(0.35) });
+    }
+}
+
+/// Where the routes to a control can move it, and where the newest note's modulation has it, as
+/// positions of the control from 0 to 1, if anything modulates it.
+fn modulation_marks<P: NumericParam>(param: &P, target: ModTarget, matrix: &Matrix) -> Option<((f32, f32), Option<f32>)> {
+    if target == ModTarget::None {
+        return None;
+    }
+    let span = modulation_span(param, target, matrix.routes_for(target))?;
+    let live = matrix
+        .monitor
+        .modulation(target)
+        .map(|modulation| param.normalized_at(target.scaling().apply(param.value_f32(), modulation)));
+    Some((span, live))
+}
+
+/// Draws a knob in `rect`: its track, the arc from its origin to its value, its pointer, and its
 /// modulation around it.
-#[allow(clippy::too_many_arguments)]
-fn paint<P: NumericParam>(
+fn paint_rotary<P: NumericParam>(
     ui: &Ui,
     response: &Response,
-    center: Pos2,
-    diameter: f32,
+    rect: Rect,
     param: &P,
     target: ModTarget,
     color: Color32,
@@ -360,25 +518,15 @@ fn paint<P: NumericParam>(
 ) {
     let painter = ui.painter();
     let visuals = ui.visuals();
-    let radius = diameter / 2.0;
+    let center = rect.center();
+    let radius = rect.height() / 2.0;
     let ring = radius - 2.0;
     let active = response.hovered() || response.dragged();
     let normalized = param.modulated_normalized_value();
 
-    // Lit while a source is dragged over it (and dimly while one is dragged at all), or while
-    // the handle of a source that modulates it is hovered
-    if target != ModTarget::None {
-        let dragged = egui::DragAndDrop::has_payload_of_type::<ModSource>(ui.ctx());
-        let lit = response.dnd_hover_payload::<ModSource>().is_some()
-            || controls
-                .highlight
-                .is_some_and(|source| controls.matrix.routes_for(target).any(|(routed, _)| routed == source));
-        if dragged || lit {
-            let stroke_color = if lit { MOD_COLOR } else { MOD_COLOR.gamma_multiply(0.35) };
-            painter.circle_stroke(center, radius + 5.0, Stroke::new(1.5_f32, stroke_color));
-        }
-    }
-
+    paint_drop_highlight(ui, response, target, controls, |color| {
+        painter.circle_stroke(center, radius + 5.0, Stroke::new(1.5_f32, color));
+    });
     arc(painter, center, ring, 0.0, 1.0, Stroke::new(3.0_f32, visuals.extreme_bg_color));
     let value_color = if active { color } else { color.gamma_multiply(0.85) };
     arc(painter, center, ring, origin(param), normalized, Stroke::new(3.0_f32, value_color));
@@ -387,24 +535,74 @@ fn paint<P: NumericParam>(
     let direction = Vec2::angled(angle(normalized));
     painter.line_segment(
         [center + direction * (radius * 0.2), center + direction * (radius - 7.0)],
-        Stroke::new(2.0_f32, visuals.strong_text_color()),
+        Stroke::new(2.0_f32, visuals.widgets.inactive.fg_stroke.color),
     );
 
-    if target == ModTarget::None {
-        return;
-    }
-    let matrix = controls.matrix;
-    if let Some((low, high)) = modulation_span(param, target, matrix.routes_for(target)) {
+    if let Some(((low, high), live)) = modulation_marks(param, target, controls.matrix) {
         let outer = radius + 1.5;
         arc(painter, center, outer, low, high, Stroke::new(2.0_f32, MOD_COLOR));
         painter.circle_filled(center + outer * Vec2::angled(angle(normalized)), 2.0, MOD_COLOR);
-        if let Some(modulation) = matrix.monitor.modulation(target) {
-            let value = param.value_f32();
-            let at = param.normalized_at(target.scaling().apply(value, modulation));
+        if let Some(at) = live {
             let dot = center + outer * Vec2::angled(angle(at));
             painter.circle(dot, 2.5, LIVE_COLOR, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
         }
     }
+}
+
+/// Draws a fader in `rect`: its slot with a scale, the stretch from its origin to its value, its
+/// cap, and its modulation beside it.
+fn paint_fader<P: NumericParam>(
+    ui: &Ui,
+    response: &Response,
+    rect: Rect,
+    param: &P,
+    target: ModTarget,
+    color: Color32,
+    controls: &Controls,
+) {
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+    let active = response.hovered() || response.dragged();
+    let normalized = param.modulated_normalized_value();
+    let x = rect.center().x;
+    let (top, bottom) = (rect.top() + CAP_HEIGHT / 2.0, rect.bottom() - CAP_HEIGHT / 2.0);
+    let y = |position: f32| bottom - (bottom - top) * position.clamp(0.0, 1.0);
+
+    paint_drop_highlight(ui, response, target, controls, |color| {
+        let outline = Rect::from_x_y_ranges((x - 16.0)..=(x + 16.0), rect.y_range()).expand(3.0);
+        painter.rect_stroke(outline, 4.0, Stroke::new(1.5_f32, color), StrokeKind::Outside);
+    });
+    // A tick every tenth of the way, longer at the ends and the middle
+    for tick in 0..=10 {
+        let length = if tick % 5 == 0 { 7.0 } else { 4.0 };
+        let at = y(tick as f32 / 10.0);
+        painter.line_segment(
+            [Pos2::new(x - 7.0 - length, at), Pos2::new(x - 7.0, at)],
+            Stroke::new(1.0_f32, visuals.weak_text_color().gamma_multiply(0.6)),
+        );
+    }
+    let slot = Rect::from_x_y_ranges((x - 2.5)..=(x + 2.5), top..=bottom);
+    painter.rect_filled(slot, 2.5, visuals.extreme_bg_color);
+    let (from, to) = (y(origin(param)), y(normalized));
+    let fill = Rect::from_x_y_ranges((x - 2.5)..=(x + 2.5), from.min(to)..=from.max(to));
+    painter.rect_filled(fill, 2.5, if active { color } else { color.gamma_multiply(0.85) });
+
+    if let Some(((low, high), live)) = modulation_marks(param, target, controls.matrix) {
+        let bar_x = x + 9.0;
+        painter.line_segment([Pos2::new(bar_x, y(low)), Pos2::new(bar_x, y(high))], Stroke::new(3.0_f32, MOD_COLOR));
+        if let Some(at) = live {
+            painter.circle(Pos2::new(bar_x, y(at)), 2.5, LIVE_COLOR, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
+        }
+    }
+
+    let cap_width = (rect.width() * 0.62).clamp(18.0, 30.0);
+    let cap = Rect::from_center_size(Pos2::new(x, y(normalized)), egui::vec2(cap_width, CAP_HEIGHT));
+    let body = if active { visuals.widgets.hovered.bg_fill } else { visuals.widgets.inactive.bg_fill };
+    painter.rect(cap, CornerRadius::same(2), body, Stroke::new(1.0_f32, Color32::from_black_alpha(140)), StrokeKind::Inside);
+    painter.line_segment(
+        [Pos2::new(cap.left() + 3.0, cap.center().y), Pos2::new(cap.right() - 3.0, cap.center().y)],
+        Stroke::new(2.0_f32, color),
+    );
 }
 
 /// A knob's right-click menu: resetting it, typing in a value, and its modulation routes, with

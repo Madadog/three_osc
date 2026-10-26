@@ -1,11 +1,14 @@
 //! The plugin's GUI, built with egui through `nih_plug_egui`.
 //!
-//! It comes in two themes (see [`theme`]), each a layout of the same controls with its own
-//! look: Studio, knobs grouped in cards that stretch to fill the window (see [`studio`]), and
-//! Classic, the original layout of sliders all on one page (see [`classic`]). Either way the
-//! presets and the tuning are in the title bar (see [`title_bar`] and [`tuning_window`]), every
-//! control is bound directly to a parameter, so host automation and the GUI stay in sync, and
-//! hovering a control shows what it does (see [`help`]).
+//! It comes in seven themes (see [`theme`]), each a layout of the same controls with its own
+//! look: Studio, knobs grouped in cards that stretch to fill the window (see [`studio`]);
+//! Classic, the original layout of sliders all on one page (see [`classic`]); and Flow, Rack,
+//! Focus, Compact and Vintage (see [`flow`], [`rack`], [`focus`], [`compact`] and [`vintage`]),
+//! which share the knobs (see [`knob`]), what they show of each control (see [`catalog`]) and
+//! other pieces (see [`widgets`]). Whichever it is, the presets and the tuning are in the title
+//! bar (see [`title_bar`] and [`tuning_window`]), every control is bound directly to a
+//! parameter, so host automation and the GUI stay in sync, and hovering a control shows what it
+//! does (see [`help`]).
 //!
 //! Modulation is set up by dragging: every modulation source (the LFOs, the envelopes, the
 //! oscillators and the MIDI sources) has a handle that can be dragged onto any control that
@@ -39,14 +42,21 @@ use crate::{Task, ThreeOscPlugin};
 use theme::Theme;
 
 mod analyser;
+mod catalog;
 mod classic;
+mod compact;
 mod displays;
+mod flow;
+mod focus;
 mod help;
 mod knob;
+mod rack;
 mod studio;
 mod theme;
 mod title_bar;
 mod tuning_window;
+mod vintage;
+mod widgets;
 
 /// The window's default size, in logical pixels.
 pub const DEFAULT_WIDTH: u32 = 1400;
@@ -84,8 +94,19 @@ pub struct EditorState {
     styled: Option<Theme>,
     /// Why the theme last picked couldn't be saved, if it couldn't.
     theme_problem: Option<String>,
+    /// Whether the settings window is open (see [`widgets::settings_window()`]), and the routes
+    /// window.
+    settings_open: bool,
+    routes_open: bool,
+    /// The modulation matrix's slots the routes editor shows although they don't route
+    /// anything (yet), because they were added there (see [`widgets::routes_list()`]).
+    added_routes: [bool; N_SLOTS],
     classic: classic::ClassicState,
     studio: studio::StudioState,
+    rack: rack::RackState,
+    focus: focus::FocusState,
+    compact: compact::CompactState,
+    vintage: vintage::VintageState,
 }
 
 impl EditorState {
@@ -102,8 +123,15 @@ impl EditorState {
             analyser: analyser::Analyser::new(),
             styled: None,
             theme_problem: None,
+            settings_open: false,
+            routes_open: false,
+            added_routes: [false; N_SLOTS],
             classic: classic::ClassicState::new(),
             studio: studio::StudioState::new(),
+            rack: rack::RackState::new(),
+            focus: focus::FocusState::new(),
+            compact: compact::CompactState::new(),
+            vintage: vintage::VintageState::new(),
         }
     }
     fn rescan(&mut self) {
@@ -202,9 +230,15 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
             .collect();
     }
     tuning_window::show(ui.ctx(), params, &mut gui.state.tuning);
+    widgets::settings_window(ui.ctx(), params, setter, gui);
     match theme {
         Theme::Studio => studio::draw(ui, params, setter, gui),
         Theme::Classic => classic::draw(ui, params, setter, gui),
+        Theme::Flow => flow::draw(ui, params, setter, gui),
+        Theme::Rack => rack::draw(ui, params, setter, gui),
+        Theme::Focus => focus::draw(ui, params, setter, gui),
+        Theme::Compact => compact::draw(ui, params, setter, gui),
+        Theme::Vintage => vintage::draw(ui, params, setter, gui),
     }
 }
 
@@ -222,8 +256,8 @@ fn theme_picker(ui: &mut Ui, gui: &mut Gui) {
         })
         .response
         .on_hover_text(
-            "Switches between the Studio layout and the Classic one. The choice is kept for \
-             every project, in Settings.json in Documents/Three Osc.",
+            "Switches the editor's layout and look (hover a theme for what it's like). The \
+             choice is kept for every project, in Settings.json in Documents/Three Osc.",
         );
     if picked != current {
         switch_theme(ui, gui, picked);
@@ -459,6 +493,8 @@ fn wavetable_file_combo(ui: &mut Ui, index: usize, file: &WavetableFile, gui: &m
         .unwrap_or_default();
     let mut picked = None;
     egui::ComboBox::from_id_salt(("wavetable file", index))
+        // (A long name is cut short rather than running past the space there is)
+        .truncate()
         .selected_text(if current.is_empty() {
             String::from("(none)")
         } else {
