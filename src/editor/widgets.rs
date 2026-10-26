@@ -16,11 +16,11 @@ use nih_plug_egui::widgets::ParamSlider;
 use super::knob::Controls;
 use super::theme::{self, Theme};
 use super::{
-    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, load_wavetable_file, set_param,
-    switch_theme, title_bar, wavetable_folder_rows, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
+    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, lfo_display, load_wavetable_file,
+    reset_remap, set_param, switch_theme, title_bar, wavetable_folder_rows, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
 };
-use crate::params::{GlobalParams, ModSlotParams, OscillatorWave, ThreeOscParams};
-use crate::synth::modulation::{ModSource, N_SLOTS};
+use crate::params::{CurrentValues, GlobalParams, ModSlotParams, OscillatorWave, ThreeOscParams};
+use crate::synth::modulation::{ModSource, ModTarget, Polarity, Route, N_SLOTS};
 
 /// Runs `add` in a child of `ui` that fills `rect`, laid out by `layout`, with the ids of the
 /// widgets in it scoped by `id_salt`.
@@ -197,7 +197,8 @@ pub fn tab(ui: &mut Ui, label: &str, badge: Option<String>, selected: bool, acce
 }
 
 /// A row of a grid of modulation routes: a slot's source and target, its amount (in a slider
-/// `slider_width` wide), and a button to remove it. Returns whether it was removed.
+/// `slider_width` wide), its polarity and remap, and a button to remove it. Returns whether it
+/// was removed.
 pub fn route_row(ui: &mut Ui, index: usize, slot: &ModSlotParams, setter: &ParamSetter, widths: [f32; 3]) -> bool {
     let [source_width, target_width, slider_width] = widths;
     combo_cell(ui, &slot.source, index, source_width, slot.source.value().help(), setter);
@@ -205,12 +206,320 @@ pub fn route_row(ui: &mut Ui, index: usize, slot: &ModSlotParams, setter: &Param
     combo_cell(ui, &slot.target, index, target_width, slot.target.value().help(), setter);
     ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(slider_width))
         .on_hover_text(help::MOD_AMOUNT);
+    ui.horizontal(|ui| {
+        polarity_button(ui, slot, setter);
+        remap_button(ui, index, slot);
+    });
     let removed = ui.button("Remove").on_hover_text(help::CLEAR_ROUTE).clicked();
     if removed {
         Matrix::clear(setter, slot);
     }
     ui.end_row();
     removed
+}
+
+/// The height of a row of the routes over a modulated control (see [`routes_overlay()`]), and
+/// the widths of its names and sliders.
+const OVERLAY_ROW: f32 = 14.0;
+const OVERLAY_NAME: f32 = 50.0;
+const OVERLAY_SLIDER: f32 = 66.0;
+
+/// While a modulated control is hovered (`hovered`), or the overlay itself is, the routes that
+/// move it as small sliders with their sources' names, just above it (`anchor`), on a
+/// transparent background. They show at once, and go as soon as the pointer leaves both the
+/// control and them. Dragging a slider sets its route's amount (finer with Shift held), and a
+/// double-click sets it to zero.
+pub fn routes_overlay(
+    ui: &Ui,
+    id: egui::Id,
+    anchor: Rect,
+    hovered: bool,
+    target: ModTarget,
+    matrix: &Matrix,
+    setter: &ParamSetter,
+) {
+    let ctx = ui.ctx();
+    // Where it was in the last frame, which keeps it up while the pointer is on it
+    let last: Option<Rect> = ctx.data(|data| data.get_temp(id));
+    if !hovered && last.is_none() {
+        return;
+    }
+    let on_overlay = last
+        .zip(ctx.input(|input| input.pointer.hover_pos()))
+        .is_some_and(|(rect, pointer)| rect.expand(3.0).contains(pointer));
+    let sliding = ctx.dragged_id().is_some_and(|dragged| (0..N_SLOTS).any(|index| dragged == id.with(index)));
+    let slots: Vec<(usize, &ModSlotParams)> = matrix.indexed_slots_for(target).collect();
+    let dragging_source = egui::DragAndDrop::has_payload_of_type::<ModSource>(ctx);
+    if !(hovered || on_overlay || sliding) || slots.is_empty() || dragging_source {
+        ctx.data_mut(|data| data.remove::<Rect>(id));
+        return;
+    }
+    // Above the control, or under it where there's no room above
+    let size = egui::vec2(OVERLAY_NAME + 4.0 + OVERLAY_SLIDER, slots.len() as f32 * OVERLAY_ROW);
+    let screen = ctx.screen_rect();
+    let x = (anchor.center().x - size.x / 2.0).clamp(screen.left(), (screen.right() - size.x).max(screen.left()));
+    let y = if anchor.top() - size.y >= screen.top() { anchor.top() - size.y } else { anchor.bottom() };
+    let rect = Rect::from_min_size(Pos2::new(x, y), size);
+    ctx.data_mut(|data| data.insert_temp(id, rect));
+    egui::Area::new(id.with("area"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(size);
+            for (row, (index, slot)) in slots.into_iter().enumerate() {
+                let top = rect.top() + row as f32 * OVERLAY_ROW;
+                let name = Rect::from_min_size(Pos2::new(rect.left(), top), egui::vec2(OVERLAY_NAME, OVERLAY_ROW));
+                let track = Rect::from_min_size(
+                    Pos2::new(name.right() + 4.0, top + 4.0),
+                    egui::vec2(OVERLAY_SLIDER, OVERLAY_ROW - 8.0),
+                );
+                route_slider(ui, id.with(index), name, track, slot, setter);
+            }
+        });
+}
+
+/// One of [`routes_overlay()`]'s sliders: the route's source's name (or, while the slider is
+/// hovered, its amount) in `name`, and its amount as a bar from the middle of `track`.
+fn route_slider(ui: &Ui, id: egui::Id, name: Rect, track: Rect, slot: &ModSlotParams, setter: &ParamSetter) {
+    let amount = &slot.amount;
+    let response = ui.interact(track.expand2(egui::vec2(2.0, 4.0)), id, Sense::click_and_drag());
+    // The position while dragging is kept unrounded, as the knobs keep theirs
+    let position_id = id.with("position");
+    if response.drag_started() {
+        setter.begin_set_parameter(amount);
+        ui.ctx().data_mut(|data| data.insert_temp(position_id, amount.unmodulated_normalized_value()));
+    }
+    if response.dragged() {
+        let fine = ui.input(|input| input.modifiers.shift);
+        let speed = if fine { 0.1 } else { 1.0 } / track.width();
+        let start = ui.ctx().data(|data| data.get_temp::<f32>(position_id)).unwrap_or_else(|| amount.unmodulated_normalized_value());
+        let position = (start + response.drag_delta().x * speed).clamp(0.0, 1.0);
+        ui.ctx().data_mut(|data| data.insert_temp(position_id, position));
+        setter.set_parameter_normalized(amount, position);
+    }
+    if response.drag_stopped() {
+        setter.end_set_parameter(amount);
+        ui.ctx().data_mut(|data| data.remove::<f32>(position_id));
+    }
+    if response.double_clicked() {
+        set_param(setter, amount, 0.0);
+    }
+    let active = response.hovered() || response.dragged();
+    if active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    let painter = ui.painter();
+    let shadow = Color32::from_black_alpha(190);
+    painter.rect_filled(track, CornerRadius::same(3), Color32::from_black_alpha(if active { 200 } else { 150 }));
+    let x = |normalized: f32| track.left() + track.width() * normalized.clamp(0.0, 1.0);
+    let zero = x(amount.preview_normalized(0.0));
+    let value = x(amount.unmodulated_normalized_value());
+    let bar = Rect::from_x_y_ranges(zero.min(value)..=zero.max(value), track.y_range());
+    painter.rect_filled(bar, CornerRadius::same(2), if active { MOD_COLOR } else { MOD_COLOR.gamma_multiply(0.85) });
+    painter.line_segment([Pos2::new(zero, track.top() - 1.0), Pos2::new(zero, track.bottom() + 1.0)], Stroke::new(1.0_f32, shadow));
+    let text = if active {
+        amount.normalized_value_to_string(amount.unmodulated_normalized_value(), true)
+    } else {
+        String::from(ModSource::variants()[slot.source.value().to_index()])
+    };
+    let font = FontId::proportional(10.0);
+    let at = name.right_center() - egui::vec2(0.0, 0.5);
+    // Outlined, so that it reads over whatever is under the overlay
+    for x in [-1.0, 0.0, 1.0] {
+        for y in [-1.0, 0.0, 1.0] {
+            if x != 0.0 || y != 0.0 {
+                painter.text(at + egui::vec2(x, y), egui::Align2::RIGHT_CENTER, &text, font.clone(), shadow);
+            }
+        }
+    }
+    painter.text(at, egui::Align2::RIGHT_CENTER, &text, font, if active { Color32::WHITE } else { MOD_COLOR });
+    let source = ModSource::variants()[slot.source.value().to_index()];
+    response.on_hover_text(format!(
+        "How much of {source} moves this control: drag to set it (Shift for finer), double-click for none."
+    ));
+}
+
+/// A button showing whether a route swings both ways (`±`) or one way (`+`), which switches it
+/// to the other (see [`Polarity`]).
+pub fn polarity_button(ui: &mut Ui, slot: &ModSlotParams, setter: &ParamSetter) -> Response {
+    let source = slot.source.value();
+    let bipolar = slot.polarity.value().is_bipolar(source);
+    let text = RichText::new(if bipolar { "±" } else { "+" }).strong().color(MOD_COLOR);
+    let response = ui
+        .add(egui::Button::new(text).small().min_size(egui::vec2(18.0, 0.0)))
+        .on_hover_text(format!(
+            "{} {}",
+            if bipolar { "Swings both ways: click for one way." } else { "Swings one way: click for both ways." },
+            help::MOD_POLARITY
+        ));
+    if response.clicked() {
+        // (The source's own polarity is left as the default, so that the route stays plain)
+        let polarity = match (!bipolar, source.is_bipolar()) {
+            (wanted, native) if wanted == native => Polarity::Source,
+            (true, _) => Polarity::Bipolar,
+            (false, _) => Polarity::Unipolar,
+        };
+        set_param(setter, &slot.polarity, polarity);
+    }
+    response
+}
+
+/// A route's remap as the synth applies it, with a full amount.
+fn remap_route(slot: &ModSlotParams) -> Route {
+    Route::remapped(slot.source.value(), slot.target.value(), 1.0, slot.remap(&CurrentValues))
+}
+
+/// Whether a route reshapes its source in a way the polarity button doesn't show.
+fn is_remapped(slot: &ModSlotParams) -> bool {
+    slot.curve.value() != 0.0 || slot.steps.value() > 1 || slot.via.value() != ModSource::None
+}
+
+/// Draws how a route maps its source in `rect`: across, the source from its bottom to its top;
+/// up, what the route applies, from -1 to 1 (with the scaling source at its top).
+fn paint_remap(painter: &Painter, rect: Rect, route: &Route, color: Color32, width: f32) {
+    let bipolar = route.source.is_bipolar();
+    let y = |value: f32| rect.center().y - value.clamp(-1.0, 1.0) * rect.height() / 2.0;
+    painter.hline(rect.x_range(), y(0.0), Stroke::new(1.0_f32, color.gamma_multiply(0.3)));
+    let steps = 64;
+    let points = (0..=steps)
+        .map(|step| {
+            let across = step as f32 / steps as f32;
+            let value = if bipolar { across * 2.0 - 1.0 } else { across };
+            Pos2::new(rect.left() + across * rect.width(), y(route.reshape(value, 1.0)))
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(width, color)));
+}
+
+/// What the remap window shows: the slot it's for, the button that opened it, and whether it's
+/// been put beside that button yet (after which it can be moved).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RemapWindow {
+    slot: usize,
+    button: Rect,
+    placed: bool,
+}
+
+fn remap_window_id() -> egui::Id {
+    egui::Id::new("remap window")
+}
+
+/// Where a window of `size` goes beside the button at `button`: under it (or over it, where
+/// there's no room under it), with their right edges lined up, and on the screen.
+fn beside(button: Rect, size: egui::Vec2, screen: Rect) -> Pos2 {
+    let x = (button.right() - size.x).clamp(screen.left(), (screen.right() - size.x).max(screen.left()));
+    let under = button.bottom() + 4.0;
+    let y = if under + size.y <= screen.bottom() { under } else { (button.top() - 4.0 - size.y).max(screen.top()) };
+    Pos2::new(x, y)
+}
+
+/// A button for a route's remap (see [`Remap`][crate::synth::modulation::Remap]): a small
+/// picture of how the route maps its source, lit while it does more than its polarity says,
+/// which opens the remap's window (see [`remap_window()`]).
+pub fn remap_button(ui: &mut Ui, index: usize, slot: &ModSlotParams) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 16.0), Sense::click());
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    painter.rect(rect, CornerRadius::same(3), visuals.weak_bg_fill, visuals.bg_stroke, StrokeKind::Inside);
+    let color = if is_remapped(slot) { MOD_COLOR } else { visuals.fg_stroke.color.gamma_multiply(0.7) };
+    paint_remap(painter, rect.shrink2(egui::vec2(4.0, 3.0)), &remap_route(slot), color, 1.2);
+    if response.clicked() {
+        ui.ctx().data_mut(|data| {
+            let open = data.get_temp::<Option<RemapWindow>>(remap_window_id()).flatten();
+            let next = match open {
+                Some(window) if window.slot == index => None,
+                _ => Some(RemapWindow { slot: index, button: rect, placed: false }),
+            };
+            data.insert_temp(remap_window_id(), next);
+        });
+    }
+    response.on_hover_text(
+        "How the route reshapes its source: click to set how it swings, bend it, step it, or have \
+         another source scale it.",
+    )
+}
+
+/// The window for the remap of the route whose remap button was clicked last, while it's open:
+/// a picture of how the route maps its source, its polarity, curve and steps, the source that
+/// scales it, its amount, and a button to put it back as it was.
+pub fn remap_window(ctx: &egui::Context, params: &ThreeOscParams, setter: &ParamSetter) {
+    let Some(RemapWindow { slot: index, button, placed }) = ctx.data(|data| data.get_temp(remap_window_id())).flatten()
+    else {
+        return;
+    };
+    let slot = &params.mod_slots[index];
+    let mut open = Matrix::is_used(slot);
+    let name = |variants: &'static [&'static str], index: usize| variants[index];
+    let title = format!(
+        "{} › {}",
+        name(ModSource::variants(), slot.source.value().to_index()),
+        name(ModTarget::variants(), slot.target.value().to_index())
+    );
+    // It's put beside its button until it has been shown at the size it was measured at (the
+    // first time it's shown, egui only measures it)
+    let size_id = remap_window_id().with("size");
+    let measured: Option<egui::Vec2> = ctx.data(|data| data.get_temp(size_id));
+    let mut window = egui::Window::new(title).id(remap_window_id()).open(&mut open).collapsible(false).resizable(false);
+    if !placed {
+        let size = measured.unwrap_or(egui::vec2(280.0, 320.0));
+        window = window.current_pos(beside(button, size, ctx.screen_rect()));
+    }
+    let shown = window.show(ctx, |ui| {
+            ui.set_width(260.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(260.0, 70.0), Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(rect, CornerRadius::same(4), ui.visuals().extreme_bg_color);
+            paint_remap(painter, rect.shrink(6.0), &remap_route(slot), MOD_COLOR, 2.0);
+            let source = slot.source.value();
+            let via = slot.via.value();
+            let caption = if via == ModSource::None {
+                String::from("The source across, what the route applies up.")
+            } else {
+                let via = name(ModSource::variants(), via.to_index());
+                format!("The source across, what the route applies up, with {via} at its top.")
+            };
+            ui.label(RichText::new(caption).small().weak());
+            ui.add_space(4.0);
+            egui::Grid::new(("remap", index)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Polarity").on_hover_text(help::MOD_POLARITY);
+                ui.horizontal(|ui| {
+                    let own = if source.is_bipolar() { "As source (±)" } else { "As source (+)" };
+                    for (polarity, label) in [(Polarity::Source, own), (Polarity::Unipolar, "+"), (Polarity::Bipolar, "±")] {
+                        let chosen = slot.polarity.value() == polarity;
+                        if ui.selectable_label(chosen, label).on_hover_text(help::MOD_POLARITY).clicked() && !chosen {
+                            set_param(setter, &slot.polarity, polarity);
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Curve").on_hover_text(help::MOD_CURVE);
+                ui.add(ParamSlider::for_param(&slot.curve, setter).with_width(150.0)).on_hover_text(help::MOD_CURVE);
+                ui.end_row();
+                ui.label("Steps").on_hover_text(help::MOD_STEPS);
+                ui.add(ParamSlider::for_param(&slot.steps, setter).with_width(150.0)).on_hover_text(help::MOD_STEPS);
+                ui.end_row();
+                ui.label("Scale by").on_hover_text(help::MOD_VIA);
+                combo_cell(ui, &slot.via, index, 150.0, help::MOD_VIA, setter);
+                ui.end_row();
+                ui.label("Amount").on_hover_text(help::MOD_AMOUNT);
+                ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(150.0)).on_hover_text(help::MOD_AMOUNT);
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            let reset = ui.button("Reset the shape").on_hover_text("Puts the polarity, curve, steps and scaling back as they were.");
+            if reset.clicked() {
+                reset_remap(setter, slot);
+            }
+        });
+    let size = shown.map(|shown| shown.response.rect.size());
+    ctx.data_mut(|data| {
+        if let Some(size) = size {
+            data.insert_temp(size_id, size);
+        }
+        let next = open.then_some(RemapWindow { slot: index, button, placed: placed || (size.is_some() && size == measured) });
+        data.insert_temp(remap_window_id(), next);
+    });
 }
 
 /// A button that adds a row to the routes editor (see [`routes_list()`]), while a slot is free.
@@ -256,8 +565,8 @@ pub fn routes_list(ui: &mut Ui, controls: &Controls, added: &mut [bool; N_SLOTS]
         return;
     }
     egui::ScrollArea::vertical().id_salt("routes").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("routes").num_columns(5).spacing([10.0, 6.0]).show(ui, |ui| {
-            for heading in ["Source", "", "Target", "Amount", ""] {
+        egui::Grid::new("routes").num_columns(6).spacing([10.0, 6.0]).show(ui, |ui| {
+            for heading in ["Source", "", "Target", "Amount", "Shape", ""] {
                 ui.label(RichText::new(heading).small().weak());
             }
             ui.end_row();
@@ -294,8 +603,8 @@ pub fn routes_window(ctx: &egui::Context, controls: &Controls, gui: &mut Gui) {
     egui::Window::new("Modulation Routes")
         .open(&mut open)
         .collapsible(false)
-        .default_size(egui::vec2(720.0, 360.0))
-        .default_pos(below_the_header(ctx, 720.0))
+        .default_size(egui::vec2(780.0, 360.0))
+        .default_pos(below_the_header(ctx, 780.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -460,10 +769,7 @@ impl Display {
             Self::FilterEnvelope => envelope_display(ui, &params.filter_env.envelope, setter, live, height),
             Self::Amp => envelope_display(ui, &params.vol_env, setter, live, height),
             Self::Envelope(index) => envelope_display(ui, &params.mod_envs[index].envelope, setter, live, height),
-            Self::Lfo(index) => {
-                let wave = params.lfos[index].wave.value().to_osc_wave();
-                displays::lfo(ui, &wave, MOD_COLOR, live.monitor.lfo_phase(index), height);
-            }
+            Self::Lfo(index) => lfo_display(ui, &params.lfos[index], index, live, height),
             Self::Distortion | Self::Chorus | Self::Delay | Self::Reverb => self.effect(ui, params, live, height),
             Self::Output => {
                 let width = ui.available_width();

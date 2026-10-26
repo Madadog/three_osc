@@ -26,7 +26,7 @@ use nih_plug_egui::widgets::ParamSlider;
 
 use super::catalog::Colors;
 use super::{set_param, Matrix, NumericParam, MOD_COLOR};
-use crate::synth::modulation::{ModSource, ModTarget, N_SOURCES};
+use crate::synth::modulation::{ModSource, ModTarget, Scaling, N_SOURCES};
 
 /// What the knobs need besides their parameters: a way to set them, the modulation matrix, the
 /// modulation source whose routes to light up (the one whose handle is hovered), and how the
@@ -160,17 +160,17 @@ fn origin<P: NumericParam>(param: &P) -> f32 {
     }
 }
 
-/// How far `routes` (each a source and its amount) can move a knob for `target`, from its value:
-/// the knob positions at the sum of the routes' lowest and highest modulation, if there are
-/// routes.
+/// How far `routes` (each whether it swings both ways, and its amount) can move a knob whose
+/// modulation moves it as `scaling` says, from its value: the knob positions at the sum of the
+/// routes' lowest and highest modulation, if there are routes.
 fn modulation_span<P: NumericParam>(
     param: &P,
-    target: ModTarget,
-    routes: impl Iterator<Item = (ModSource, f32)>,
+    scaling: Scaling,
+    routes: impl Iterator<Item = (bool, f32)>,
 ) -> Option<(f32, f32)> {
     let (mut low, mut high, mut any) = (0.0, 0.0, false);
-    for (source, amount) in routes {
-        if source.is_bipolar() {
+    for (bipolar, amount) in routes {
+        if bipolar {
             low -= amount.abs();
             high += amount.abs();
         } else {
@@ -180,7 +180,6 @@ fn modulation_span<P: NumericParam>(
         any = true;
     }
     let value = param.value_f32();
-    let scaling = target.scaling();
     any.then(|| (param.normalized_at(scaling.apply(value, low)), param.normalized_at(scaling.apply(value, high))))
 }
 
@@ -198,6 +197,9 @@ pub struct Knob<'a, P: NumericParam> {
     label: &'a str,
     help: &'a str,
     target: ModTarget,
+    /// How the target's modulation moves the knob: as it moves the target's own control,
+    /// unless the knob says otherwise.
+    scaling: Scaling,
     color: Color32,
 }
 
@@ -209,19 +211,22 @@ impl<'a, P: NumericParam> Knob<'a, P> {
             label,
             help,
             target: ModTarget::None,
+            scaling: ModTarget::None.scaling(),
             color,
         }
     }
 
-    /// Makes the knob a target for modulation.
-    pub fn modulated(mut self, target: ModTarget) -> Self {
+    /// Makes the knob a target for modulation, which moves it as `scaling` says (or as it moves
+    /// the target's own control).
+    pub fn modulated(mut self, target: ModTarget, scaling: Option<Scaling>) -> Self {
         self.target = target;
+        self.scaling = scaling.unwrap_or_else(|| target.scaling());
         self
     }
 
     /// Adds the knob, `width` wide (and as tall as the style's [`Style::height()`]).
     pub fn show(self, ui: &mut Ui, width: f32, controls: &Controls) -> Response {
-        let Self { param, label, help, target, color } = self;
+        let Self { param, label, help, target, scaling, color } = self;
         let setter = controls.setter;
         let style = controls.style;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, style.height(width)), Sense::hover());
@@ -325,8 +330,8 @@ impl<'a, P: NumericParam> Knob<'a, P> {
         }
 
         match style.shape {
-            Shape::Rotary => paint_rotary(ui, &response, control_rect, param, target, color, controls),
-            Shape::Fader(_) => paint_fader(ui, &response, control_rect, param, target, color, controls),
+            Shape::Rotary => paint_rotary(ui, &response, control_rect, param, target, scaling, color, controls),
+            Shape::Fader(_) => paint_fader(ui, &response, control_rect, param, target, scaling, color, controls),
         }
 
         if response.dragged() {
@@ -337,6 +342,9 @@ impl<'a, P: NumericParam> Knob<'a, P> {
             ui.ctx().set_cursor_icon(cursor);
         }
         context_menu(&response, entry_id, param, target, controls);
+        // The routes that move it, over it while it's hovered
+        let hovered = response.hovered() || value_hovered;
+        super::widgets::routes_overlay(ui, id.with("routes"), rect, hovered, target, controls.matrix, setter);
         if let (Some(value), true) = (value, style.value_below) {
             value.on_hover_text("Click to type in a value.");
         }
@@ -344,17 +352,9 @@ impl<'a, P: NumericParam> Knob<'a, P> {
         if response.dragged() || !style.tooltips {
             response
         } else {
-            let routes: Vec<String> = controls
-                .matrix
-                .routes_for(target)
-                .map(|(source, amount)| format!("{} {:+.0}%", ModSource::variants()[source.to_index()], amount * 100.0))
-                .collect();
             response.on_hover_ui(|ui| {
                 ui.label(RichText::new(param.name()).strong());
                 ui.label(help);
-                if !routes.is_empty() {
-                    ui.label(RichText::new(format!("Modulated by {}.", routes.join(", "))).color(MOD_COLOR));
-                }
                 if modulatable {
                     ui.label(RichText::new("Right-click to edit its modulation.").weak());
                 }
@@ -485,7 +485,7 @@ fn paint_drop_highlight(ui: &Ui, response: &Response, target: ModTarget, control
     let lit = response.dnd_hover_payload::<ModSource>().is_some()
         || controls
             .highlight
-            .is_some_and(|source| controls.matrix.routes_for(target).any(|(routed, _)| routed == source));
+            .is_some_and(|source| controls.matrix.routes_for(target).any(|(routed, ..)| routed == source));
     if dragged || lit {
         around(if lit { MOD_COLOR } else { MOD_COLOR.gamma_multiply(0.35) });
     }
@@ -493,26 +493,34 @@ fn paint_drop_highlight(ui: &Ui, response: &Response, target: ModTarget, control
 
 /// Where the routes to a control can move it, and where the newest note's modulation has it, as
 /// positions of the control from 0 to 1, if anything modulates it.
-fn modulation_marks<P: NumericParam>(param: &P, target: ModTarget, matrix: &Matrix) -> Option<((f32, f32), Option<f32>)> {
+fn modulation_marks<P: NumericParam>(
+    param: &P,
+    target: ModTarget,
+    scaling: Scaling,
+    matrix: &Matrix,
+) -> Option<((f32, f32), Option<f32>)> {
     if target == ModTarget::None {
         return None;
     }
-    let span = modulation_span(param, target, matrix.routes_for(target))?;
+    let routes = matrix.routes_for(target).map(|(_, bipolar, amount)| (bipolar, amount));
+    let span = modulation_span(param, scaling, routes)?;
     let live = matrix
         .monitor
         .modulation(target)
-        .map(|modulation| param.normalized_at(target.scaling().apply(param.value_f32(), modulation)));
+        .map(|modulation| param.normalized_at(scaling.apply(param.value_f32(), modulation)));
     Some((span, live))
 }
 
 /// Draws a knob in `rect`: its track, the arc from its origin to its value, its pointer, and its
 /// modulation around it.
+#[allow(clippy::too_many_arguments)]
 fn paint_rotary<P: NumericParam>(
     ui: &Ui,
     response: &Response,
     rect: Rect,
     param: &P,
     target: ModTarget,
+    scaling: Scaling,
     color: Color32,
     controls: &Controls,
 ) {
@@ -538,7 +546,7 @@ fn paint_rotary<P: NumericParam>(
         Stroke::new(2.0_f32, visuals.widgets.inactive.fg_stroke.color),
     );
 
-    if let Some(((low, high), live)) = modulation_marks(param, target, controls.matrix) {
+    if let Some(((low, high), live)) = modulation_marks(param, target, scaling, controls.matrix) {
         let outer = radius + 1.5;
         arc(painter, center, outer, low, high, Stroke::new(2.0_f32, MOD_COLOR));
         painter.circle_filled(center + outer * Vec2::angled(angle(normalized)), 2.0, MOD_COLOR);
@@ -551,12 +559,14 @@ fn paint_rotary<P: NumericParam>(
 
 /// Draws a fader in `rect`: its slot with a scale, the stretch from its origin to its value, its
 /// cap, and its modulation beside it.
+#[allow(clippy::too_many_arguments)]
 fn paint_fader<P: NumericParam>(
     ui: &Ui,
     response: &Response,
     rect: Rect,
     param: &P,
     target: ModTarget,
+    scaling: Scaling,
     color: Color32,
     controls: &Controls,
 ) {
@@ -587,7 +597,7 @@ fn paint_fader<P: NumericParam>(
     let fill = Rect::from_x_y_ranges((x - 2.5)..=(x + 2.5), from.min(to)..=from.max(to));
     painter.rect_filled(fill, 2.5, if active { color } else { color.gamma_multiply(0.85) });
 
-    if let Some(((low, high), live)) = modulation_marks(param, target, controls.matrix) {
+    if let Some(((low, high), live)) = modulation_marks(param, target, scaling, controls.matrix) {
         let bar_x = x + 9.0;
         painter.line_segment([Pos2::new(bar_x, y(low)), Pos2::new(bar_x, y(high))], Stroke::new(3.0_f32, MOD_COLOR));
         if let Some(at) = live {
@@ -605,8 +615,9 @@ fn paint_fader<P: NumericParam>(
     );
 }
 
-/// A knob's right-click menu: resetting it, typing in a value, and its modulation routes, with
-/// their amounts, a way to remove them and a way to add another.
+/// A knob's right-click menu: resetting it, typing in a value, and its modulation: the routes
+/// that move it (under a thin line, if there are any), with their amounts and a way to remove
+/// them, and a menu to add another.
 fn context_menu<P: NumericParam>(
     response: &Response,
     entry_id: egui::Id,
@@ -616,7 +627,7 @@ fn context_menu<P: NumericParam>(
 ) {
     let setter = controls.setter;
     response.context_menu(|ui| {
-        ui.set_min_width(240.0);
+        ui.set_min_width(220.0);
         let value = param.normalized_value_to_string(param.unmodulated_normalized_value(), true);
         ui.label(RichText::new(format!("{}: {value}", param.name())).strong());
         let default = param.normalized_value_to_string(param.default_normalized_value(), true);
@@ -631,29 +642,37 @@ fn context_menu<P: NumericParam>(
         if target == ModTarget::None {
             return;
         }
-        ui.separator();
-        ui.label(RichText::new("Modulation").color(MOD_COLOR));
         let matrix = controls.matrix;
         let mut routed = [false; N_SOURCES];
-        egui::Grid::new("routes").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-            for slot in matrix.slots_for(target) {
-                let source = slot.source.value();
-                routed[source.to_index()] = true;
-                ui.label(ModSource::variants()[source.to_index()]).on_hover_text(source.help());
-                ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(110.0))
-                    .on_hover_text(super::help::MOD_AMOUNT);
-                if ui.small_button("Remove").clicked() {
-                    Matrix::clear(setter, slot);
+        let slots: Vec<_> = matrix.indexed_slots_for(target).collect();
+        if !slots.is_empty() {
+            ui.scope(|ui| {
+                ui.visuals_mut().widgets.noninteractive.bg_stroke.color = MOD_COLOR.gamma_multiply(0.45);
+                ui.add(egui::Separator::default().spacing(4.0));
+            });
+            egui::Grid::new("routes").num_columns(5).min_col_width(0.0).spacing([6.0, 4.0]).show(ui, |ui| {
+                for (index, slot) in slots {
+                    let source = slot.source.value();
+                    routed[source.to_index()] = true;
+                    ui.label(RichText::new(ModSource::variants()[source.to_index()]).color(MOD_COLOR))
+                        .on_hover_text(source.help());
+                    ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(110.0))
+                        .on_hover_text(super::help::MOD_AMOUNT);
+                    super::widgets::polarity_button(ui, slot, setter);
+                    if super::widgets::remap_button(ui, index, slot).clicked() {
+                        // (For the remap's window, which opens where the button was)
+                        ui.close_menu();
+                    }
+                    if ui.small_button("×").on_hover_text(super::help::REMOVE_ROUTE).clicked() {
+                        Matrix::clear(setter, slot);
+                    }
+                    ui.end_row();
                 }
-                ui.end_row();
-            }
-        });
-        if !routed.contains(&true) {
-            ui.label(RichText::new("Nothing modulates it yet: drag a source's handle onto the knob, or add one here.").weak());
+            });
         }
         let free = matrix.slots.iter().any(|slot| !Matrix::is_used(slot));
         ui.add_enabled_ui(free, |ui| {
-            ui.menu_button("Add a source", |ui| {
+            ui.menu_button("Add modulation", |ui| {
                 for (index, name) in ModSource::variants().iter().enumerate().skip(1) {
                     let source = ModSource::from_index(index);
                     let button = ui.add_enabled(!routed[index], egui::Button::new(*name)).on_hover_text(source.help());
@@ -671,6 +690,7 @@ fn context_menu<P: NumericParam>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::catalog;
     use super::*;
     use crate::params::ThreeOscParams;
 
@@ -693,27 +713,39 @@ mod tests {
     #[test]
     fn the_modulation_span_covers_every_routes_swing() {
         let params = ThreeOscParams::default();
-        let span = |param: &FloatParam, target: ModTarget, routes: &[(ModSource, f32)]| {
-            modulation_span(param, target, routes.iter().copied())
+        let span = |param: &FloatParam, target: ModTarget, routes: &[(bool, f32)]| {
+            modulation_span(param, target.scaling(), routes.iter().copied())
         };
         assert_eq!(span(&params.filter.cutoff, ModTarget::Cutoff, &[]), None);
 
-        // An LFO swings both ways: from the top of the cutoff's range, 5 octaves down and up
-        // (past the top)
+        // A route that swings both ways (an LFO's, say): from the top of the cutoff's range, 5
+        // octaves down and up (past the top)
         let cutoff = &params.filter.cutoff;
-        let (low, high) = span(cutoff, ModTarget::Cutoff, &[(ModSource::Lfo1, 0.5)]).unwrap();
+        let (low, high) = span(cutoff, ModTarget::Cutoff, &[(true, 0.5)]).unwrap();
         assert!(close(low, cutoff.preview_normalized(cutoff.value() / 32.0)) && close(high, 1.0));
 
-        // An envelope only one way, even at a negative amount: Osc 1 is at 100%
+        // One way only (an envelope's, or a unipolar LFO's), even at a negative amount: Osc 1
+        // is at 100%
         let amp = &params.osc1.amp;
-        let (low, high) = span(amp, ModTarget::Osc1Amp, &[(ModSource::Env1, -0.5)]).unwrap();
+        let (low, high) = span(amp, ModTarget::Osc1Amp, &[(false, -0.5)]).unwrap();
         assert!(close(low, 0.5) && close(high, 1.0));
 
         // And the routes add up: from the middle of the pan, a quarter either way plus half more
         // up, of its whole range
         let pan = &params.osc1.pan;
-        let routes = [(ModSource::Lfo2, 0.25), (ModSource::Velocity, 0.5)];
+        let routes = [(true, 0.25), (false, 0.5)];
         let (low, high) = span(pan, ModTarget::Osc1Pan, &routes).unwrap();
         assert!(close(low, 0.25) && close(high, 1.0), "{low} {high}");
+
+        // A synced LFO's rate knob moves through about three note lengths an octave
+        let lfo = &crate::params::LfoParams {
+            sync: BoolParam::new("Sync", true),
+            ..crate::params::LfoParams::new()
+        };
+        let routes = [(false, 0.25)];
+        let steps = catalog::lfo_rate(lfo, 0);
+        let (low, high) = modulation_span(&lfo.division, steps.scaling.unwrap(), routes.iter().copied()).unwrap();
+        assert!(close(low, lfo.division.unmodulated_normalized_value()), "{low}");
+        assert!(close(high, lfo.division.preview_normalized(lfo.division.value() + 3)), "{high}");
     }
 }

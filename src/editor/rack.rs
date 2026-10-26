@@ -20,8 +20,9 @@ use super::catalog::{self, Colors, Control};
 use super::knob::{self, Controls};
 use super::widgets::{self, in_rect};
 use super::{
-    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, theme_picker, title_bar,
-    tuning_window, wavetable_file_combo, wavetable_file_status, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
+    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, lfo_display, short_combo_cell,
+    theme_picker, title_bar, tuning_window, wavetable_file_combo, wavetable_file_status, Gui, Live, Matrix, WaveDisplay,
+    MOD_COLOR,
 };
 use crate::params::{EnvelopeParams, OscillatorWave, ThreeOscParams};
 use crate::synth::modulation::{ModSource, ModTarget, N_SOURCES};
@@ -229,15 +230,15 @@ const ROW_SOUND: &[(Module, f32)] = &[
 const ROW_MODULATION: &[(Module, f32)] = &[
     (Module::Envelope(0), 10.0),
     (Module::Envelope(1), 10.0),
-    (Module::Lfo(0), 6.0),
-    (Module::Lfo(1), 6.0),
-    (Module::Lfo(2), 6.0),
+    (Module::Lfo(0), 8.0),
+    (Module::Lfo(1), 8.0),
+    (Module::Lfo(2), 8.0),
     (Module::Midi, 6.0),
     (Module::Distortion, 6.0),
     (Module::Chorus, 6.0),
     (Module::Delay, 7.0),
     (Module::Reverb, 6.0),
-    (Module::Output, 12.0),
+    (Module::Output, 10.0),
 ];
 
 /// The width of an HP in a rack `width` wide: the longer row fills it.
@@ -533,23 +534,32 @@ fn voice(ui: &mut Ui, rect: Rect, params: &ThreeOscParams, controls: &Controls) 
     knob_grid(ui, "voice knobs", grid_rect, &catalog::voice(global), 2, controls);
 }
 
+/// An LFO's module: its wave, trigger and sync, its display, its knobs, and its jack.
 fn lfo(ui: &mut Ui, rect: Rect, index: usize, params: &ThreeOscParams, controls: &Controls, jacks: &Jacks, live: Live) {
     let lfo = &params.lfos[index];
+    let setter = controls.setter;
     let body = panel(ui.painter(), rect, Some((&format!("LFO {}", index + 1), COLORS.modulation)));
-    let rate = [catalog::lfo_rate(lfo, index)];
-    let grid = grid_height(body.width(), 1, 1);
-    let display_height = (body.height() - 26.0 - grid - JACK_HEIGHT - 8.0).max(DISPLAY_MIN);
-    let wave = lfo.wave.value().to_osc_wave();
-    let phase = live.monitor.lfo_phase(index);
+    let knobs = catalog::lfo(lfo, index);
+    let grid = grid_height(body.width(), knobs.len(), LFO_COLUMNS);
+    let display_height = (body.height() - LFO_CHOICES - grid - JACK_HEIGHT - 8.0).max(DISPLAY_MIN);
     let top = in_rect(ui, ("lfo", index), body, Layout::top_down(Align::Min), |ui| {
-        combo_cell(ui, &lfo.wave, index, body.width() - 12.0, help::LFO_WAVE, controls.setter);
-        displays::lfo(ui, &wave, MOD_COLOR, phase, display_height);
+        short_combo_cell(ui, &lfo.wave, index, body.width() - 12.0, help::LFO_WAVE, setter);
+        combo_cell(ui, &lfo.trigger, index, body.width() - 12.0, help::LFO_TRIGGER, setter);
+        ui.horizontal(|ui| {
+            widgets::switch(ui, &lfo.sync, help::LFO_SYNC, setter, COLORS.modulation);
+            ui.label(RichText::new("SYNC").small().color(INK)).on_hover_text(help::LFO_SYNC);
+        });
+        lfo_display(ui, lfo, index, live, display_height);
         ui.min_rect().bottom()
     });
     let grid_rect = Rect::from_min_max(Pos2::new(body.left(), top + 6.0), body.max);
-    knob_grid(ui, ("lfo knob", index), grid_rect, &rate, 1, controls);
+    knob_grid(ui, ("lfo knobs", index), grid_rect, &knobs, LFO_COLUMNS, controls);
     jack(ui, body, "OUT", ModSource::lfo(index), controls, jacks);
 }
+
+/// The columns of an LFO module's knobs, and the height of its choices over its display.
+const LFO_COLUMNS: usize = 2;
+const LFO_CHOICES: f32 = 2.0 * 26.0 + 22.0;
 
 /// The sources that come from MIDI (and the random one), a jack each.
 fn midi(ui: &mut Ui, rect: Rect, controls: &Controls, jacks: &Jacks) {
@@ -656,6 +666,10 @@ mod tests {
             assert!(26.0 + DISPLAY_MIN + grid_height(osc_width, 13, 4) + JACK_HEIGHT + 8.0 <= height, "{size:?}");
             let filter_width = 16.0 * hp - 2.0 * PADDING;
             assert!(2.0 * 26.0 + DISPLAY_MIN + grid_height(filter_width, 4, 2) + 8.0 <= height, "{size:?}");
+            let lfo_height = rows[1].height() - TITLE_HEIGHT - PADDING - 4.0;
+            let lfo_width = 8.0 * hp - 2.0 * PADDING;
+            let lfo_knobs = grid_height(lfo_width, 3, LFO_COLUMNS);
+            assert!(LFO_CHOICES + DISPLAY_MIN + 6.0 + lfo_knobs + JACK_HEIGHT + 8.0 <= lfo_height, "{size:?}");
         }
     }
 }

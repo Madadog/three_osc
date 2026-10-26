@@ -16,7 +16,8 @@ use crate::synth::filter::{
     ladder_oversampling, Filter, FilterContainer, FilterController, FilterModel, FilterType, LadderFilter,
     LADDER_LANES,
 };
-use crate::synth::oscillator::{OscWave, WavePreview};
+use crate::synth::lfo::{Lfo, LfoTrigger, LfoVoice};
+use crate::synth::oscillator::WavePreview;
 
 /// The displays' colours, which the theme sets (see [`set_palette()`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,28 +175,63 @@ pub fn wave(ui: &mut Ui, preview: &WavePreview, position: f32, phase: f32, phase
     curve(&painter, points, centre, color, 1.5);
 }
 
-/// One cycle of an LFO's waveform, with a dot where the newest note's copy of it is (`phase`, in
-/// cycles).
-pub fn lfo(ui: &mut Ui, wave: &OscWave, color: Color32, phase: Option<f32>, height: f32) {
+/// An LFO's wave, from where its notes start it: one cycle (or, for a one shot LFO, the part of
+/// it a note runs through), or four of a random wave, whose values differ from cycle to cycle.
+/// A dot shows the newest note's copy of it (`newest`: its phase in cycles and its output, faded
+/// in as far as it has).
+pub fn lfo(ui: &mut Ui, lfo: &Lfo, color: Color32, newest: Option<(LfoVoice, f32)>, height: f32) {
     let (response, painter, rect) = frame(ui, height);
-    response.on_hover_text(
-        "One cycle of the LFO, from -100% to 100%. The dot is where the newest note's copy of it is.",
-    );
+    let random = lfo.wave.is_random();
+    let one_shot = lfo.trigger == LfoTrigger::OneShot;
+    response.on_hover_text(if random {
+        "Four cycles of the LFO's random values, from -100% to 100%. Each note draws its own: \
+         while notes play, these are the newest one's, from the start of the cycle it's in, and \
+         the dot is where it is."
+    } else if one_shot {
+        "The cycle the LFO runs through once at the start of each note, from -100% to 100%, \
+         holding its end. The dot is where the newest note's copy of it is."
+    } else {
+        "One cycle of the LFO, from -100% to 100%, from where its notes start it. The dot is where \
+         the newest note's copy of it is."
+    });
     let centre = rect.center().y;
     painter.guide(Pos2::new(rect.left(), centre), Pos2::new(rect.right(), centre));
+    // The random waves draw the newest note's values (from the cycle it's in), or some others
+    // while no note plays
+    let (seed, first_cycle) = match newest {
+        Some((voice, _)) if random => (voice.seed, voice.cycle),
+        _ => (1, 0),
+    };
+    // How many cycles the width shows, from the start phase (or for a note's random values that
+    // go on cycle after cycle, from the start of the cycle it's in)
+    let start = if random && newest.is_some() && !one_shot { 0.0 } else { lfo.phase };
+    let span = if random {
+        4.0
+    } else if one_shot {
+        (1.0 - start).max(0.01)
+    } else {
+        1.0
+    };
+    let value = |offset: f32| {
+        let phase = start + offset;
+        let whole = phase.floor();
+        // (The end of a cycle shows as the start of the next one, except where a one shot holds)
+        let (phase, cycle) = if one_shot { (phase.min(1.0), 0.0) } else { (phase - whole, whole) };
+        lfo.wave.value(phase, first_cycle.wrapping_add(cycle as u32), seed)
+    };
     let steps = (rect.width() as usize).max(2) * 2;
     let points = (0..=steps)
         .map(|step| {
-            let phase = step as f32 / steps as f32;
-            // The end of the cycle is the start of the next one
-            let value = wave.generate(if step == steps { 0.0 } else { phase });
-            Pos2::new(x_at(rect, phase), centre - value * rect.height() / 2.0)
+            let x = step as f32 / steps as f32;
+            Pos2::new(x_at(rect, x), centre - value(x * span) * rect.height() / 2.0)
         })
         .collect();
     curve(&painter, points, centre, color, 1.5);
-    if let Some(phase) = phase {
-        let phase = phase.rem_euclid(1.0);
-        painter.live_dot(Pos2::new(x_at(rect, phase), centre - wave.generate(phase) * rect.height() / 2.0));
+    if let Some((voice, output)) = newest {
+        let phase = voice.phase as f32;
+        let offset = if one_shot { (phase - start).max(0.0) } else { (phase - start).rem_euclid(1.0) };
+        let x = (offset / span).clamp(0.0, 1.0);
+        painter.live_dot(Pos2::new(x_at(rect, x), centre - output * rect.height() / 2.0));
     }
 }
 

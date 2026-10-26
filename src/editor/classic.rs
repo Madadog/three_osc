@@ -13,7 +13,7 @@ use nih_plug_egui::egui::{self, RichText, Stroke, StrokeKind, Ui};
 use nih_plug_egui::widgets::ParamSlider;
 
 use super::{
-    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, set_param, title_bar,
+    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, lfo_display, set_param, title_bar,
     wavetable_file_combo, wavetable_file_status, wavetable_folder_rows, Gui, Live, Matrix, NumericParam, WaveDisplay,
     MOD_COLOR,
 };
@@ -23,13 +23,15 @@ use crate::params::{
     WavetableFile,
 };
 use crate::synth::effects::{ChorusSettings, DelaySettings, DistortionSettings, ReverbSettings};
-use crate::synth::modulation::{ModSource, ModTarget};
+use crate::synth::modulation::{ModSource, ModTarget, Scaling};
 use crate::synth::oversampling::Oversampling;
 
 const SLIDER_WIDTH: f32 = 110.0;
 const COMBO_WIDTH: f32 = 150.0;
 /// Width of the combo boxes in the modulation matrix, which has two per row.
-const MATRIX_COMBO_WIDTH: f32 = 115.0;
+const MATRIX_COMBO_WIDTH: f32 = 100.0;
+/// Width of the amount sliders in the modulation matrix.
+const MATRIX_SLIDER_WIDTH: f32 = 90.0;
 /// The width of a section of controls. Sections are laid out side by side, so they can't be
 /// left to take all the width they are offered (their separators would).
 const SECTION_WIDTH: f32 = 290.0;
@@ -336,16 +338,25 @@ fn oscillator(
 }
 
 fn lfo(ui: &mut Ui, index: usize, lfo: &LfoParams, matrix: &Matrix, setter: &ParamSetter, live: Live) {
-    let wave = lfo.wave.value().to_osc_wave();
-    let phase = live.monitor.lfo_phase(index);
     section(
         ui,
         &format!("LFO {}", index + 1),
         Some(ModSource::lfo(index)),
-        Display::Beside(&mut |ui| displays::lfo(ui, &wave, MOD_COLOR, phase, displays::LFO_HEIGHT)),
+        Display::Beside(&mut |ui| lfo_display(ui, lfo, index, live, displays::LFO_HEIGHT)),
         |ui| {
             combo(ui, &lfo.wave, help::LFO_WAVE, setter);
-            mod_slider(ui, &lfo.rate, help::LFO_RATE, ModTarget::lfo_rate(index), matrix, setter);
+            toggle(ui, "Sync", &lfo.sync, help::LFO_SYNC, setter);
+            let target = ModTarget::lfo_rate(index);
+            if lfo.sync.value() {
+                // (Its rate's modulation moves through about three note lengths an octave)
+                let scaling = Scaling::Linear(3.0 * ModTarget::LFO_RATE_OCTAVES);
+                mod_slider_scaled(ui, &lfo.division, help::LFO_DIVISION, target, scaling, matrix, setter);
+            } else {
+                mod_slider(ui, &lfo.rate, help::LFO_RATE, target, matrix, setter);
+            }
+            slider(ui, &lfo.phase, help::LFO_PHASE, setter);
+            combo(ui, &lfo.trigger, help::LFO_TRIGGER, setter);
+            slider(ui, &lfo.fade, help::LFO_FADE, setter);
         },
     );
 }
@@ -512,7 +523,8 @@ fn modulation_matrix(ui: &mut Ui, matrix: &Matrix, setter: &ParamSetter) {
                 );
                 ui.separator();
                 egui::Grid::new("routes")
-                    .num_columns(4)
+                    .num_columns(6)
+                    .min_col_width(0.0)
                     .spacing([6.0, 4.0])
                     .show(ui, |ui| {
                         for (index, slot) in matrix.slots.iter().enumerate() {
@@ -529,8 +541,10 @@ fn matrix_row(ui: &mut Ui, index: usize, slot: &ModSlotParams, setter: &ParamSet
     combo_cell(ui, &slot.source, index, MATRIX_COMBO_WIDTH, source_help, setter);
     let target_help = slot.target.value().help();
     combo_cell(ui, &slot.target, index, MATRIX_COMBO_WIDTH, target_help, setter);
-    ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(SLIDER_WIDTH))
+    ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(MATRIX_SLIDER_WIDTH))
         .on_hover_text(help::MOD_AMOUNT);
+    super::widgets::polarity_button(ui, slot, setter);
+    super::widgets::remap_button(ui, index, slot);
     let in_use = slot.source.value() != ModSource::None || slot.target.value() != ModTarget::None;
     if ui
         .add_enabled(in_use, egui::Button::new(RichText::new("×").strong()).small())
@@ -664,6 +678,20 @@ fn mod_slider<P: NumericParam>(
     matrix: &Matrix,
     setter: &ParamSetter,
 ) {
+    mod_slider_scaled(ui, param, help, target, target.scaling(), matrix, setter);
+}
+
+/// A [`mod_slider()`] whose target's modulation moves it as `scaling` says, rather than as it
+/// moves the target's own control.
+fn mod_slider_scaled<P: NumericParam>(
+    ui: &mut Ui,
+    param: &P,
+    help: &str,
+    target: ModTarget,
+    scaling: Scaling,
+    matrix: &Matrix,
+    setter: &ParamSetter,
+) {
     ui.label(param.name()).on_hover_text(help);
     ui.horizontal(|ui| {
         let response = ui.add(ParamSlider::for_param(param, setter).with_width(SLIDER_WIDTH));
@@ -687,27 +715,20 @@ fn mod_slider<P: NumericParam>(
             matrix.add_route(setter, *source, target);
         }
 
-        // The routes that modulate this control
-        let routes: Vec<String> = matrix
-            .routes_for(target)
-            .map(|(source, amount)| {
-                format!(
-                    "{} {:+.0}%",
-                    ModSource::variants()[source.to_index()],
-                    amount * 100.0
-                )
-            })
-            .collect();
-        if !routes.is_empty() {
+        // A marker if routes modulate this control
+        if matrix.routes_for(target).next().is_some() {
             // Painted rather than a glyph, which the default proportional fonts may lack
             let (rect, marker) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 3.5, MOD_COLOR);
-            marker.on_hover_text(format!("Modulated by:\n{}", routes.join("\n")));
+            // The routes over the slider while it (or the marker) is hovered
+            let hovered = response.hovered() || marker.hovered();
+            let id = response.id.with("routes");
+            super::widgets::routes_overlay(ui, id, response.rect, hovered, target, matrix, setter);
 
             if let Some(modulation) = matrix.monitor.modulation(target) {
                 let value = param.value_f32();
                 let from = param.normalized_at(value);
-                let to = param.normalized_at(target.scaling().apply(value, modulation));
+                let to = param.normalized_at(scaling.apply(value, modulation));
                 let bar = response.rect;
                 let x = |normalized: f32| bar.left() + bar.width() * normalized.clamp(0.0, 1.0);
                 let painter = ui.painter();

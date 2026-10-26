@@ -174,30 +174,6 @@ pub fn wrap_cycles_signed(phase: f32) -> f32 {
     }
 }
 
-/// A single instance of a playing oscillator (the LFO), with its phase in cycles.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OscVoice {
-    /// In `[0, 1)`. Double precision, since a slow LFO updated at every sample advances by
-    /// steps too small for single precision to add up exactly: at 0.01 Hz it would run 3% fast.
-    pub phase: f64,
-}
-impl OscVoice {
-    /// Advances the phase by `delta` cycles and returns the new phase, wrapped to `[0, 1]` (the
-    /// conversion to single precision can round up to 1).
-    pub fn add_phase(&mut self, delta: f32) -> f32 {
-        let mut phase = self.phase + delta as f64;
-        // Usually the phase is still in its cycle (the comparisons are cheaper than wrapping)
-        if !(0.0..1.0).contains(&phase) {
-            phase -= (phase as i64) as f64;
-            if phase < 0.0 {
-                phase += 1.0;
-            }
-        }
-        self.phase = phase;
-        phase as f32
-    }
-}
-
 #[derive(Debug, Clone)]
 /// Brute force approach to oscillator super (playing multiple detuned copies
 /// of a wave simultaneously) which tracks the phase of every wave copy.
@@ -471,61 +447,6 @@ impl Default for OscillatorParams {
             fm: 0.0,
             pm: 0.0,
             am: 0.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-/// Naive wave generators, used by the LFO.
-pub enum OscWave {
-    Sine,
-    Tri,
-    Saw,
-    Exp,
-    Square,
-}
-
-impl OscWave {
-    /// [`generate()`][Self::generate()] for eight phases at once, with exactly the same
-    /// results.
-    pub fn generate8(&self, phase: f32x8) -> f32x8 {
-        use OscWave::*;
-
-        let half = phase.simd_le(f32x8::splat(0.5));
-        match self {
-            Sine => fastmath::x8::sin_cycles(phase),
-            Tri => half.select(
-                phase * f32x8::splat(4.0) - f32x8::splat(1.0),
-                f32x8::splat(3.0) - phase * f32x8::splat(4.0),
-            ),
-            Saw => phase * f32x8::splat(2.0) - f32x8::splat(1.0),
-            Exp => fastmath::x8::sin_cycles(phase).abs() * f32x8::splat(2.0) - f32x8::splat(1.0),
-            Square => half.select(f32x8::splat(1.0), f32x8::splat(-1.0)),
-        }
-    }
-    /// Generates the waveform at the given phase in cycles (`[0, 1)`), with all values ranging
-    /// from -1 to +1 peak to peak.
-    pub fn generate(&self, phase: f32) -> f32 {
-        use OscWave::*;
-
-        match self {
-            Sine => fastmath::sin_cycles(phase),
-            Tri => {
-                if phase <= 0.5 {
-                    phase * 4.0 - 1.0
-                } else {
-                    3.0 - phase * 4.0
-                }
-            }
-            Saw => phase * 2.0 - 1.0,
-            Exp => fastmath::sin_cycles(phase).abs() * 2.0 - 1.0,
-            Square => {
-                if phase <= 0.5 {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
         }
     }
 }
@@ -2765,22 +2686,6 @@ mod tests {
         assert_eq!(osc.stepped_pitch_factor(octave(3.0), 0.0), 2.0);
         assert_eq!(osc.stepped_pitch_factor(0.0, step(-3.0)), 0.5 / 3.0);
         assert_eq!(osc.stepped_pitch_factor(0.0, 1.0), 65.0 / 3.0);
-    }
-
-    /// A slow LFO updated at every sample advances its phase by steps far smaller than the
-    /// phase, which still add up to the right time.
-    #[test]
-    fn lfo_phase_keeps_time_in_tiny_steps() {
-        let mut lfo = OscVoice::default();
-        let delta = 0.01 / 44100.0;
-        let mut phase = 0.0;
-        // Half a cycle at 0.01 Hz
-        for _ in 0..44100 * 50 {
-            phase = lfo.add_phase(delta);
-        }
-        assert!((phase - 0.5).abs() < 1e-5, "{phase}");
-        // A step of more than a cycle (a fast LFO at the block rate) wraps too
-        assert!((lfo.add_phase(2.25) - 0.75).abs() < 1e-5);
     }
 
     #[test]

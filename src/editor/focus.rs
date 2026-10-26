@@ -17,10 +17,10 @@ use super::catalog::{self, Colors, Control};
 use super::knob::{self, Controls};
 use super::widgets::{self, in_rect};
 use super::{
-    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, theme_picker, title_bar,
+    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, lfo_display, theme_picker, title_bar,
     tuning_window, wavetable_file_combo, wavetable_file_status, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
 };
-use crate::params::{FilterModelParam, FilterTypeParam, OscillatorWave, PolyphonyParam, ThreeOscParams, Wave};
+use crate::params::{FilterModelParam, FilterTypeParam, ModSlotParams, OscillatorWave, PolyphonyParam, ThreeOscParams, Wave};
 use crate::synth::modulation::{ModSource, ModTarget};
 use crate::ThreeOscPlugin;
 
@@ -44,6 +44,8 @@ const SIDEBAR_WIDTH: f32 = 280.0;
 const ENTRY_HEIGHT: f32 = 36.0;
 const GAP: f32 = 12.0;
 const MODULATION_WIDTH: f32 = 330.0;
+/// The most a route's name takes of the modulation side, which has its controls beside it.
+const ROUTE_NAME_WIDTH: f32 = 120.0;
 const HELP_HEIGHT: f32 = 92.0;
 const MIN_WIDTH: f32 = 1100.0;
 const MIN_HEIGHT: f32 = 760.0;
@@ -247,8 +249,10 @@ impl Module {
             Self::FilterEnvelope => "Moves the filter's cutoff over each note, by its Amount. It's also a modulation source.",
             Self::Envelope(_) => "An envelope that's only a modulation source: drag it from the list onto any knob.",
             Self::Lfo(_) => {
-                "A low frequency oscillator, a modulation source that swings back and forth. \
-                 Each note has its own, started when the note starts."
+                "A low frequency oscillator, a modulation source that swings back and forth, at \
+                 a rate or in time with the host's tempo. Each note has its own, started at its \
+                 phase when the note starts (or, with the Free trigger, carrying on from one that \
+                 runs all the time), which can fade in."
             }
             Self::Midi => "The modulation sources that come from how notes are played, and a random value for each note.",
             Self::Routes => {
@@ -286,7 +290,7 @@ impl Module {
                 controls
             }
             Self::Envelope(index) => catalog::envelope(&params.mod_envs[index].envelope).to_vec(),
-            Self::Lfo(index) => vec![catalog::lfo_rate(&params.lfos[index], index)],
+            Self::Lfo(index) => catalog::lfo(&params.lfos[index], index).to_vec(),
             Self::Distortion => catalog::distortion(&fx.distortion).to_vec(),
             Self::Chorus => catalog::chorus(&fx.chorus).to_vec(),
             Self::Delay => catalog::delay(&fx.delay).to_vec(),
@@ -336,7 +340,12 @@ impl Module {
             Self::Envelope(index) => envelope(&params.mod_envs[index].envelope),
             Self::Lfo(index) => {
                 let lfo = &params.lfos[index];
-                format!("{} · {}", Wave::variants()[lfo.wave.value().to_index()], value(&lfo.rate))
+                let rate = if lfo.sync.value() {
+                    lfo.division.normalized_value_to_string(lfo.division.modulated_normalized_value(), true)
+                } else {
+                    value(&lfo.rate)
+                };
+                format!("{} · {rate}", Wave::variants()[lfo.wave.value().to_index()])
             }
             Self::Midi => String::from("Velocity, key, wheel, touch, random"),
             Self::Routes => {
@@ -454,10 +463,9 @@ fn entry(ui: &mut Ui, module: Module, params: &ThreeOscParams, controls: &Contro
             in_rect(ui, ("thumbnail", index), thumbnail, Layout::top_down(Align::Min), |ui| wave.show(ui, thumbnail.height()));
         }
         Module::Lfo(index) => {
-            let wave = params.lfos[index].wave.value().to_osc_wave();
-            let phase = gui.live.monitor.lfo_phase(index);
+            let live = gui.live;
             in_rect(ui, ("lfo thumbnail", index), thumbnail, Layout::top_down(Align::Min), |ui| {
-                displays::lfo(ui, &wave, MOD_COLOR, phase, thumbnail.height())
+                lfo_display(ui, &params.lfos[index], index, live, thumbnail.height())
             });
         }
         _ => {
@@ -656,10 +664,15 @@ fn controls_page(
             }
             Module::Lfo(index) => {
                 let lfo = &params.lfos[index];
-                choice(ui, "Wave", &mut |ui| combo_cell(ui, &lfo.wave, index, 160.0, help::LFO_WAVE, setter), help::LFO_WAVE);
-                let wave = lfo.wave.value().to_osc_wave();
+                ui.horizontal(|ui| {
+                    choice(ui, "Wave", &mut |ui| combo_cell(ui, &lfo.wave, index, 160.0, help::LFO_WAVE, setter), help::LFO_WAVE);
+                    let trigger = &mut |ui: &mut Ui| combo_cell(ui, &lfo.trigger, index, 120.0, help::LFO_TRIGGER, setter);
+                    choice(ui, "Trigger", trigger, help::LFO_TRIGGER);
+                    let sync = &mut |ui: &mut Ui| drop(widgets::switch(ui, &lfo.sync, help::LFO_SYNC, setter, ACCENT));
+                    choice(ui, "Sync", sync, help::LFO_SYNC);
+                });
                 let height = ui.available_height().max(60.0);
-                displays::lfo(ui, &wave, MOD_COLOR, live.monitor.lfo_phase(index), height);
+                lfo_display(ui, lfo, index, live, height);
             }
             Module::Distortion | Module::Chorus | Module::Delay | Module::Reverb => {
                 effect_content(ui, module, params, controls, live, &mut choice);
@@ -795,6 +808,22 @@ fn routes_page(ui: &mut Ui, rect: Rect, controls: &Controls, gui: &mut Gui) {
     });
 }
 
+/// A grid row for a route: its name (cut short where it's long), its amount, polarity and
+/// remap, and a button to remove it.
+fn route_row(ui: &mut Ui, name: String, index: usize, slot: &ModSlotParams, setter: &ParamSetter) {
+    ui.scope(|ui| {
+        ui.set_max_width(ROUTE_NAME_WIDTH);
+        ui.add(egui::Label::new(RichText::new(name).color(INK)).truncate());
+    });
+    ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(70.0)).on_hover_text(help::MOD_AMOUNT);
+    widgets::polarity_button(ui, slot, setter);
+    widgets::remap_button(ui, index, slot);
+    if ui.small_button("×").on_hover_text(help::REMOVE_ROUTE).clicked() {
+        Matrix::clear(setter, slot);
+    }
+    ui.end_row();
+}
+
 /// The routes into a module's knobs, and (for a modulation source) out of it, each with its
 /// amount and a way to remove it.
 fn modulation_side(ui: &mut Ui, rect: Rect, module: Module, knobs: &[Control], controls: &Controls) {
@@ -814,21 +843,17 @@ fn modulation_side(ui: &mut Ui, rect: Rect, module: Module, knobs: &[Control], c
         let into: Vec<_> = matrix
             .slots
             .iter()
-            .filter(|slot| Matrix::is_used(slot) && knobs.iter().any(|knob| knob.target == slot.target.value()))
+            .enumerate()
+            .filter(|(_, slot)| Matrix::is_used(slot) && knobs.iter().any(|knob| knob.target == slot.target.value()))
             .collect();
         ui.label(RichText::new("Into its knobs").strong().color(INK));
         if into.is_empty() {
             ui.label(RichText::new("Nothing modulates it yet: drag a source from the list onto a knob.").small().color(INK_WEAK));
         }
-        egui::Grid::new("into").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
-            for slot in into {
+        egui::Grid::new("into").num_columns(5).min_col_width(0.0).spacing([6.0, 6.0]).show(ui, |ui| {
+            for (index, slot) in into {
                 let source = ModSource::variants()[slot.source.value().to_index()];
-                ui.label(RichText::new(format!("{source} › {}", label_of(slot.target.value()))).color(INK));
-                ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(90.0));
-                if ui.small_button("×").on_hover_text(help::CLEAR_ROUTE).clicked() {
-                    Matrix::clear(setter, slot);
-                }
-                ui.end_row();
+                route_row(ui, format!("{source} › {}", label_of(slot.target.value())), index, slot, setter);
             }
         });
         if let Some(source) = module.source() {
@@ -837,19 +862,16 @@ fn modulation_side(ui: &mut Ui, rect: Rect, module: Module, knobs: &[Control], c
             let out: Vec<_> = matrix
                 .slots
                 .iter()
-                .filter(|slot| Matrix::is_used(slot) && slot.source.value() == source)
+                .enumerate()
+                .filter(|(_, slot)| Matrix::is_used(slot) && slot.source.value() == source)
                 .collect();
             if out.is_empty() {
                 ui.label(RichText::new("It doesn't modulate anything yet: drag its handle onto a knob.").small().color(INK_WEAK));
             }
-            egui::Grid::new("out").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
-                for slot in out {
-                    ui.label(RichText::new(ModTarget::variants()[slot.target.value().to_index()]).color(INK));
-                    ui.add(ParamSlider::for_param(&slot.amount, setter).with_width(90.0));
-                    if ui.small_button("×").on_hover_text(help::CLEAR_ROUTE).clicked() {
-                        Matrix::clear(setter, slot);
-                    }
-                    ui.end_row();
+            egui::Grid::new("out").num_columns(5).min_col_width(0.0).spacing([6.0, 6.0]).show(ui, |ui| {
+                for (index, slot) in out {
+                    let target = ModTarget::variants()[slot.target.value().to_index()];
+                    route_row(ui, String::from(target), index, slot, setter);
                 }
             });
         }

@@ -1,6 +1,6 @@
 //! What the audio thread shows the GUI of the notes that are playing, so that the displays can
-//! follow them: where each voice is in its envelopes, and the newest voice's LFO phases,
-//! modulation and filter cutoff. And the synth's output itself, for the meter and spectrogram
+//! follow them: where each voice is in its envelopes, and the newest voice's LFOs, modulation
+//! and filter cutoff. And the synth's output itself, for the meter and spectrogram
 //! (see [`OutputTap`]).
 //!
 //! The audio thread writes it after each buffer while the GUI is open (see
@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use nih_plug::prelude::Enum;
 
+use super::lfo::LfoVoice;
 use super::modulation::{ModTarget, Targets, N_LFOS, N_TARGETS};
 
 /// How many of the newest voices are shown.
@@ -47,8 +48,12 @@ pub struct Monitor {
     voice_count: AtomicU32,
     /// Whether a voice is playing, so that the newest voice's values below mean something.
     playing: AtomicBool,
-    /// The newest voice's LFO phases, in cycles.
+    /// The newest voice's copies of the LFOs (their phases, cycles and seeds), and their
+    /// outputs.
     lfo_phases: [AtomicU32; N_LFOS],
+    lfo_cycles: [AtomicU32; N_LFOS],
+    lfo_seeds: [AtomicU32; N_LFOS],
+    lfo_values: [AtomicU32; N_LFOS],
     /// The newest voice's modulation of every target.
     modulation: [AtomicU32; N_TARGETS],
     /// The newest voice's filter cutoff, in Hz.
@@ -64,6 +69,9 @@ impl Default for Monitor {
             voice_count: AtomicU32::new(0),
             playing: AtomicBool::new(false),
             lfo_phases: std::array::from_fn(|_| AtomicU32::new(0)),
+            lfo_cycles: std::array::from_fn(|_| AtomicU32::new(0)),
+            lfo_seeds: std::array::from_fn(|_| AtomicU32::new(0)),
+            lfo_values: std::array::from_fn(|_| AtomicU32::new(0)),
             modulation: std::array::from_fn(|_| AtomicU32::new(0)),
             cutoff: AtomicU32::new(0),
             output: OutputTap::default(),
@@ -73,7 +81,9 @@ impl Default for Monitor {
 
 /// The newest voice's values, for [`Monitor::store()`].
 pub struct NewestVoice {
-    pub lfo_phases: [f32; N_LFOS],
+    pub lfos: [LfoVoice; N_LFOS],
+    /// Its LFOs' outputs, faded in as far as they have.
+    pub lfo_values: [f32; N_LFOS],
     pub modulation: Targets,
     pub cutoff: f32,
 }
@@ -90,8 +100,13 @@ impl Monitor {
         self.voice_count.store(count as u32, Ordering::Relaxed);
         self.playing.store(newest.is_some(), Ordering::Relaxed);
         if let Some(newest) = newest {
-            for (slot, phase) in self.lfo_phases.iter().zip(newest.lfo_phases) {
-                slot.store(phase.to_bits(), Ordering::Relaxed);
+            for (lfo, voice) in newest.lfos.iter().enumerate() {
+                self.lfo_phases[lfo].store((voice.phase as f32).to_bits(), Ordering::Relaxed);
+                self.lfo_cycles[lfo].store(voice.cycle, Ordering::Relaxed);
+                self.lfo_seeds[lfo].store(voice.seed, Ordering::Relaxed);
+            }
+            for (slot, value) in self.lfo_values.iter().zip(newest.lfo_values) {
+                slot.store(value.to_bits(), Ordering::Relaxed);
             }
             for (slot, modulation) in self.modulation.iter().zip(newest.modulation) {
                 slot.store(modulation.to_bits(), Ordering::Relaxed);
@@ -115,9 +130,18 @@ impl Monitor {
             .then(|| f32::from_bits(slot.load(Ordering::Relaxed)))
     }
 
-    /// The newest voice's phase of an LFO, in cycles.
-    pub fn lfo_phase(&self, lfo: usize) -> Option<f32> {
-        self.newest(&self.lfo_phases[lfo])
+    /// The newest voice's output of an LFO, faded in as far as it has.
+    pub fn lfo_value(&self, lfo: usize) -> Option<f32> {
+        self.newest(&self.lfo_values[lfo])
+    }
+
+    /// The newest voice's copy of an LFO (with its phase in single precision).
+    pub fn lfo(&self, lfo: usize) -> Option<LfoVoice> {
+        self.newest(&self.lfo_phases[lfo]).map(|phase| LfoVoice {
+            phase: phase as f64,
+            cycle: self.lfo_cycles[lfo].load(Ordering::Relaxed),
+            seed: self.lfo_seeds[lfo].load(Ordering::Relaxed),
+        })
     }
 
     /// The newest voice's modulation of a target.
@@ -227,15 +251,18 @@ mod tests {
             .collect();
         let mut modulation = [0.0; N_TARGETS];
         modulation[ModTarget::Cutoff.to_index()] = -0.25;
+        let lfo = |phase: f64, cycle: u32| LfoVoice { phase, cycle, seed: 7 };
         let newest = NewestVoice {
-            lfo_phases: [0.1, 0.2, 0.3],
+            lfos: [lfo(0.125, 0), lfo(0.25, 1), lfo(0.375, 2)],
+            lfo_values: [-0.5, 0.0, 0.75],
             modulation,
             cutoff: 1234.0,
         };
         monitor.store(voices.iter().copied(), Some(newest));
         let shown: Vec<VoiceState> = monitor.voices().collect();
         assert_eq!(shown, &voices[20 - MONITORED_VOICES..]);
-        assert_eq!(monitor.lfo_phase(2), Some(0.3));
+        assert_eq!(monitor.lfo(2), Some(lfo(0.375, 2)));
+        assert_eq!(monitor.lfo_value(0), Some(-0.5));
         assert_eq!(monitor.modulation(ModTarget::Cutoff), Some(-0.25));
         assert_eq!(monitor.cutoff(), Some(1234.0));
         // Once nothing plays, the newest voice's values are gone

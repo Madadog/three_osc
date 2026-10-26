@@ -118,11 +118,7 @@ fn select_sweep(osc: &mut OscillatorParams) {
 /// Two LFOs, an envelope and velocity modulating pitch, cutoff, position and amplitude.
 fn four_routes(plugin: &mut ThreeOscPlugin) {
     use crate::synth::modulation::{ModSource, ModTarget, Route};
-    let route = |source, target, amount| Route {
-        source,
-        target,
-        amount,
-    };
+    let route = |source, target, amount| Route::new(source, target, amount);
     plugin.synth.routes.extend_from_slice(&[
         route(ModSource::Lfo1, ModTarget::FinePitch, 0.2),
         route(ModSource::Env1, ModTarget::Cutoff, 0.6),
@@ -274,10 +270,10 @@ fn benchmark_modulation_rate() {
         ("default patch, 4 modulation routes", four_routes),
         // An oscillator as a source: the silent osc 2 has to play, and its wave is kept
         ("default patch, silent osc 2 on the cutoff", |plugin| {
-            plugin.synth.routes.push(Route { source: ModSource::Osc2, target: ModTarget::Cutoff, amount: 0.3 });
+            plugin.synth.routes.push(Route::new(ModSource::Osc2, ModTarget::Cutoff, 0.3));
         }),
         ("default patch, silent osc 2 on osc 1 pitch", |plugin| {
-            plugin.synth.routes.push(Route { source: ModSource::Osc2, target: ModTarget::Osc1Pitch, amount: 0.1 });
+            plugin.synth.routes.push(Route::new(ModSource::Osc2, ModTarget::Osc1Pitch, 0.1));
         }),
         ("3 x saw, unison 8", |plugin| plugin.synth.oscillators.iter_mut().for_each(supersaw)),
         ("3 x saw, unison 8, ladder filter", |plugin| {

@@ -77,7 +77,9 @@ const TRAVEL_MIN: f32 = 70.0;
 const TRAVEL_MAX: f32 = 150.0;
 /// The width of an LFO's column of wave buttons beside its fader, and the height of each.
 const WAVES_WIDTH: f32 = 46.0;
+/// The tallest a row of the wave buttons gets, and the shortest.
 const WAVE_ROW: f32 = 18.0;
+const WAVE_ROW_MIN: f32 = 12.0;
 /// The least room for the scope and for the MIDI sources' handles, which get what their tiers
 /// have left.
 const SCOPE_MIN: f32 = 200.0;
@@ -209,7 +211,7 @@ const TIERS: [(&[Part], usize); 3] = [
         ],
         2,
     ),
-    (&[Part::Envelope(0), Part::Envelope(1), Part::Lfo(0), Part::Lfo(1), Part::Lfo(2), Part::Scope], 1),
+    (&[Part::Envelope(0), Part::Envelope(1), Part::Lfo(0), Part::Lfo(1), Part::Lfo(2), Part::Scope], 2),
 ];
 
 impl Part {
@@ -301,7 +303,7 @@ impl Part {
             Self::Amp => catalog::envelope(&params.vol_env).to_vec(),
             Self::Voice => catalog::voice(&params.global).to_vec(),
             Self::Envelope(index) => catalog::envelope(&params.mod_envs[index].envelope).to_vec(),
-            Self::Lfo(index) => vec![catalog::lfo_rate(&params.lfos[index], index)],
+            Self::Lfo(index) => catalog::lfo(&params.lfos[index], index).to_vec(),
             Self::Distortion => catalog::distortion(&fx.distortion).to_vec(),
             Self::Chorus => catalog::chorus(&fx.chorus).to_vec(),
             Self::Delay => catalog::delay(&fx.delay).to_vec(),
@@ -316,7 +318,7 @@ impl Part {
     fn width(self, params: &ThreeOscParams, cell: f32) -> Option<f32> {
         match self {
             Self::Scope | Self::Midi => None,
-            Self::Lfo(_) => Some(cell + WAVES_WIDTH),
+            Self::Lfo(_) => Some(3.0 * cell + WAVES_WIDTH),
             _ => Some(self.knobs(params).len() as f32 * cell),
         }
     }
@@ -566,6 +568,17 @@ fn section(ui: &mut Ui, part: Part, rect: Rect, cell: f32, params: &ThreeOscPara
             switches(ui, row(0), &toggles, setter);
         }
         Part::Reverb => switches(ui, row(0), &[("ON", &fx.reverb.enabled, help::REVERB)], setter),
+        Part::Lfo(index) => {
+            // Its sync at the right of its handle's row, and its trigger under them (the LFOs'
+            // parameters share their names, so each LFO's buttons have ids of their own)
+            let lfo = &params.lfos[index];
+            ui.push_id(("lfo switches", index), |ui| {
+                let sync = Rect::from_min_max(Pos2::new(row(0).right() - 48.0, row(0).top()), row(0).max);
+                switches(ui, sync, &[("SYNC", &lfo.sync, help::LFO_SYNC)], setter);
+                let labels = ["RETRIG", "FREE", "1 SHOT"].map(Label::Text);
+                choice_buttons(ui, row(1), &lfo.trigger, &labels, help::LFO_TRIGGER, setter);
+            });
+        }
         _ => {}
     }
     // The other modulation sources' handles, where the oscillators have their waves
@@ -575,7 +588,7 @@ fn section(ui: &mut Ui, part: Part, rect: Rect, cell: f32, params: &ThreeOscPara
         });
     }
 
-    // The faders along the bottom, and an LFO's wave buttons beside its one
+    // The faders along the bottom, and an LFO's wave buttons beside them
     let height = controls.style.height(cell);
     let faders = Rect::from_min_max(Pos2::new(body.left(), body.bottom() - height), body.max);
     let knobs = part.knobs(params);
@@ -584,7 +597,7 @@ fn section(ui: &mut Ui, part: Part, rect: Rect, cell: f32, params: &ThreeOscPara
         catalog::show_all(ui, &knobs, cell, controls);
     });
     if let Part::Lfo(index) = part {
-        let column = Rect::from_min_max(Pos2::new(faders.left() + cell + 6.0, faders.top()), faders.max);
+        let column = Rect::from_min_max(Pos2::new(faders.left() + knobs.len() as f32 * cell + 6.0, faders.top()), faders.max);
         lfo_waves(ui, column, index, params, setter);
     }
 }
@@ -803,13 +816,16 @@ fn selector<T: Enum + PartialEq + Copy + 'static>(
 fn lfo_waves(ui: &mut Ui, rect: Rect, index: usize, params: &ThreeOscParams, setter: &ParamSetter) {
     let param = &params.lfos[index].wave;
     let current = param.value().to_index();
-    let top = rect.center().y - 2.5 * WAVE_ROW;
+    let waves = Glyph::LFO_WAVES.len() as f32;
+    let row_height = (rect.height() / waves).clamp(WAVE_ROW_MIN, WAVE_ROW);
+    let top = rect.center().y - waves / 2.0 * row_height;
     for (wave, glyph) in Glyph::LFO_WAVES.into_iter().enumerate() {
-        let row = Rect::from_min_size(Pos2::new(rect.left(), top + wave as f32 * WAVE_ROW), egui::vec2(rect.width(), WAVE_ROW));
+        let row = Rect::from_min_size(Pos2::new(rect.left(), top + wave as f32 * row_height), egui::vec2(rect.width(), row_height));
         let response = ui.interact(row, ui.id().with(("lfo wave", index, wave)), Sense::click());
         let painter = ui.painter();
         glyph.paint(painter, Rect::from_min_size(Pos2::new(row.left(), row.center().y - 4.5), egui::vec2(16.0, 9.0)), SILK);
-        let button = Rect::from_center_size(Pos2::new(row.right() - 12.0, row.center().y), egui::vec2(24.0, 12.0));
+        let button_height = (row_height - 4.0).min(12.0);
+        let button = Rect::from_center_size(Pos2::new(row.right() - 12.0, row.center().y), egui::vec2(24.0, button_height));
         rubber(painter, button, &response);
         led(painter, button.center(), wave == current);
         let response = response.on_hover_text(format!("{}\n{}", Wave::variants()[wave], help::LFO_WAVE));
@@ -827,6 +843,8 @@ enum Glyph {
     Saw,
     Exponential,
     Square,
+    Random,
+    SmoothRandom,
     Lowpass,
     Bandpass,
     Highpass,
@@ -834,7 +852,15 @@ enum Glyph {
 
 impl Glyph {
     /// The LFOs' waves, in the order of their parameter's choices.
-    const LFO_WAVES: [Self; 5] = [Self::Sine, Self::Triangle, Self::Saw, Self::Exponential, Self::Square];
+    const LFO_WAVES: [Self; 7] = [
+        Self::Sine,
+        Self::Triangle,
+        Self::Saw,
+        Self::Exponential,
+        Self::Square,
+        Self::Random,
+        Self::SmoothRandom,
+    ];
 
     fn paint(self, painter: &Painter, rect: Rect, color: Color32) {
         let at = |x: f32, y: f32| Pos2::new(rect.left() + x * rect.width(), rect.bottom() - y * rect.height());
@@ -852,6 +878,20 @@ impl Glyph {
             Self::Saw => vec![at(0.0, 0.0), at(1.0, 1.0), at(1.0, 0.0)],
             Self::Exponential => curve(&|x| (x * 3.0).exp_m1() / 3.0_f32.exp_m1()),
             Self::Square => vec![at(0.0, 1.0), at(0.5, 1.0), at(0.5, 0.0), at(1.0, 0.0)],
+            Self::Random => {
+                let levels = [0.35, 0.9, 0.1, 0.65];
+                levels
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(step, level)| [at(step as f32 / 4.0, *level), at((step + 1) as f32 / 4.0, *level)])
+                    .collect()
+            }
+            Self::SmoothRandom => curve(&|x| {
+                let levels = [0.35, 0.9, 0.1, 0.65, 0.35];
+                let (step, within) = ((x * 4.0).floor().min(3.0) as usize, (x * 4.0).fract());
+                let eased = within * within * (3.0 - 2.0 * within);
+                levels[step] + (levels[step + 1] - levels[step]) * if x >= 1.0 { 1.0 } else { eased }
+            }),
             Self::Lowpass => curve(&|x| if x < 0.5 { 0.8 } else { 0.8 * (1.0 - ((x - 0.5) / 0.5).powf(1.5)) }),
             Self::Highpass => curve(&|x| if x > 0.5 { 0.8 } else { 0.8 * (1.0 - ((0.5 - x) / 0.5).powf(1.5)) }),
             Self::Bandpass => curve(&|x| 0.9 * (-(x - 0.5).powi(2) * 20.0).exp()),
@@ -882,7 +922,8 @@ mod tests {
                 }
             }
             // The LFOs' wave buttons fit beside their faders
-            assert!(faders_height(plan.travel, plan.cell) >= 5.0 * WAVE_ROW, "{size:?}");
+            let waves = Glyph::LFO_WAVES.len() as f32;
+            assert!(faders_height(plan.travel, plan.cell) >= waves * WAVE_ROW_MIN, "{size:?}");
         }
         // A window the size the editor opens at fits the whole panel
         let window = Rect::from_min_size(Pos2::ZERO, egui::vec2(1384.0, 984.0));

@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use crate::synth::effects::{self, EffectSettings};
 use crate::synth::envelopes::AdsrEnvelope;
 use crate::synth::filter::{FilterModel, FilterType};
-use crate::synth::modulation::{ModSource, ModTarget, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
-use crate::synth::oscillator::{multiplier_ratio, Interpolation, OscWave, WavePreview, MULTIPLIER_RANGE, OCTAVE_RANGE};
+use crate::synth::lfo::{Lfo, LfoTrigger, LfoWave, DEFAULT_DIVISION, DIVISIONS};
+use crate::synth::modulation::{ModSource, ModTarget, Polarity, Remap, N_LFOS, N_MOD_ENVELOPES, N_SLOTS};
+use crate::synth::oscillator::{multiplier_ratio, Interpolation, WavePreview, MULTIPLIER_RANGE, OCTAVE_RANGE};
 use crate::synth::oversampling::Oversampling;
 use crate::synth::tuning::{Tuning, KEYS};
 use crate::synth::{ModulationRate, Polyphony, LFO_MAX_HZ, LFO_MIN_HZ};
@@ -38,16 +39,45 @@ pub enum Wave {
     Exponential,
     #[id = "square"]
     Square,
+    #[id = "random"]
+    Random,
+    #[id = "smooth_random"]
+    #[name = "Smooth Random"]
+    SmoothRandom,
 }
 
 impl Wave {
-    pub fn to_osc_wave(self) -> OscWave {
+    pub fn to_lfo_wave(self) -> LfoWave {
         match self {
-            Wave::Sine => OscWave::Sine,
-            Wave::Triangle => OscWave::Tri,
-            Wave::Saw => OscWave::Saw,
-            Wave::Exponential => OscWave::Exp,
-            Wave::Square => OscWave::Square,
+            Wave::Sine => LfoWave::Sine,
+            Wave::Triangle => LfoWave::Triangle,
+            Wave::Saw => LfoWave::Saw,
+            Wave::Exponential => LfoWave::Exponential,
+            Wave::Square => LfoWave::Square,
+            Wave::Random => LfoWave::Random,
+            Wave::SmoothRandom => LfoWave::SmoothRandom,
+        }
+    }
+}
+
+/// How an LFO starts each note, see [`LfoTrigger`].
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LfoTriggerParam {
+    #[id = "retrigger"]
+    Retrigger,
+    #[id = "free"]
+    Free,
+    #[id = "one_shot"]
+    #[name = "One Shot"]
+    OneShot,
+}
+
+impl LfoTriggerParam {
+    pub fn to_trigger(self) -> LfoTrigger {
+        match self {
+            Self::Retrigger => LfoTrigger::Retrigger,
+            Self::Free => LfoTrigger::Free,
+            Self::OneShot => LfoTrigger::OneShot,
         }
     }
 }
@@ -819,14 +849,29 @@ impl EnvelopeParams {
     }
 }
 
-/// A low frequency oscillator, which is a modulation source (see [`ModSlotParams`]).
+/// A low frequency oscillator, which is a modulation source (see [`ModSlotParams`] and
+/// [`crate::synth::lfo`]).
 #[derive(Params)]
 pub struct LfoParams {
     #[id = "lfo_wave"]
     pub wave: EnumParam<Wave>,
-    /// LFO frequency in Hz.
+    /// LFO frequency in Hz, unless it's synced.
     #[id = "lfo_rate"]
     pub rate: FloatParam,
+    /// Whether the rate follows the host's tempo, a cycle taking `division`.
+    #[id = "lfo_sync"]
+    pub sync: BoolParam,
+    /// The note length a synced LFO's cycle takes: an index into [`DIVISIONS`].
+    #[id = "lfo_division"]
+    pub division: IntParam,
+    /// Where in its cycle each note starts it, in degrees.
+    #[id = "lfo_phase"]
+    pub phase: FloatParam,
+    #[id = "lfo_trigger"]
+    pub trigger: EnumParam<LfoTriggerParam>,
+    /// How long it takes to fade in at the start of each note, in seconds.
+    #[id = "lfo_fade"]
+    pub fade: FloatParam,
 }
 
 impl LfoParams {
@@ -846,8 +891,44 @@ impl LfoParams {
             )
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            sync: BoolParam::new("Sync", false),
+            division: IntParam::new(
+                "Division",
+                DEFAULT_DIVISION as i32,
+                IntRange::Linear {
+                    min: 0,
+                    max: DIVISIONS.len() as i32 - 1,
+                },
+            )
+            .with_value_to_string(Arc::new(|index| String::from(division(index).0)))
+            .with_string_to_value(Arc::new(|text| {
+                let text = text.trim();
+                DIVISIONS.iter().position(|(name, _)| name.eq_ignore_ascii_case(text)).map(|index| index as i32)
+            })),
+            phase: FloatParam::new("Phase", 0.0, FloatRange::Linear { min: 0.0, max: 360.0 })
+                .with_unit("°")
+                .with_value_to_string(formatters::v2s_f32_rounded(0)),
+            trigger: EnumParam::new("Trigger", LfoTriggerParam::Retrigger),
+            fade: time_param("Fade In", 0.0, 0.0),
         }
     }
+
+    /// The LFO's settings as `values` has them.
+    pub fn lfo(&self, values: &impl ParamValues) -> Lfo {
+        Lfo {
+            wave: values.get(&self.wave).to_lfo_wave(),
+            freq: values.get(&self.rate),
+            sync: values.get(&self.sync).then(|| division(values.get(&self.division)).1),
+            phase: values.get(&self.phase) / 360.0,
+            trigger: values.get(&self.trigger).to_trigger(),
+            fade: values.get(&self.fade),
+        }
+    }
+}
+
+/// The division at an index of the Division parameter, see [`DIVISIONS`].
+pub fn division(index: i32) -> (&'static str, f32) {
+    DIVISIONS[index.clamp(0, DIVISIONS.len() as i32 - 1) as usize]
 }
 
 impl Default for LfoParams {
@@ -877,8 +958,9 @@ impl Default for ModEnvParams {
     }
 }
 
-/// One route of the modulation matrix: a source, a target, and how much of the source is
-/// applied to the target (see [`crate::synth::modulation`]).
+/// One route of the modulation matrix: a source, a target, how much of the source is applied
+/// to the target, and how the source is reshaped on the way (see
+/// [`crate::synth::modulation`]).
 #[derive(Params)]
 pub struct ModSlotParams {
     #[id = "mod_source"]
@@ -888,6 +970,18 @@ pub struct ModSlotParams {
     /// From -100% to 100%, with finer control around zero.
     #[id = "mod_amount"]
     pub amount: FloatParam,
+    /// Whether the route swings as its source does, from 0 to 1, or from -1 to 1.
+    #[id = "mod_polarity"]
+    pub polarity: EnumParam<Polarity>,
+    /// From -100% to 100%: how far the source is bent, see [`Remap::curve`].
+    #[id = "mod_curve"]
+    pub curve: FloatParam,
+    /// How many levels the source is stepped to, 1 for none.
+    #[id = "mod_steps"]
+    pub steps: IntParam,
+    /// Another source that scales the route, from 0 to 1.
+    #[id = "mod_via"]
+    pub via: EnumParam<ModSource>,
 }
 
 impl ModSlotParams {
@@ -908,6 +1002,38 @@ impl ModSlotParams {
             .with_unit(" %")
             .with_value_to_string(v2s_signed_percentage())
             .with_string_to_value(formatters::s2v_f32_percentage()),
+            polarity: EnumParam::new("Polarity", Polarity::Source),
+            curve: FloatParam::new("Curve", 0.0, FloatRange::Linear { min: -1.0, max: 1.0 })
+                .with_unit(" %")
+                .with_value_to_string(v2s_signed_percentage())
+                .with_string_to_value(formatters::s2v_f32_percentage()),
+            steps: IntParam::new("Steps", 1, IntRange::Linear { min: 1, max: 32 })
+                .with_value_to_string(Arc::new(|steps| {
+                    if steps <= 1 {
+                        String::from("Off")
+                    } else {
+                        steps.to_string()
+                    }
+                }))
+                .with_string_to_value(Arc::new(|text| {
+                    let text = text.trim();
+                    if text.eq_ignore_ascii_case("off") {
+                        Some(1)
+                    } else {
+                        text.parse().ok()
+                    }
+                })),
+            via: EnumParam::new("Scale By", ModSource::None),
+        }
+    }
+
+    /// How the route reshapes its source, as `values` has it.
+    pub fn remap(&self, values: &impl ParamValues) -> Remap {
+        Remap {
+            polarity: values.get(&self.polarity),
+            curve: values.get(&self.curve),
+            steps: values.get(&self.steps).max(1) as u32,
+            via: values.get(&self.via),
         }
     }
 }

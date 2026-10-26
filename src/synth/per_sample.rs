@@ -14,6 +14,7 @@ use wide::{f32x8, i32x8};
 
 use super::envelopes::AdsrEnvelope;
 use super::fastmath::{self, x8};
+use super::lfo::LfoTrigger;
 use super::filter::{Filter, FilterContainer, FilterModel, SvfSimper};
 use super::modulation::{ModSource, ModTarget, Route, Sources, N_LFOS, N_SLOTS, N_SOURCES, N_TARGETS};
 use super::oscillator::{frame_indices, OscillatorParams, WavetableNotes, MULTIPLIER_RANGE, OCTAVE_RANGE};
@@ -123,11 +124,7 @@ impl RoutesByTarget {
             *range = (start, start);
             start += count;
         }
-        let none = Route {
-            source: ModSource::None,
-            target: ModTarget::None,
-            amount: 0.0,
-        };
+        let none = Route::new(ModSource::None, ModTarget::None, 0.0);
         let mut sorted = [none; N_SLOTS];
         for route in routes {
             let range = &mut ranges[route.target.to_index()];
@@ -234,7 +231,11 @@ impl Modulated<'_> {
     fn at(&self, v: usize) -> f32x8 {
         let mut sum = f32x8::ZERO;
         for route in self.routes {
-            sum += self.sources[route.source.to_index()][v] * f32x8::splat(route.amount);
+            let mut value = self.sources[route.source.to_index()][v];
+            if !route.is_plain() {
+                value = route.reshape8(value, self.sources[route.remap.via.to_index()][v]);
+            }
+            sum += value * f32x8::splat(route.amount);
         }
         sum
     }
@@ -361,7 +362,7 @@ impl Voice {
             (!routes.is_empty()).then(|| Modulated {
                 routes,
                 sources,
-                varies: routes.iter().any(|route| !constant[route.source.to_index()]),
+                varies: routes.iter().any(|route| route.sources().any(|source| !constant[source.to_index()])),
             })
         };
 
@@ -848,56 +849,72 @@ impl Voice {
         }
 
         if context.routes_by_target.modulate_lfo_rates() {
-            self.update_lfos_one_by_one(context, block_len);
+            self.update_lfos_one_by_one(context, block_start, block_len);
             return;
         }
         // The LFOs keep running whether they are used or not, so they don't jump when routed.
         // Without their rates modulated, each sample's phase follows from the block's first.
         let offsets = f32x8::from_i32x8(lane_indices());
         for (i, lfo) in context.lfos.iter().enumerate() {
-            let delta = lfo.freq / sample_rate;
+            let delta = context.lfo_rates[i] / sample_rate;
+            let one_shot = lfo.trigger == LfoTrigger::OneShot;
             if used(ModSource::lfo(i)) {
-                let first = splat(self.lfos[i].phase as f32);
+                let copy = self.lfos[i];
+                let first = splat(copy.phase as f32);
                 for (v, values) in sources[ModSource::lfo(i).to_index()].iter_mut().enumerate().take(vectors) {
-                    let phase = first + (offsets + splat(8.0 * v as f32)) * splat(delta);
-                    *values = lfo.wave.generate8(phase - phase.fast_trunc_int().round_float());
+                    let offset = (offsets + splat(8.0 * v as f32)) * splat(delta);
+                    let wave = if lfo.wave.is_random() {
+                        // (Each sample's cycle has its own value)
+                        let offset = offset.to_array();
+                        f32x8::new(std::array::from_fn(|lane| copy.value_at(lfo.wave, offset[lane], one_shot)))
+                    } else {
+                        let phase = first + offset;
+                        let phase = if one_shot {
+                            phase.fast_min(splat(1.0))
+                        } else {
+                            phase - phase.fast_trunc_int().round_float()
+                        };
+                        lfo.wave.value8(phase)
+                    };
+                    *values = if lfo.fade > 0.0 { wave * lfo.fade_gain8(times(v)) } else { wave };
                 }
             }
-            self.lfos[i].add_phase(delta * block_len as f32);
+            self.lfos[i].advance(delta * block_len as f32, one_shot);
         }
     }
 
     /// The LFOs one sample at a time, when routes modulate their rates: each sample's rate
     /// depends on the sources at the sample before, the LFOs among them. Like the control rate
     /// update, a sample's LFO values come from the phases reached by the sample before.
-    fn update_lfos_one_by_one(&mut self, context: &VoiceContext, block_len: usize) {
+    fn update_lfos_one_by_one(&mut self, context: &VoiceContext, block_start: u32, block_len: usize) {
         let routes = &context.routes_by_target;
         let sources = &mut self.samples.sources;
         // Each sample's LFO values
         let mut values = [[0.0_f32; N_LFOS]; CONTROL_BLOCK_SAMPLES];
         let mut rates = [0.0_f32; N_LFOS];
         for (n, values) in values.iter_mut().enumerate().take(block_len) {
+            let time = (block_start + n as u32) as f32 / context.sample_rate;
             for (i, lfo) in context.lfos.iter().enumerate() {
-                values[i] = lfo.wave.generate(self.lfos[i].phase as f32);
+                values[i] = self.lfos[i].value(lfo.wave) * lfo.fade_gain(time);
             }
             // The rates' modulation at this sample, which moves the phases on to the next
+            let lfo_values = *values;
+            let value = |source: ModSource| match (0..N_LFOS).find(|&lfo| ModSource::lfo(lfo) == source) {
+                Some(lfo) => lfo_values[lfo],
+                None => sample(&sources[source.to_index()], n),
+            };
             for (i, rate) in rates.iter_mut().enumerate() {
                 *rate = 0.0;
                 for route in routes.get(ModTarget::lfo_rate(i)) {
-                    let source = route.source.to_index();
-                    let value = match (0..N_LFOS).find(|&lfo| ModSource::lfo(lfo).to_index() == source) {
-                        Some(lfo) => values[lfo],
-                        None => sample(&sources[source], n),
-                    };
-                    *rate += value * route.amount;
+                    *rate += route.reshape(value(route.source), value(route.remap.via)) * route.amount;
                 }
             }
             for (i, lfo) in context.lfos.iter().enumerate() {
-                let mut freq = lfo.freq;
+                let mut freq = context.lfo_rates[i];
                 if rates[i] != 0.0 {
                     freq = (freq * fastmath::exp2(rates[i] * ModTarget::LFO_RATE_OCTAVES)).clamp(LFO_MIN_HZ, LFO_MAX_HZ);
                 }
-                self.lfos[i].add_phase(freq / context.sample_rate);
+                self.lfos[i].advance(freq / context.sample_rate, lfo.trigger == LfoTrigger::OneShot);
             }
         }
         for (i, rate) in rates.iter().enumerate() {

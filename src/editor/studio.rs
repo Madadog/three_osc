@@ -21,7 +21,7 @@ use super::catalog::{self, Colors};
 use super::knob::{self, Controls};
 use super::widgets::{self, in_rect, ChipStyle};
 use super::{
-    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, theme_picker, title_bar,
+    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, lfo_display, theme_picker, title_bar,
     tuning_window, wavetable_file_combo, wavetable_file_status, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
 };
 use crate::params::{EnvelopeParams, FxParams, GlobalParams, LfoParams, OscillatorWave, ThreeOscParams};
@@ -224,7 +224,8 @@ impl Areas {
         let page = card_height(DISPLAY_MIN + FILE_ROWS + INNER_GAP + 3.0 * KNOBS.height(osc_cell) + 2.0 * ROW_GAP);
         let envelope_cell = cell_width(Self::envelope_width(width), ENVELOPE_CELLS);
         let envelopes = card_height(DISPLAY_MIN + INNER_GAP + KNOBS.height(envelope_cell));
-        let lfos = card_height(KNOBS.height(LFO_CELL).max(OUTPUT_MIN));
+        let lfo_cell = cell_width(Self::lfo_width(width), LFO_CELLS);
+        let lfos = card_height((DISPLAY_MIN + INNER_GAP + KNOBS.height(lfo_cell)).max(OUTPUT_MIN));
         [page, envelopes, lfos]
     }
 
@@ -254,11 +255,12 @@ impl Areas {
     }
 }
 
-/// How many knobs wide an oscillator's rows are, and the envelopes'.
+/// How many knobs wide an oscillator's rows are, the envelopes' and the LFOs'.
 const OSC_CELLS: usize = 5;
 const ENVELOPE_CELLS: usize = 5;
-/// The width of an LFO's rate knob, and the output's knobs.
-const LFO_CELL: f32 = 72.0;
+const LFO_CELLS: usize = 5;
+/// The width of the output's knobs.
+const OUTPUT_CELL: f32 = 72.0;
 
 /// The width of each of `cells` knobs across a card `width` wide.
 fn cell_width(width: f32, cells: usize) -> f32 {
@@ -593,8 +595,11 @@ fn lfos(ui: &mut Ui, rect: Rect, params: &ThreeOscParams, controls: &Controls, g
     output_card(ui, output, &params.global, controls, gui);
 }
 
+/// An LFO: its wave, its display, its rate (or note length), phase and fade-in, and its sync
+/// and trigger beside them.
 fn lfo_card(ui: &mut Ui, rect: Rect, index: usize, lfo: &LfoParams, controls: &Controls, live: Live) {
     let card = card(ui, rect, MOD_COLOR);
+    let setter = controls.setter;
     title_row(
         ui,
         ("lfo title", index),
@@ -602,21 +607,30 @@ fn lfo_card(ui: &mut Ui, rect: Rect, index: usize, lfo: &LfoParams, controls: &C
         |ui| {
             widgets::chip(ui, ModSource::lfo(index), &format!("LFO {}", index + 1), controls, &chips());
         },
-        |ui| combo_cell(ui, &lfo.wave, index, COMBO_WIDTH, help::LFO_WAVE, controls.setter),
+        |ui| combo_cell(ui, &lfo.wave, index, COMBO_WIDTH, help::LFO_WAVE, setter),
     );
     let body = card.body;
-    let knob_rect = Rect::from_min_size(
-        Pos2::new(body.left(), body.center().y - KNOBS.height(LFO_CELL) / 2.0),
-        egui::vec2(LFO_CELL, KNOBS.height(LFO_CELL)),
-    );
-    knob_row(ui, ("lfo knob", index), knob_rect, |ui| {
-        catalog::lfo_rate(lfo, index).show(ui, LFO_CELL, controls);
+    let cell = cell_width(rect.width(), LFO_CELLS);
+    let knob_height = KNOBS.height(cell);
+    let display_height = (body.height() - knob_height - INNER_GAP).max(DISPLAY_MIN);
+    in_rect(ui, ("lfo display", index), body, Layout::top_down(Align::Min), |ui| {
+        lfo_display(ui, lfo, index, live, display_height);
     });
-    let display = Rect::from_min_max(Pos2::new(knob_rect.right() + INNER_GAP, body.top()), body.max);
-    let wave = lfo.wave.value().to_osc_wave();
-    let phase = live.monitor.lfo_phase(index);
-    in_rect(ui, ("lfo display", index), display, Layout::top_down(Align::Min), |ui| {
-        displays::lfo(ui, &wave, MOD_COLOR, phase, display.height());
+    let row = row_rect(body, body.bottom() - knob_height, knob_height);
+    let knobs = Rect::from_min_size(row.min, egui::vec2(3.0 * cell, row.height()));
+    knob_row(ui, ("lfo knobs", index), knobs, |ui| {
+        for knob in catalog::lfo(lfo, index) {
+            knob.show(ui, cell, controls);
+        }
+    });
+    let choices = Rect::from_min_max(Pos2::new(knobs.right() + INNER_GAP, row.top() + 4.0), row.max);
+    in_rect(ui, ("lfo choices", index), choices, Layout::top_down(Align::Min), |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.horizontal(|ui| {
+            widgets::switch(ui, &lfo.sync, help::LFO_SYNC, setter, MOD_COLOR);
+            ui.label(RichText::new("Sync").color(TEXT)).on_hover_text(help::LFO_SYNC);
+        });
+        combo_cell(ui, &lfo.trigger, index, choices.width() - 14.0, help::LFO_TRIGGER, setter);
     });
 }
 
@@ -635,12 +649,12 @@ fn output_card(ui: &mut Ui, rect: Rect, global: &GlobalParams, controls: &Contro
     );
     let body = card.body;
     let knobs = Rect::from_min_max(
-        Pos2::new(body.right() - 2.0 * LFO_CELL, body.center().y - KNOBS.height(LFO_CELL) / 2.0),
-        Pos2::new(body.right(), body.center().y + KNOBS.height(LFO_CELL) / 2.0),
+        Pos2::new(body.right() - 2.0 * OUTPUT_CELL, body.center().y - KNOBS.height(OUTPUT_CELL) / 2.0),
+        Pos2::new(body.right(), body.center().y + KNOBS.height(OUTPUT_CELL) / 2.0),
     );
     knob_row(ui, "output knobs", knobs, |ui| {
         for knob in catalog::output(global) {
-            knob.show(ui, LFO_CELL, controls);
+            knob.show(ui, OUTPUT_CELL, controls);
         }
     });
     let analyser_rect = Rect::from_min_max(body.min, Pos2::new(knobs.left() - INNER_GAP, body.bottom()));
@@ -826,10 +840,16 @@ fn matrix_page(ui: &mut Ui, rect: Rect, controls: &Controls, gui: &mut Gui) {
                  envelopes', the LFOs' and those along the bottom) onto a knob. Its knob then \
                  shows an orange arc for how far its routes can move it, and a light dot for \
                  where the newest note's modulation has it.",
-                "Right-click a knob to change its routes' amounts, remove them or add another. \
-                 Hovering a source's handle lights up the knobs it modulates.",
+                "Hover a modulated knob to see its routes' amounts as small sliders above it, \
+                 and drag them. Right-click a knob to change its routes, remove them or add \
+                 another. Hovering a source's handle lights up the knobs it modulates.",
                 "The LFOs, Key Track, Random and the oscillators swing both ways, from -1 to 1; \
-                 the other sources go from 0 to 1.",
+                 the other sources go from 0 to 1. A route's ± (or +) button makes it swing \
+                 the other way, and the picture next to it opens the route's shape: a curve to \
+                 bend the source, steps to quantise it, and another source to scale it by (the \
+                 mod wheel, say, for how deep an LFO goes).",
+                "An LFO can follow the host's tempo (Sync), start each note at a phase, run \
+                 freely across notes or just once (its trigger), and fade in.",
             ] {
                 ui.label(RichText::new(paragraph).color(TEXT));
                 ui.add_space(4.0);

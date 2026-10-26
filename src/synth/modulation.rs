@@ -9,9 +9,15 @@
 //! delay time) by a number of octaves, see [`ModTarget::scaling()`].
 //! A target's modulation is the sum of its routes, and the result is clamped to the control's
 //! range.
+//!
+//! On its way to the amount, a route can reshape its source (see [`Remap`]): swing it from 0 to
+//! 1 or from -1 to 1 whatever the source's own range, bend it, step it, and scale it by another
+//! source.
 
 use nih_plug::prelude::Enum;
+use wide::f32x8;
 
+use super::fastmath;
 use super::oscillator::{MULTIPLIER_RANGE, OCTAVE_RANGE};
 
 /// Something that can drive a modulation route. The LFOs, the key, the random source and the
@@ -437,6 +443,70 @@ impl ModTarget {
     }
 }
 
+/// How a route swings: as its source does, or from 0 to 1 or from -1 to 1 whatever the source.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Polarity {
+    /// From -1 to 1 for the bipolar sources (see [`ModSource::is_bipolar()`]), and from 0 to 1
+    /// for the others.
+    #[id = "source"]
+    #[name = "As Source"]
+    #[default]
+    Source,
+    #[id = "unipolar"]
+    Unipolar,
+    #[id = "bipolar"]
+    Bipolar,
+}
+
+impl Polarity {
+    /// Whether a route from `source` swings from -1 to 1.
+    pub fn is_bipolar(self, source: ModSource) -> bool {
+        match self {
+            Self::Source => source.is_bipolar(),
+            Self::Unipolar => false,
+            Self::Bipolar => true,
+        }
+    }
+}
+
+/// How a route reshapes its source on the way to the amount. The source's position in its range
+/// (from 0 to 1) is bent by the curve, then stepped, then swung over the route's polarity, then
+/// scaled by the other source (from 0 to 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Remap {
+    pub polarity: Polarity,
+    /// From -1 to 1: 0 leaves the source straight, more than 0 keeps it low for longer (raising
+    /// its position to a power of up to [`Remap::MAX_EXPONENT`]), less than 0 high.
+    pub curve: f32,
+    /// How many levels the source is stepped to, or 1 (or 0) to leave it smooth.
+    pub steps: u32,
+    /// A source that scales the route, from 0 at its bottom to 1 at its top (a bipolar one over
+    /// its whole swing, from -1), or [`ModSource::None`].
+    pub via: ModSource,
+}
+
+impl Default for Remap {
+    fn default() -> Self {
+        Self {
+            polarity: Polarity::Source,
+            curve: 0.0,
+            steps: 1,
+            via: ModSource::None,
+        }
+    }
+}
+
+impl Remap {
+    /// The power a full curve raises the source's position to (and the root a full negative
+    /// curve takes).
+    pub const MAX_EXPONENT: f32 = 4.0;
+
+    /// The power the curve raises the source's position to.
+    pub fn exponent(&self) -> f32 {
+        Self::MAX_EXPONENT.powf(self.curve)
+    }
+}
+
 /// An active modulation route.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Route {
@@ -444,6 +514,122 @@ pub struct Route {
     pub target: ModTarget,
     /// From -1 to 1.
     pub amount: f32,
+    pub remap: Remap,
+    /// Whether the source goes to the amount as it comes, which spares the reshaping.
+    plain: bool,
+    /// Whether the route swings from -1 to 1.
+    bipolar: bool,
+    /// [`Remap::exponent()`].
+    exponent: f32,
+}
+
+impl Route {
+    /// A route that applies its source as it comes.
+    pub fn new(source: ModSource, target: ModTarget, amount: f32) -> Self {
+        Self::remapped(source, target, amount, Remap::default())
+    }
+
+    /// A route that reshapes its source as `remap` says.
+    pub fn remapped(source: ModSource, target: ModTarget, amount: f32, remap: Remap) -> Self {
+        let bipolar = remap.polarity.is_bipolar(source);
+        Self {
+            source,
+            target,
+            amount,
+            remap,
+            plain: bipolar == source.is_bipolar() && remap.curve == 0.0 && remap.steps <= 1 && remap.via == ModSource::None,
+            bipolar,
+            exponent: remap.exponent(),
+        }
+    }
+
+    /// Whether the route applies its source as it comes.
+    pub fn is_plain(&self) -> bool {
+        self.plain
+    }
+
+    /// The route's contribution to its target, given the sources' values.
+    #[inline]
+    pub fn apply(&self, sources: &Sources) -> f32 {
+        let value = sources[self.source.to_index()];
+        if self.plain {
+            return value * self.amount;
+        }
+        self.reshape(value, sources[self.remap.via.to_index()]) * self.amount
+    }
+
+    /// A value of the source reshaped as the route's [`Remap`] says, with the scaling source at
+    /// `via`, before the amount.
+    pub fn reshape(&self, value: f32, via: f32) -> f32 {
+        if self.plain {
+            return value;
+        }
+        let remap = &self.remap;
+        let mut position = if self.source.is_bipolar() { (value + 1.0) * 0.5 } else { value };
+        if remap.curve != 0.0 || remap.steps > 1 {
+            position = position.clamp(0.0, 1.0);
+        }
+        if remap.curve != 0.0 {
+            position = fastmath::pow(position, self.exponent);
+        }
+        if remap.steps > 1 {
+            let steps = remap.steps as f32;
+            position = (position * steps).floor().min(steps - 1.0) / (steps - 1.0);
+        }
+        let mut shaped = if self.bipolar { position * 2.0 - 1.0 } else { position };
+        if remap.via != ModSource::None {
+            shaped *= scale(remap.via, via);
+        }
+        shaped
+    }
+
+    /// [`reshape()`][Self::reshape()] of eight values at once, with exactly the same results.
+    pub fn reshape8(&self, value: f32x8, via: f32x8) -> f32x8 {
+        if self.plain {
+            return value;
+        }
+        let splat = f32x8::splat;
+        let remap = &self.remap;
+        let mut position = if self.source.is_bipolar() { (value + splat(1.0)) * splat(0.5) } else { value };
+        if remap.curve != 0.0 || remap.steps > 1 {
+            position = position.fast_max(f32x8::ZERO).fast_min(splat(1.0));
+        }
+        if remap.curve != 0.0 {
+            position = fastmath::x8::pow(position, splat(self.exponent));
+        }
+        if remap.steps > 1 {
+            let steps = splat(remap.steps as f32);
+            position = (position * steps).floor().fast_min(steps - splat(1.0)) / (steps - splat(1.0));
+        }
+        let mut shaped = if self.bipolar { position * splat(2.0) - splat(1.0) } else { position };
+        if remap.via != ModSource::None {
+            shaped *= scale8(remap.via, via);
+        }
+        shaped
+    }
+
+    /// The sources the route reads: its own, and the one that scales it.
+    pub fn sources(&self) -> impl Iterator<Item = ModSource> {
+        [self.source, self.remap.via].into_iter().filter(|source| *source != ModSource::None)
+    }
+}
+
+/// A scaling source's value as a scale from 0 to 1: a bipolar source's whole swing, from -1.
+fn scale(source: ModSource, value: f32) -> f32 {
+    if source.is_bipolar() {
+        (value + 1.0) * 0.5
+    } else {
+        value
+    }
+}
+
+/// [`scale()`] of eight values.
+fn scale8(source: ModSource, value: f32x8) -> f32x8 {
+    if source.is_bipolar() {
+        (value + f32x8::splat(1.0)) * f32x8::splat(0.5)
+    } else {
+        value
+    }
 }
 
 /// The value of every source for one voice at one point in time.
@@ -455,7 +641,7 @@ pub type Targets = [f32; N_TARGETS];
 pub fn apply_routes(routes: &[Route], sources: &Sources) -> Targets {
     let mut targets = [0.0; N_TARGETS];
     for route in routes {
-        targets[route.target.to_index()] += sources[route.source.to_index()] * route.amount;
+        targets[route.target.to_index()] += route.apply(sources);
     }
     targets
 }
@@ -499,13 +685,69 @@ mod tests {
         sources[ModSource::Lfo1.to_index()] = 0.5;
         sources[ModSource::Velocity.to_index()] = 1.0;
         let routes = [
-            Route { source: ModSource::Lfo1, target: ModTarget::Cutoff, amount: 0.5 },
-            Route { source: ModSource::Velocity, target: ModTarget::Cutoff, amount: -0.1 },
-            Route { source: ModSource::Velocity, target: ModTarget::Osc2Amp, amount: 1.0 },
+            Route::new(ModSource::Lfo1, ModTarget::Cutoff, 0.5),
+            Route::new(ModSource::Velocity, ModTarget::Cutoff, -0.1),
+            Route::new(ModSource::Velocity, ModTarget::Osc2Amp, 1.0),
         ];
         let targets = apply_routes(&routes, &sources);
         assert!((targets[ModTarget::Cutoff.to_index()] - 0.15).abs() < 1e-6);
         assert_eq!(targets[ModTarget::Osc2Amp.to_index()], 1.0);
         assert_eq!(targets[ModTarget::Osc1Amp.to_index()], 0.0);
+    }
+
+    /// A route reshapes its source as its remap says, and leaves it alone by default.
+    #[test]
+    fn routes_reshape_their_sources() {
+        let route = |source, remap| Route::remapped(source, ModTarget::Cutoff, 1.0, remap);
+        let plain = Remap::default();
+        // By default the source goes through as it is
+        for source in [ModSource::Lfo1, ModSource::Env1] {
+            assert!(route(source, plain).is_plain());
+            for value in [-1.0, -0.3, 0.0, 0.42, 1.0] {
+                assert_eq!(route(source, plain).reshape(value, 0.0), value);
+            }
+        }
+        // An LFO made unipolar swings from 0 to 1, and an envelope made bipolar from -1 to 1
+        let unipolar = route(ModSource::Lfo1, Remap { polarity: Polarity::Unipolar, ..plain });
+        assert!(!unipolar.is_plain());
+        assert_eq!([-1.0, 0.0, 1.0].map(|value| unipolar.reshape(value, 0.0)), [0.0, 0.5, 1.0]);
+        let bipolar = route(ModSource::Env1, Remap { polarity: Polarity::Bipolar, ..plain });
+        assert_eq!([0.0, 0.5, 1.0].map(|value| bipolar.reshape(value, 0.0)), [-1.0, 0.0, 1.0]);
+        // (and choosing the source's own polarity changes nothing)
+        assert!(route(ModSource::Lfo1, Remap { polarity: Polarity::Bipolar, ..plain }).is_plain());
+        // A curve bends the range between its ends: up keeps it low for longer
+        let curved = route(ModSource::Env1, Remap { curve: 0.5, ..plain });
+        assert_eq!(curved.reshape(0.0, 0.0), 0.0);
+        assert!((curved.reshape(1.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((curved.reshape(0.5, 0.0) - 0.25).abs() < 1e-5);
+        let bent_down = route(ModSource::Env1, Remap { curve: -1.0, ..plain });
+        assert!((bent_down.reshape(0.0625, 0.0) - 0.5).abs() < 1e-5);
+        // Steps quantise it into levels from the bottom to the top of its range
+        let stepped = route(ModSource::Lfo1, Remap { steps: 3, ..plain });
+        assert_eq!([-1.0, -0.4, 0.1, 0.5, 1.0].map(|value| stepped.reshape(value, 0.0)), [-1.0, -1.0, 0.0, 1.0, 1.0]);
+        // Another source scales it from 0 to 1, a bipolar one from its middle
+        let scaled = route(ModSource::Lfo1, Remap { via: ModSource::ModWheel, ..plain });
+        assert_eq!(scaled.reshape(-0.8, 0.25), -0.2);
+        let by_lfo = route(ModSource::Env1, Remap { via: ModSource::Lfo2, ..plain });
+        assert_eq!(by_lfo.reshape(0.8, 0.0), 0.4);
+        assert_eq!(by_lfo.sources().collect::<Vec<_>>(), [ModSource::Env1, ModSource::Lfo2]);
+        // All of it together, eight values at a time, the same as one at a time
+        let everything = route(
+            ModSource::Lfo1,
+            Remap { polarity: Polarity::Unipolar, curve: -0.3, steps: 5, via: ModSource::Key },
+        );
+        let values = [-1.0, -0.6, -0.2, 0.0, 0.3, 0.55, 0.9, 1.0];
+        let vias = [0.2, -1.0, 1.0, 0.5, -0.5, 0.0, 0.7, 1.0];
+        let vector = everything.reshape8(f32x8::new(values), f32x8::new(vias)).to_array();
+        for ((value, via), reshaped) in values.into_iter().zip(vias).zip(vector) {
+            assert_eq!(reshaped.to_bits(), everything.reshape(value, via).to_bits(), "{value}, {via}");
+        }
+        // The amount applies on top
+        let mut sources = [0.0; N_SOURCES];
+        sources[ModSource::Lfo1.to_index()] = -1.0;
+        let half = Route::remapped(ModSource::Lfo1, ModTarget::Cutoff, 0.5, Remap { polarity: Polarity::Unipolar, ..plain });
+        assert_eq!(half.apply(&sources), 0.0);
+        sources[ModSource::Lfo1.to_index()] = 1.0;
+        assert_eq!(half.apply(&sources), 0.5);
     }
 }

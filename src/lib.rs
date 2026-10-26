@@ -228,19 +228,19 @@ impl ThreeOscPlugin {
         // Modulation: LFOs, envelopes and the matrix. The routes vector has room for every
         // slot, so this doesn't allocate.
         for (lfo, lfo_params) in synth.lfos.iter_mut().zip(params.lfos.iter()) {
-            lfo.wave = values.get(&lfo_params.wave).to_osc_wave();
-            lfo.freq = values.get(&lfo_params.rate);
+            *lfo = lfo_params.lfo(values);
         }
         for (envelope, env_params) in synth.mod_envelopes.iter_mut().zip(params.mod_envs.iter()) {
             apply_envelope_values(envelope, &env_params.envelope, values);
         }
         synth.routes.clear();
         for slot in params.mod_slots.iter() {
-            let route = Route {
-                source: values.get(&slot.source),
-                target: values.get(&slot.target),
-                amount: values.get(&slot.amount),
-            };
+            let route = Route::remapped(
+                values.get(&slot.source),
+                values.get(&slot.target),
+                values.get(&slot.amount),
+                slot.remap(values),
+            );
             if route.source != ModSource::None && route.target != ModTarget::None && route.amount != 0.0 {
                 synth.routes.push(route);
             }
@@ -518,6 +518,9 @@ impl Plugin for ThreeOscPlugin {
     ) -> ProcessStatus {
         self.apply_params();
         self.update_wavetable_files(|task| context.execute_background(task));
+        let transport = context.transport();
+        let position = transport.playing.then(|| transport.pos_beats()).flatten();
+        self.synth.set_transport(transport.tempo, position);
 
         let (out_l, out_r) = match buffer.as_slice() {
             [out_l, out_r, ..] => (out_l, out_r),
@@ -746,11 +749,7 @@ mod tests {
     #[test]
     fn modulation_routes_change_the_sound() {
         let mut plugin = ThreeOscPlugin::default();
-        let route = |source, target, amount| Route {
-            source,
-            target,
-            amount,
-        };
+        let route = |source, target, amount| Route::new(source, target, amount);
         let reference = render_with_routes(&mut plugin, &[], 60);
 
         // A route to nothing, from nothing, or to a silent oscillator's position leaves the
@@ -802,17 +801,9 @@ mod tests {
     fn modulation_can_switch_oscillators_on() {
         let mut plugin = ThreeOscPlugin::default();
         let reference = render_with_routes(&mut plugin, &[], 60);
-        let amp = Route {
-            source: ModSource::Velocity,
-            target: ModTarget::Osc2Amp,
-            amount: 1.0,
-        };
+        let amp = Route::new(ModSource::Velocity, ModTarget::Osc2Amp, 1.0);
         assert!(max_abs_diff(&render_with_routes(&mut plugin, &[amp], 60), &reference) > 1e-3);
-        let pm = Route {
-            source: ModSource::Env1,
-            target: ModTarget::Osc1Pm,
-            amount: 0.3,
-        };
+        let pm = Route::new(ModSource::Env1, ModTarget::Osc1Pm, 0.3);
         assert!(max_abs_diff(&render_with_routes(&mut plugin, &[pm], 60), &reference) > 1e-3);
     }
 
@@ -1319,7 +1310,7 @@ mod tests {
                 set_up(&mut plugin, &patch, "off");
                 plugin.synth.modulation_rate = rate;
                 plugin.synth.mod_wheel = 1.0;
-                plugin.synth.routes.push(Route { source: ModSource::ModWheel, target, amount });
+                plugin.synth.routes.push(Route::new(ModSource::ModWheel, target, amount));
                 let (left, _) = render_note(&mut plugin, 60, 0.5, 0.5);
                 let measured = frequency(&left, plugin.synth.sample_rate as f32);
                 assert!((measured / (c4 * ratio) - 1.0).abs() < 0.002, "{rate:?}, {target:?} by {amount}: {measured} Hz");
@@ -1361,7 +1352,7 @@ mod tests {
         for (rate_mode, tolerance) in [(synth::ModulationRate::Sample, 0.02), (synth::ModulationRate::Block, 0.3)] {
             set_up(&mut plugin, &patch, "off");
             plugin.synth.modulation_rate = rate_mode;
-            plugin.synth.routes.push(Route { source: ModSource::Osc2, target: ModTarget::Volume, amount: 0.5 });
+            plugin.synth.routes.push(Route::new(ModSource::Osc2, ModTarget::Volume, 0.5));
             let (left, _) = render_note(&mut plugin, 60, 1.0, 1.0);
             assert!(left.iter().all(|sample| sample.is_finite()));
             let carrier = level(&left, c4, rate);
@@ -1549,11 +1540,7 @@ mod tests {
     /// amplitude, a slower LFO on the cutoff, a short attack and a pitch slide, and optionally
     /// an LFO modulating another's rate.
     fn fast_modulation(plugin: &mut ThreeOscPlugin, model: synth::filter::FilterModel, lfo_rate: bool) {
-        let route = |source, target, amount| Route {
-            source,
-            target,
-            amount,
-        };
+        let route = |source, target, amount| Route::new(source, target, amount);
         let synth = &mut plugin.synth;
         synth.routes.extend_from_slice(&[
             route(ModSource::Lfo1, ModTarget::Pitch, 0.1),
@@ -1587,6 +1574,8 @@ mod tests {
         plugin.apply_params();
         plugin.synth.modulation_rate = rate;
         plugin.synth.routes.clear();
+        // (The same random values for every render)
+        plugin.synth.seed_random(1);
         for osc in plugin.synth.oscillators.iter_mut() {
             osc.phase_rand = 0.0;
         }
@@ -1639,6 +1628,59 @@ mod tests {
         }
     }
 
+    /// The LFOs' options (a start phase, a fade-in, a synced random wave, a one shot) and remapped
+    /// routes (polarities, curves and a scaling source) give the same modulation at the sample
+    /// rate as at the control rate run one sample at a time, with and without an LFO modulating
+    /// another's rate.
+    #[test]
+    fn lfo_options_and_remapped_routes_match_at_both_rates() {
+        use synth::filter::FilterModel;
+        use synth::lfo::{Lfo, LfoTrigger, LfoWave};
+        use synth::modulation::{Polarity, Remap};
+        use synth::ModulationRate;
+
+        let mut plugin = ThreeOscPlugin::default();
+        for lfo_rate in [false, true] {
+            let setup = |plugin: &mut ThreeOscPlugin| {
+                let synth = &mut plugin.synth;
+                synth.tempo = 140.0;
+                synth.mod_wheel = 0.6;
+                synth.lfos[0] = Lfo { freq: 300.0, phase: 0.3, fade: 0.02, ..Lfo::default() };
+                synth.lfos[1] = Lfo { wave: LfoWave::SmoothRandom, sync: Some(0.25), ..Lfo::default() };
+                synth.lfos[2] = Lfo {
+                    wave: LfoWave::Saw,
+                    freq: 40.0,
+                    phase: 0.1,
+                    trigger: LfoTrigger::OneShot,
+                    ..Lfo::default()
+                };
+                let remap = |polarity, curve, via| Remap { polarity, curve, via, ..Remap::default() };
+                synth.routes.extend_from_slice(&[
+                    Route::remapped(ModSource::Lfo1, ModTarget::Pitch, 0.1, remap(Polarity::Unipolar, 0.4, ModSource::None)),
+                    Route::remapped(ModSource::Lfo2, ModTarget::Volume, -0.5, remap(Polarity::Source, -0.6, ModSource::ModWheel)),
+                    Route::remapped(ModSource::Lfo3, ModTarget::Cutoff, -0.4, remap(Polarity::Unipolar, 0.0, ModSource::None)),
+                    Route::remapped(ModSource::Env1, ModTarget::Osc1Amp, -0.4, remap(Polarity::Bipolar, 0.3, ModSource::None)),
+                ]);
+                if lfo_rate {
+                    let route = Route::remapped(ModSource::Lfo3, ModTarget::Lfo1Rate, 0.3, remap(Polarity::Source, 0.5, ModSource::None));
+                    synth.routes.push(route);
+                }
+                synth.mod_envelopes[0].decay_time = 0.01;
+                synth.filter_controller.filter_model = FilterModel::SvfSimperFilter;
+                synth.filter_controller.target_cutoff = 3000.0;
+                synth.oscillators[0].wavetable = 0;
+            };
+            let case = format!("LFO rate modulated: {lfo_rate}");
+            let sample_rate = render_buffers(&mut plugin, ModulationRate::Sample, 4096, setup);
+            let one_at_a_time = render_buffers(&mut plugin, ModulationRate::Block, 1, setup);
+            let unmodulated = render_buffers(&mut plugin, ModulationRate::Sample, 4096, |_| {});
+            let peak = one_at_a_time.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            assert!(peak > 0.05, "{case}: {peak}");
+            assert!(max_abs_diff(&sample_rate, &one_at_a_time) < 5e-3 * peak, "{case}");
+            assert!(max_abs_diff(&sample_rate, &unmodulated) > 0.1 * peak, "{case}");
+        }
+    }
+
     /// At the sample rate, the controls that stay the same throughout a block are only worked
     /// out once, and the filters then run on one set of coefficients. That renders exactly
     /// what working out every sample's gives: modulation by a source that never changes (the
@@ -1674,17 +1716,13 @@ mod tests {
                     let synth = &mut plugin.synth;
                     synth.filter_controller.filter_model = model;
                     synth.mod_wheel = 1.0;
-                    synth.lfos[0].wave = synth::oscillator::OscWave::Square;
+                    synth.lfos[0].wave = synth::lfo::LfoWave::Square;
                     synth.lfos[0].freq = 0.01;
                     // The second oscillator, for the FM and AM
                     synth.oscillators[1].amp = 0.5;
                     synth.oscillators[0].wavetable = OscillatorWave::PwSweep.wavetable_index().unwrap();
                     for (target, amount) in targets {
-                        synth.routes.push(Route {
-                            source,
-                            target,
-                            amount,
-                        });
+                        synth.routes.push(Route::new(source, target, amount));
                     }
                 })
             };
@@ -1776,13 +1814,9 @@ mod tests {
         plugin.synth.oscillators[0].pan = pan;
         plugin.synth.oscillators[0].phase_rand = 0.0;
         if let Some(amount) = pan_mod {
-            plugin.synth.lfos[0].wave = synth::oscillator::OscWave::Square;
+            plugin.synth.lfos[0].wave = synth::lfo::LfoWave::Square;
             plugin.synth.lfos[0].freq = 0.01;
-            plugin.synth.routes.push(Route {
-                source: ModSource::Lfo1,
-                target: ModTarget::Osc1Pan,
-                amount,
-            });
+            plugin.synth.routes.push(Route::new(ModSource::Lfo1, ModTarget::Osc1Pan, amount));
         }
         plugin.synth.note_on(60, 100);
         let mut left = vec![0.0; 2048];
@@ -1841,11 +1875,7 @@ mod tests {
             assert!(level(&dry[6000..]) < 1e-6, "{rate:?}");
             assert!(level(&wet[6000..]) > 1e-3, "{rate:?}");
             assert!(max_abs_diff(&wet, &wet_right) > 1e-4, "{rate:?}");
-            let silenced = [Route {
-                source: ModSource::ModWheel,
-                target: ModTarget::ReverbMix,
-                amount: -1.0,
-            }];
+            let silenced = [Route::new(ModSource::ModWheel, ModTarget::ReverbMix, -1.0)];
             let (modulated, _) = render(&mut plugin, rate, true, &silenced);
             assert_eq!(modulated, dry, "{rate:?}");
         }
@@ -1897,11 +1927,7 @@ mod tests {
             if rng.usize(0..16) == 0 {
                 plugin.synth.routes.clear();
                 for _ in 0..rng.usize(0..=4) {
-                    plugin.synth.routes.push(Route {
-                        source: ModSource::from_index(rng.usize(0..synth::modulation::N_SOURCES)),
-                        target: ModTarget::from_index(rng.usize(0..synth::modulation::N_TARGETS)),
-                        amount: rng.f32() * 2.0 - 1.0,
-                    });
+                    plugin.synth.routes.push(Route::new(ModSource::from_index(rng.usize(0..synth::modulation::N_SOURCES)), ModTarget::from_index(rng.usize(0..synth::modulation::N_TARGETS)), rng.f32() * 2.0 - 1.0));
                 }
             }
             // Now and then a block at the sample rate, which is much slower

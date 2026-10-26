@@ -11,7 +11,7 @@ use crate::params::{
     ChorusParams, DelayParams, DistortionParams, EnvelopeParams, FilterEnvParams, FilterParams, GlobalParams,
     LfoParams, OscParams, ReverbParams, ThreeOscParams,
 };
-use crate::synth::modulation::ModTarget;
+use crate::synth::modulation::{ModTarget, Scaling};
 
 /// What a control is part of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,9 @@ pub struct Control<'a> {
     pub label: &'static str,
     pub help: &'static str,
     pub target: ModTarget,
+    /// How the modulation of `target` moves this control, when that isn't how it moves the
+    /// target's own control (see [`ModTarget::scaling()`]).
+    pub scaling: Option<Scaling>,
     pub group: Group,
 }
 
@@ -66,6 +69,7 @@ impl<'a> Control<'a> {
             label,
             help,
             target: ModTarget::None,
+            scaling: None,
             group,
         }
     }
@@ -76,12 +80,21 @@ impl<'a> Control<'a> {
             label,
             help,
             target: ModTarget::None,
+            scaling: None,
             group,
         }
     }
 
     fn modulated(self, target: ModTarget) -> Self {
         Self { target, ..self }
+    }
+
+    /// The same control, whose target's modulation moves it as `scaling` says.
+    fn scaled(self, scaling: Scaling) -> Self {
+        Self {
+            scaling: Some(scaling),
+            ..self
+        }
     }
 
     /// The same control under another label.
@@ -108,10 +121,10 @@ impl<'a> Control<'a> {
         let color = controls.colors.of(self.group);
         match self.param {
             Numeric::Float(param) => Knob::new(param, self.label, self.help, color)
-                .modulated(self.target)
+                .modulated(self.target, self.scaling)
                 .show(ui, width, controls),
             Numeric::Int(param) => Knob::new(param, self.label, self.help, color)
-                .modulated(self.target)
+                .modulated(self.target, self.scaling)
                 .show(ui, width, controls),
         }
     }
@@ -127,6 +140,7 @@ pub fn short_name(label: &'static str) -> &'static str {
         "Mult" => "MULT",
         "Position" => "POS",
         "Phase" => "PHASE",
+        "Fade" => "FADE",
         "Rand" => "RAND",
         "Unison" => "UNI",
         "Detune" => "DET",
@@ -222,9 +236,29 @@ pub fn envelope(envelope: &EnvelopeParams) -> [Control<'_>; 4] {
     ]
 }
 
-/// An LFO's rate.
+/// An LFO's rate: in Hz, or synced, the note length a cycle takes.
 pub fn lfo_rate(lfo: &LfoParams, index: usize) -> Control<'_> {
-    Control::float(&lfo.rate, "Rate", help::LFO_RATE, Group::Modulation).modulated(ModTarget::lfo_rate(index))
+    let target = ModTarget::lfo_rate(index);
+    if lfo.sync.value() {
+        // (Its rate's modulation moves through about three note lengths an octave)
+        let steps = 3.0 * ModTarget::LFO_RATE_OCTAVES;
+        Control::int(&lfo.division, "Rate", help::LFO_DIVISION, Group::Modulation)
+            .modulated(target)
+            .scaled(Scaling::Linear(steps))
+    } else {
+        Control::float(&lfo.rate, "Rate", help::LFO_RATE, Group::Modulation).modulated(target)
+    }
+}
+
+/// An LFO's knobs: its rate (see [`lfo_rate()`]), where in its cycle each note starts it, and
+/// how long it takes to fade in.
+pub fn lfo(lfo: &LfoParams, index: usize) -> [Control<'_>; 3] {
+    use Group::Modulation;
+    [
+        lfo_rate(lfo, index),
+        Control::float(&lfo.phase, "Phase", help::LFO_PHASE, Modulation),
+        Control::float(&lfo.fade, "Fade", help::LFO_FADE, Modulation),
+    ]
 }
 
 /// How notes are played: gliding, sliding into them, the pitch wheel's range, the octaves'

@@ -24,8 +24,6 @@ use self::oscillator::BlockOutput;
 use self::oscillator::BlockParams;
 use self::oscillator::Interpolation;
 use self::oscillator::Modulation;
-use self::oscillator::OscVoice;
-use self::oscillator::OscWave;
 use self::oscillator::OscillatorParams;
 use self::oscillator::SampleValues;
 use self::oscillator::SimdLevel;
@@ -34,7 +32,9 @@ use self::oscillator::WavetableFrames;
 use self::oscillator::WavetableNotes;
 use self::oscillator::WavetableSet;
 use self::oscillator::UNISON_VECTORS;
+use self::lfo::{Lfo, LfoTrigger, LfoVoice, DEFAULT_TEMPO};
 use self::per_sample::{RoutesByTarget, SampleControls};
+pub use self::lfo::{LFO_MAX_HZ, LFO_MIN_HZ};
 
 /// Samples per control rate block. Envelopes, pitch, the LFOs, the modulation matrix,
 /// keytracking and the filter coefficients are only recalculated this often (unless the
@@ -80,7 +80,12 @@ pub struct ThreeOsc {
     /// The share of the way to its note a voice's pitch glides at each of its samples.
     pub portamento_rate: f32,
     pub portamento_offset: f32,
-    pub lfos: [LfoParams; N_LFOS],
+    pub lfos: [Lfo; N_LFOS],
+    /// The copies of the LFOs that run all the time, which the notes of the LFOs set to Free
+    /// start from (see [`lfo`]).
+    free_lfos: [LfoVoice; N_LFOS],
+    /// The host's tempo, in beats per minute, which the synced LFOs follow.
+    pub tempo: f64,
     /// The envelopes that are only there to be modulation sources.
     pub mod_envelopes: [AdsrEnvelope; N_MOD_ENVELOPES],
     /// The modulation matrix's active routes (see [`modulation`]).
@@ -147,6 +152,8 @@ impl ThreeOsc {
             portamento_rate: 0.1,
             portamento_offset: 0.0,
             lfos: Default::default(),
+            free_lfos: std::array::from_fn(|lfo| LfoVoice { seed: 0x5eed_0000 + lfo as u32, ..LfoVoice::default() }),
+            tempo: DEFAULT_TEMPO,
             mod_envelopes: std::array::from_fn(|_| AdsrEnvelope::new(0.0, 0.5, 0.05, 1.0, 1.0)),
             routes: Vec::with_capacity(modulation::N_SLOTS),
             mod_wheel: 0.0,
@@ -203,10 +210,11 @@ impl ThreeOsc {
         };
         self.notes.note_on(note, velocity);
         let random = self.rng.f32() * 2.0 - 1.0;
+        let lfos = self.start_lfos(random);
 
         match &self.polyphony {
             Polyphony::Polyphonic => {
-                let mut new_voice = Voice::from_midi_note(note, pitch, velocity, &self.oscillators, random);
+                let mut new_voice = Voice::from_midi_note(note, pitch, velocity, &self.oscillators, random, lfos);
                 new_voice.semitone_detune += self.portamento_offset;
                 self.voices.push(new_voice)
             }
@@ -226,10 +234,11 @@ impl ThreeOsc {
                         voice.release_time = None;
                         voice.runtime = 0;
                         voice.random = random;
+                        voice.lfos = lfos;
                     }
                 } else {
                     let mut new_voice =
-                        Voice::from_midi_note(note, pitch, velocity, &self.oscillators, random);
+                        Voice::from_midi_note(note, pitch, velocity, &self.oscillators, random, lfos);
                     new_voice.semitone_detune += self.portamento_offset;
                     self.voices.push(new_voice)
                 }
@@ -238,6 +247,7 @@ impl ThreeOsc {
     }
     pub fn note_off(&mut self, note: u8, _velocity: u8) {
         self.notes.note_off(note);
+        let lfos = self.start_lfos(self.voices.last().map_or(0.0, |voice| voice.random));
 
         match self.polyphony {
             Polyphony::Polyphonic => self
@@ -275,11 +285,37 @@ impl ThreeOsc {
                             voice.semitone_detune += self.portamento_offset;
                             voice.release_time = None;
                             voice.runtime = 0;
+                            voice.lfos = lfos;
                         }
                     } else {
                         voice.release();
                     }
                 }),
+        }
+    }
+    /// The copies of the LFOs a note starts, see [`LfoVoice::start()`]. Their random values come
+    /// from the note's random source (`random`), so that each note draws its own.
+    fn start_lfos(&self, random: f32) -> [LfoVoice; N_LFOS] {
+        std::array::from_fn(|i| {
+            let seed = random.to_bits().wrapping_mul(0x9e37_79b9).wrapping_add(i as u32);
+            LfoVoice::start(&self.lfos[i], &self.free_lfos[i], seed)
+        })
+    }
+    /// Restarts the random values the notes draw from `seed`, for renders to compare.
+    #[cfg(test)]
+    pub(crate) fn seed_random(&mut self, seed: u64) {
+        self.rng = fastrand::Rng::with_seed(seed);
+    }
+    /// Takes the host's tempo (if it says) and its song position in beats (while it plays, if it
+    /// says), at the start of a buffer. The synced LFOs set to Free follow the song position.
+    pub fn set_transport(&mut self, tempo: Option<f64>, position: Option<f64>) {
+        self.tempo = tempo.filter(|tempo| *tempo > 0.0).unwrap_or(DEFAULT_TEMPO);
+        if let Some(position) = position {
+            for (free, lfo) in self.free_lfos.iter_mut().zip(&self.lfos) {
+                if let (LfoTrigger::Free, Some(beats)) = (lfo.trigger, lfo.sync) {
+                    *free = free.at_position(position, beats);
+                }
+            }
         }
     }
     /// Polyphonic aftertouch for the voices playing `note`, from 0 to 1.
@@ -370,7 +406,7 @@ impl ThreeOsc {
         let sources_used: [bool; N_SOURCES] = std::array::from_fn(|source| {
             self.routes
                 .iter()
-                .any(|route| route.source.to_index() == source)
+                .any(|route| route.sources().any(|routed| routed.to_index() == source))
         });
         // Oscillators that are modulation sources play even when they're silent
         let sourced: [bool; 3] = std::array::from_fn(|i| sources_used[ModSource::osc(i).to_index()]);
@@ -391,6 +427,7 @@ impl ThreeOsc {
             filter_controller: &self.filter_controller,
             gain_envelope: &self.gain_envelope,
             lfos: &self.lfos,
+            lfo_rates: std::array::from_fn(|i| self.lfos[i].rate(self.tempo)),
             mod_envelopes: &self.mod_envelopes,
             routes: &self.routes,
             sources_used,
@@ -514,6 +551,10 @@ impl ThreeOsc {
         self.voice_output = voice_output;
         self.effects = effects;
         self.effect_modulation = effect_modulation;
+        // The free running LFOs move on by the samples just played
+        for (free, lfo) in self.free_lfos.iter_mut().zip(&self.lfos) {
+            free.advance(lfo.rate(self.tempo) / self.sample_rate as f32 * len as f32, false);
+        }
     }
     /// Runs only the control rate update of every voice for `blocks` blocks, at the modulation
     /// rate, for the benchmarks.
@@ -549,10 +590,17 @@ impl ThreeOsc {
             runtime: voice.runtime / factor,
             released: voice.release_time.map(|time| time / factor),
         });
-        let newest = self.voices.last().map(|voice| NewestVoice {
-            lfo_phases: std::array::from_fn(|lfo| voice.lfos[lfo].phase as f32),
-            modulation: self.newest_modulation,
-            cutoff: voice.cutoff,
+        let newest = self.voices.last().map(|voice| {
+            let time = voice.runtime as f32 / self.voice_rate() as f32;
+            NewestVoice {
+                lfos: voice.lfos,
+                lfo_values: std::array::from_fn(|lfo| {
+                    let settings = &self.lfos[lfo];
+                    voice.lfos[lfo].value(settings.wave) * settings.fade_gain(time)
+                }),
+                modulation: self.newest_modulation,
+                cutoff: voice.cutoff,
+            }
         });
         monitor.store(voices, newest);
     }
@@ -579,7 +627,9 @@ struct VoiceContext<'a> {
     frames: [&'a WavetableFrames; 3],
     filter_controller: &'a FilterController,
     gain_envelope: &'a AdsrEnvelope,
-    lfos: &'a [LfoParams; N_LFOS],
+    lfos: &'a [Lfo; N_LFOS],
+    /// Each LFO's rate before modulation, in Hz, at the tempo for the synced ones.
+    lfo_rates: [f32; N_LFOS],
     mod_envelopes: &'a [AdsrEnvelope; N_MOD_ENVELOPES],
     routes: &'a [Route],
     /// Which modulation sources any route uses, so the unused ones aren't computed.
@@ -625,7 +675,8 @@ pub struct Voice {
     runtime: u32,
     release_time: Option<u32>,
     osc_voice: [SuperVoice; 3],
-    lfos: [OscVoice; N_LFOS],
+    /// The voice's copies of the LFOs.
+    lfos: [LfoVoice; N_LFOS],
     filter: filter::FilterContainer,
     /// Filter for the right channel, only used when the stereo width is above zero.
     filter_right: filter::FilterContainer,
@@ -733,7 +784,14 @@ struct Scratch {
     source: [f32; CONTROL_BLOCK_SAMPLES],
 }
 impl Voice {
-    pub fn from_midi_note(index: u8, pitch: f32, velocity: u8, osc: &[OscillatorParams], random: f32) -> Self {
+    pub fn from_midi_note(
+        index: u8,
+        pitch: f32,
+        velocity: u8,
+        osc: &[OscillatorParams],
+        random: f32,
+        lfos: [LfoVoice; N_LFOS],
+    ) -> Self {
         let osc_voice = [
             SuperVoice::new(osc[0].phase, osc[0].phase_rand),
             SuperVoice::new(osc[1].phase, osc[1].phase_rand),
@@ -746,7 +804,7 @@ impl Voice {
             runtime: 0,
             release_time: None,
             osc_voice,
-            lfos: Default::default(),
+            lfos,
             velocity,
             pressure: 0.0,
             random,
@@ -840,13 +898,15 @@ impl Voice {
         // The LFOs keep running whether they are used or not, so they don't jump when routed.
         for (i, lfo) in context.lfos.iter().enumerate() {
             let rate_mod = self.mods[ModTarget::lfo_rate(i).to_index()];
-            let mut freq = lfo.freq;
+            let mut freq = context.lfo_rates[i];
             if rate_mod != 0.0 {
                 freq = (freq * fastmath::exp2(rate_mod * ModTarget::LFO_RATE_OCTAVES)).clamp(LFO_MIN_HZ, LFO_MAX_HZ);
             }
-            let phase = self.lfos[i].add_phase(freq / sample_rate * block_len as f32);
+            let one_shot = lfo.trigger == LfoTrigger::OneShot;
+            self.lfos[i].advance(freq / sample_rate * block_len as f32, one_shot);
             if used(ModSource::lfo(i)) {
-                sources[ModSource::lfo(i).to_index()] = lfo.wave.generate(phase);
+                let fade = lfo.fade_gain(self.runtime as f32 / sample_rate);
+                sources[ModSource::lfo(i).to_index()] = self.lfos[i].value(lfo.wave) * fade;
             }
         }
         for (i, envelope) in context.mod_envelopes.iter().enumerate() {
@@ -1497,6 +1557,7 @@ fn filter_chunk_lockstep<'a, F: 'a, const N: usize>(
 
 pub mod effects;
 pub mod fastmath;
+pub mod lfo;
 pub mod monitor;
 pub mod oversampling;
 mod per_sample;
@@ -1601,29 +1662,173 @@ pub mod envelopes {
     }
 }
 
-/// The slowest and fastest an LFO can run, in Hz, modulated or not.
-pub const LFO_MIN_HZ: f32 = 0.01;
-pub const LFO_MAX_HZ: f32 = 1000.0;
-
-/// A low frequency oscillator's settings. Each voice runs its own copy of every LFO, started
-/// when the note starts, and the LFOs' outputs are modulation sources (see [`modulation`]).
-pub struct LfoParams {
-    /// Rate in Hz.
-    pub freq: f32,
-    pub wave: OscWave,
-}
-impl Default for LfoParams {
-    fn default() -> Self {
-        Self {
-            freq: 5.0,
-            wave: OscWave::Sine,
-        }
-    }
-}
-
 pub(crate) mod filter;
 
 #[inline]
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {
     (to - from).mul_add(amount, from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synth::lfo::LfoWave;
+    use crate::synth::modulation::{Polarity, Remap};
+
+    const RATE: f64 = 44100.0;
+
+    /// A synth with an LFO set up by `lfo`, routed to the cutoff.
+    fn synth_with(lfo: impl FnOnce(&mut Lfo)) -> ThreeOsc {
+        let mut synth = ThreeOsc::new(RATE);
+        lfo(&mut synth.lfos[0]);
+        synth.routes.push(Route::new(ModSource::Lfo1, ModTarget::Cutoff, 1.0));
+        synth
+    }
+
+    fn run(synth: &mut ThreeOsc, seconds: f64) {
+        let samples = (seconds * RATE) as usize;
+        let (mut left, mut right) = (vec![0.0; samples], vec![0.0; samples]);
+        synth.run(&mut left, &mut right);
+    }
+
+    /// The newest voice's modulation of the cutoff, at the end of the last block.
+    fn cutoff_modulation(synth: &ThreeOsc) -> f32 {
+        synth.newest_modulation[ModTarget::Cutoff.to_index()]
+    }
+
+    #[test]
+    fn synced_lfos_follow_the_tempo() {
+        // A cycle a beat at 120 beats a minute is 2 Hz: half a cycle in a quarter of a second
+        let mut synth = synth_with(|lfo| lfo.sync = Some(1.0));
+        synth.set_transport(Some(120.0), None);
+        synth.note_on(60, 100);
+        run(&mut synth, 0.25);
+        assert!((synth.voices[0].lfos[0].phase - 0.5).abs() < 2e-3, "{}", synth.voices[0].lfos[0].phase);
+        // At half the tempo a quarter of a second is a quarter of a cycle
+        synth.set_transport(Some(60.0), None);
+        run(&mut synth, 0.25);
+        assert!((synth.voices[0].lfos[0].phase - 0.75).abs() < 2e-3);
+        // Without a tempo from the host, it's the default
+        synth.set_transport(None, None);
+        assert_eq!(synth.tempo, DEFAULT_TEMPO);
+    }
+
+    #[test]
+    fn free_lfos_keep_the_notes_in_step() {
+        let mut synth = synth_with(|lfo| {
+            lfo.trigger = LfoTrigger::Free;
+            lfo.freq = 3.0;
+            lfo.phase = 0.25;
+        });
+        run(&mut synth, 0.1);
+        synth.note_on(60, 100);
+        run(&mut synth, 0.137);
+        synth.note_on(64, 100);
+        let phases = |synth: &ThreeOsc| synth.voices.iter().map(|voice| voice.lfos[0].phase).collect::<Vec<_>>();
+        let started = phases(&synth);
+        assert!((started[0] - started[1]).abs() < 1e-3, "{started:?}");
+        // The notes start a quarter of a cycle on from the free running copy
+        let free = synth.free_lfos[0].phase;
+        assert!(((started[1] - free).rem_euclid(1.0) - 0.25).abs() < 1e-6, "{started:?} {free}");
+        run(&mut synth, 0.3);
+        let later = phases(&synth);
+        assert!((later[0] - later[1]).abs() < 1e-3, "{later:?}");
+
+        // Synced, the free running copy follows the host's song position: a quarter note cycle
+        // at beat 10.5 is half way through
+        synth.lfos[0].sync = Some(1.0);
+        synth.set_transport(Some(120.0), Some(10.5));
+        assert!((synth.free_lfos[0].phase - 0.5).abs() < 1e-9);
+        synth.note_on(67, 100);
+        assert!((synth.voices[2].lfos[0].phase - 0.75).abs() < 1e-6);
+        // (A retriggered LFO doesn't follow it)
+        synth.lfos[0].trigger = LfoTrigger::Retrigger;
+        synth.set_transport(Some(120.0), Some(11.0));
+        assert!((synth.free_lfos[0].phase - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_shot_lfos_hold_the_end_of_their_cycle() {
+        let mut synth = synth_with(|lfo| {
+            lfo.trigger = LfoTrigger::OneShot;
+            lfo.wave = LfoWave::Saw;
+            lfo.freq = 10.0;
+            lfo.phase = 0.5;
+        });
+        synth.note_on(60, 100);
+        run(&mut synth, 0.03);
+        assert!(cutoff_modulation(&synth) > 0.0 && cutoff_modulation(&synth) < 1.0);
+        run(&mut synth, 0.2);
+        assert_eq!(synth.voices[0].lfos[0].phase, 1.0);
+        assert_eq!(cutoff_modulation(&synth), 1.0);
+        // At the sample rate too
+        synth.modulation_rate = ModulationRate::Sample;
+        synth.note_on(62, 100);
+        run(&mut synth, 0.2);
+        assert_eq!(synth.voices[1].lfos[0].phase, 1.0);
+        assert_eq!(cutoff_modulation(&synth), 1.0);
+    }
+
+    #[test]
+    fn lfos_fade_in_over_the_start_of_each_note() {
+        for rate in [ModulationRate::Block, ModulationRate::Sample] {
+            // A square wave slow enough to stay high, faded in over 0.4 seconds
+            let mut synth = synth_with(|lfo| {
+                lfo.wave = LfoWave::Square;
+                lfo.freq = 0.01;
+                lfo.fade = 0.4;
+            });
+            synth.modulation_rate = rate;
+            synth.note_on(60, 100);
+            run(&mut synth, 0.1);
+            assert!((cutoff_modulation(&synth) - 0.25).abs() < 2e-3, "{rate:?}: {}", cutoff_modulation(&synth));
+            run(&mut synth, 0.4);
+            assert_eq!(cutoff_modulation(&synth), 1.0, "{rate:?}");
+        }
+    }
+
+    /// In Monophonic mode a new note restarts the LFOs (as it does the envelopes), and each note
+    /// draws its own random values.
+    #[test]
+    fn notes_restart_their_lfos() {
+        let mut synth = synth_with(|lfo| lfo.freq = 1.0);
+        synth.polyphony = Polyphony::Monophonic;
+        synth.note_on(60, 100);
+        run(&mut synth, 0.3);
+        assert!(synth.voices[0].lfos[0].phase > 0.2);
+        synth.note_on(62, 100);
+        assert_eq!(synth.voices.len(), 1);
+        assert_eq!(synth.voices[0].lfos[0].phase, 0.0);
+
+        let mut synth = synth_with(|lfo| lfo.wave = LfoWave::Random);
+        synth.note_on(60, 100);
+        synth.note_on(64, 100);
+        let [first, second] = [0, 1].map(|voice| synth.voices[voice].lfos[0]);
+        assert_ne!(first.value(LfoWave::Random), second.value(LfoWave::Random));
+    }
+
+    /// A route scaled by another source moves its target that much less, and a unipolar route
+    /// from an LFO only moves it one way.
+    #[test]
+    fn remapped_routes_reshape_the_modulation() {
+        for rate in [ModulationRate::Block, ModulationRate::Sample] {
+            let mut synth = synth_with(|lfo| {
+                lfo.wave = LfoWave::Square;
+                lfo.freq = 0.01;
+                lfo.phase = 0.75;
+            });
+            synth.modulation_rate = rate;
+            let remap = Remap { via: ModSource::ModWheel, ..Remap::default() };
+            synth.routes[0] = Route::remapped(ModSource::Lfo1, ModTarget::Cutoff, 0.5, remap);
+            synth.mod_wheel = 0.5;
+            synth.note_on(60, 100);
+            run(&mut synth, 0.05);
+            // (The square is low, from its start phase)
+            assert_eq!(cutoff_modulation(&synth), -0.25, "{rate:?}");
+            let remap = Remap { polarity: Polarity::Unipolar, ..Remap::default() };
+            synth.routes[0] = Route::remapped(ModSource::Lfo1, ModTarget::Cutoff, 0.5, remap);
+            run(&mut synth, 0.05);
+            assert_eq!(cutoff_modulation(&synth), 0.0, "{rate:?}");
+        }
+    }
 }

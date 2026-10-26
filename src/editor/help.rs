@@ -87,11 +87,26 @@ pub const WAVETABLE_FOLDER: &str = "Put .wav wavetables in this folder and set a
 pub const WAVETABLE_PATH: &str = "A file outside the folder, loaded into an oscillator with the buttons.";
 pub const WAVETABLE_LOAD: &str = "Loads the file into this oscillator, and sets its Wave to File.";
 
-pub const LFO_WAVE: &str = "The LFO's waveform.";
-pub const LFO_RATE: &str = "How fast the LFO oscillates, up to 1 kHz. Each note has its own copy of the LFO, started when \
-     the note starts. At the Block modulation rate (see the Advanced tab), modulation is worked \
-     out every 32 samples, so an LFO much faster than a few hundred Hz steps and aliases there: \
-     audio-rate LFOs want the Sample rate.";
+pub const LFO_WAVE: &str = "The LFO's waveform. Random draws a new value each cycle and holds it (a sample and hold), and \
+     Smooth Random glides from each value to the next. Each note draws its own random values, \
+     except with the Free trigger, where the notes share the free running LFO's.";
+pub const LFO_RATE: &str = "How fast the LFO oscillates, up to 1 kHz (or, with Sync on, how long a cycle takes, as a note \
+     length at the host's tempo). At the Block modulation rate (see the Advanced tab), \
+     modulation is worked out every 32 samples, so an LFO much faster than a few hundred Hz \
+     steps and aliases there: audio-rate LFOs want the Sample rate.";
+pub const LFO_DIVISION: &str = "How long a cycle of the LFO takes, as a note length at the host's tempo (120 beats a \
+     minute when the host doesn't say): from 8 bars down to a 64th note, with dotted (D) and \
+     triplet (T) lengths. Modulating the rate still scales it, by up to 4 octaves at 100%.";
+pub const LFO_SYNC: &str = "Syncs the LFO to the host's tempo: its rate becomes a note length. Set to Free as well, it \
+     follows the host's song position while it plays, so its cycles line up with the bars.";
+pub const LFO_PHASE: &str = "Where in its cycle each note starts the LFO (for Free, how far ahead of the free running LFO \
+     the notes are), from 0 to 360 degrees: 90 starts a sine at its top.";
+pub const LFO_TRIGGER: &str = "How each note starts the LFO. Retrigger starts it at its phase, so every note's modulation \
+     starts the same. Free carries on from an LFO that runs all the time, so the notes move \
+     together, in time with the song when synced. One Shot runs through the cycle once, from its \
+     phase, and holds the end: an extra envelope (a Saw rises, a Triangle falls).";
+pub const LFO_FADE: &str = "How long the LFO takes to fade in at the start of each note, from nothing to its full swing: \
+     vibrato that comes in as a note is held, say.";
 
 pub const FILTER_MODEL: &str = "There are 3 filter models: Digital is an SVF identical to an IIR biquad filter (except stable \
      over large cutoff changes), RC is a darker filter capable of aggressive self-resonance, and \
@@ -139,4 +154,15 @@ pub const GLOBAL_PITCH: &str = "Pitch detune for the whole synth, in semitones. 
 pub const BEND_RANGE: &str = "Controls the range of the MIDI pitch wheel in semitones. Useful if you have a MIDI keyboard.";
 
 pub const MOD_AMOUNT: &str = "How much of the source is applied to the target, from -100% to 100%.";
+pub const MOD_POLARITY: &str = "Whether the route swings both ways around the control (±, from -1 to 1) or only one way \
+     (+, from 0 to 1), whatever its source does by itself. The LFOs, the oscillators, the key \
+     and the random value swing both ways by themselves, the rest one way.";
+pub const MOD_CURVE: &str = "Bends the source on its way to the amount: above 0 it stays near the bottom of its range for \
+     longer and rises late (up to the 4th power), below 0 it rises early and stays near the top.";
+pub const MOD_STEPS: &str = "Steps the source into this many levels across its range (Off for smooth): 2 flips between its \
+     ends, and 13 on a one way route to a pitch at 100% (an octave) plays the semitones.";
+pub const MOD_VIA: &str = "Another source that scales the route, from nothing at its bottom (or, for one that swings \
+     both ways, at its lowest) to all of it at its top: the mod wheel bringing in an LFO's \
+     vibrato, say.";
 pub const CLEAR_ROUTE: &str = "Clears this row.";
+pub const REMOVE_ROUTE: &str = "Removes this modulation route.";

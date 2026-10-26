@@ -29,11 +29,11 @@ use nih_plug_egui::resizable_window::ResizableWindow;
 use nih_plug_egui::{create_egui_editor, EguiState};
 
 use crate::params::{
-    EnvelopeParams, FilterEnvParams, FilterParams, ModSlotParams, OscParams, OscillatorWave, ThreeOscParams,
-    WavetableFile,
+    CurrentValues, EnvelopeParams, FilterEnvParams, FilterParams, LfoParams, ModSlotParams, OscParams, OscillatorWave,
+    ThreeOscParams, WavetableFile,
 };
 use crate::synth::envelopes::AdsrEnvelope;
-use crate::synth::modulation::{ModSource, ModTarget, Targets, N_SLOTS, N_TARGETS};
+use crate::synth::modulation::{ModSource, ModTarget, Polarity, Targets, N_SLOTS, N_TARGETS};
 use crate::synth::monitor::Monitor;
 use crate::synth::oscillator::{builtin_spectra, CycleRenderer, WavePreview};
 use crate::synth::oversampling::Oversampling;
@@ -231,6 +231,7 @@ fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gu
     }
     tuning_window::show(ui.ctx(), params, &mut gui.state.tuning);
     widgets::settings_window(ui.ctx(), params, setter, gui);
+    widgets::remap_window(ui.ctx(), params, setter);
     match theme {
         Theme::Studio => studio::draw(ui, params, setter, gui),
         Theme::Classic => classic::draw(ui, params, setter, gui),
@@ -287,13 +288,21 @@ struct Matrix<'a> {
 }
 
 impl Matrix<'_> {
-    /// The routes that modulate `target`, as `(source, amount)`.
-    fn routes_for(&self, target: ModTarget) -> impl Iterator<Item = (ModSource, f32)> + '_ {
-        self.slots_for(target).map(|slot| (slot.source.value(), slot.amount.value()))
+    /// The routes that modulate `target`, as their source, whether they swing both ways (see
+    /// [`Polarity`]), and their amount.
+    fn routes_for(&self, target: ModTarget) -> impl Iterator<Item = (ModSource, bool, f32)> + '_ {
+        self.slots_for(target).map(|slot| {
+            let source = slot.source.value();
+            (source, slot.polarity.value().is_bipolar(source), slot.amount.value())
+        })
     }
     /// The slots that route a source to `target` (none, for no target).
     fn slots_for(&self, target: ModTarget) -> impl Iterator<Item = &ModSlotParams> + '_ {
-        self.slots.iter().filter(move |slot| {
+        self.indexed_slots_for(target).map(|(_, slot)| slot)
+    }
+    /// [`slots_for()`][Self::slots_for()], with each slot's index in the matrix.
+    fn indexed_slots_for(&self, target: ModTarget) -> impl Iterator<Item = (usize, &ModSlotParams)> + '_ {
+        self.slots.iter().enumerate().filter(move |(_, slot)| {
             target != ModTarget::None && slot.source.value() != ModSource::None && slot.target.value() == target
         })
     }
@@ -333,11 +342,28 @@ impl Matrix<'_> {
             None => false,
         }
     }
-    /// Empties a slot.
+    /// Empties a slot, and puts its remap back as it was.
     fn clear(setter: &ParamSetter, slot: &ModSlotParams) {
         set_param(setter, &slot.source, ModSource::None);
         set_param(setter, &slot.target, ModTarget::None);
         set_param(setter, &slot.amount, 0.0);
+        reset_remap(setter, slot);
+    }
+}
+
+/// Puts a slot's remap back to leaving the source as it comes (see [`Remap`]).
+fn reset_remap(setter: &ParamSetter, slot: &ModSlotParams) {
+    if slot.polarity.value() != Polarity::Source {
+        set_param(setter, &slot.polarity, Polarity::Source);
+    }
+    if slot.curve.value() != 0.0 {
+        set_param(setter, &slot.curve, 0.0);
+    }
+    if slot.steps.value() != 1 {
+        set_param(setter, &slot.steps, 1);
+    }
+    if slot.via.value() != ModSource::None {
+        set_param(setter, &slot.via, ModSource::None);
     }
 }
 
@@ -391,12 +417,35 @@ fn combo_cell<T: Enum + PartialEq + Copy + 'static>(
     help: &str,
     setter: &ParamSetter,
 ) {
+    enum_combo(ui, egui::ComboBox::from_id_salt((param.name(), id_salt)).width(width), param, help, setter);
+}
+
+/// Like [`combo_cell()`], but cutting the choice's name short where it doesn't fit in the space
+/// left in `ui`, rather than running past it.
+fn short_combo_cell<T: Enum + PartialEq + Copy + 'static>(
+    ui: &mut Ui,
+    param: &EnumParam<T>,
+    id_salt: usize,
+    width: f32,
+    help: &str,
+    setter: &ParamSetter,
+) {
+    let combo = egui::ComboBox::from_id_salt((param.name(), id_salt)).width(width).truncate();
+    enum_combo(ui, combo, param, help, setter);
+}
+
+fn enum_combo<T: Enum + PartialEq + Copy + 'static>(
+    ui: &mut Ui,
+    combo: egui::ComboBox,
+    param: &EnumParam<T>,
+    help: &str,
+    setter: &ParamSetter,
+) {
     let variants = T::variants();
     let current = param.value().to_index();
     let mut selected = current;
-    egui::ComboBox::from_id_salt((param.name(), id_salt))
+    combo
         .selected_text(variants[current])
-        .width(width)
         .show_ui(ui, |ui| {
             for (index, name) in variants.iter().enumerate() {
                 ui.selectable_value(&mut selected, index, *name);
@@ -482,6 +531,13 @@ fn envelope_display(ui: &mut Ui, params: &EnvelopeParams, setter: &ParamSetter, 
     let mut envelope = AdsrEnvelope::new(0.0, 0.0, 0.0, 0.0, 0.0);
     crate::apply_envelope_params(&mut envelope, params);
     displays::envelope(ui, &envelope, MOD_COLOR, &live.voice_times(), params, setter, height);
+}
+
+/// An LFO's display (see [`displays::lfo()`]), with where the newest note's copy of it is.
+fn lfo_display(ui: &mut Ui, params: &LfoParams, index: usize, live: Live, height: f32) {
+    let lfo = params.lfo(&CurrentValues);
+    let newest = live.monitor.lfo(index).zip(live.monitor.lfo_value(index));
+    displays::lfo(ui, &lfo, MOD_COLOR, newest, height);
 }
 
 /// A combo box picking an oscillator's wavetable file from the wavetable folder.

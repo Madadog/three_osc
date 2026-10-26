@@ -20,8 +20,8 @@ use super::catalog::{self, Colors, Control};
 use super::knob::{self, Controls};
 use super::widgets::{self, in_rect, ChipStyle};
 use super::{
-    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, theme_picker, title_bar,
-    tuning_window, wavetable_file_combo, wavetable_file_status, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
+    analyser, combo_cell, displays, envelope_display, filter_display_inputs, help, lfo_display, set_param, theme_picker,
+    title_bar, tuning_window, wavetable_file_combo, wavetable_file_status, Gui, Live, Matrix, WaveDisplay, MOD_COLOR,
 };
 use crate::params::{EnvelopeParams, OscillatorWave, ThreeOscParams};
 use crate::synth::modulation::ModSource;
@@ -322,7 +322,7 @@ impl Plan {
         let output = Rect::from_x_y_ranges(amp_column.left()..=area.right(), lane_top..=area.bottom());
 
         let lane_width = amp_column.left() - WIRE_GAP - area.left() - 5.0 * GAP;
-        let shares = [0.235, 0.235, 0.135, 0.135, 0.135, 0.125];
+        let shares = [0.2, 0.2, 0.165, 0.165, 0.165, 0.105];
         let mut left = area.left();
         let lane = shares.map(|share| {
             let rect = Rect::from_x_y_ranges(left..=left + lane_width * share, lane_top..=area.bottom());
@@ -801,6 +801,7 @@ fn lane(ui: &mut Ui, plan: &Plan, params: &ThreeOscParams, controls: &Controls, 
     }
     for (index, (lfo, rect)) in params.lfos.iter().zip(&plan.lane[2..5]).enumerate() {
         let node = node(ui, *rect);
+        let setter = controls.setter;
         title_row(
             ui,
             ("lfo title", index),
@@ -808,21 +809,32 @@ fn lane(ui: &mut Ui, plan: &Plan, params: &ThreeOscParams, controls: &Controls, 
             |ui| {
                 widgets::chip(ui, ModSource::lfo(index), &format!("LFO {}", index + 1), controls, &chips());
             },
-            |_| {},
+            |ui| {
+                // (A lit button rather than a labelled switch, which wouldn't fit beside the chip)
+                let synced = lfo.sync.value();
+                let text = RichText::new("Sync").small().color(if synced { BACKGROUND } else { TEXT_WEAK });
+                let button = egui::Button::new(text).small().fill(if synced { MOD_COLOR } else { WIDGET });
+                if ui.add(button).on_hover_text(help::LFO_SYNC).clicked() {
+                    set_param(setter, &lfo.sync, !synced);
+                }
+            },
         );
+        // Its wave and trigger over its display, and its knobs under it
         let body = node.body;
-        let combo = Rect::from_min_size(body.min, egui::vec2(body.width(), 22.0));
-        in_rect(ui, ("lfo wave", index), combo, Layout::left_to_right(Align::Center), |ui| {
-            combo_cell(ui, &lfo.wave, index, body.width() - 12.0, help::LFO_WAVE, controls.setter);
+        let combos = Rect::from_min_size(body.min, egui::vec2(body.width(), 2.0 * 22.0 + ROW_GAP));
+        in_rect(ui, ("lfo choices", index), combos, Layout::top_down(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            combo_cell(ui, &lfo.wave, index, body.width(), help::LFO_WAVE, setter);
+            combo_cell(ui, &lfo.trigger, index, body.width(), help::LFO_TRIGGER, setter);
         });
-        let height = KNOBS.height(LINK_CELL);
-        let knob = Rect::from_min_size(Pos2::new(body.left(), body.bottom() - height), egui::vec2(LINK_CELL, height));
-        knob_row(ui, ("lfo rate", index), knob, &[catalog::lfo_rate(lfo, index)], LINK_CELL, controls);
-        let display = Rect::from_min_max(Pos2::new(body.left(), combo.bottom() + INNER_GAP), Pos2::new(body.right(), knob.top() - 2.0));
-        let wave = lfo.wave.value().to_osc_wave();
-        let phase = live.monitor.lfo_phase(index);
+        let knobs = catalog::lfo(lfo, index);
+        let cell = (body.width() / knobs.len() as f32).min(LINK_CELL);
+        let height = KNOBS.height(cell);
+        let row = Rect::from_min_size(Pos2::new(body.left(), body.bottom() - height), egui::vec2(body.width(), height));
+        knob_row(ui, ("lfo knobs", index), row, &knobs, cell, controls);
+        let display = Rect::from_min_max(Pos2::new(body.left(), combos.bottom() + INNER_GAP), Pos2::new(body.right(), row.top() - 2.0));
         in_rect(ui, ("lfo display", index), display, Layout::top_down(Align::Min), |ui| {
-            displays::lfo(ui, &wave, MOD_COLOR, phase, display.height().max(24.0));
+            lfo_display(ui, lfo, index, live, display.height().max(24.0));
         });
     }
     let midi = node(ui, plan.lane[5]);

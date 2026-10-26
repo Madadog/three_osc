@@ -17,10 +17,10 @@ use super::catalog::{self, Colors, Control};
 use super::knob::{self, Controls};
 use super::widgets::{self, ChipStyle, Display};
 use super::{
-    combo_cell, displays, help, theme_picker, title_bar, tuning_window, wavetable_file_combo, wavetable_file_status,
-    Gui, Matrix, MOD_COLOR,
+    combo_cell, displays, help, set_param, short_combo_cell, theme_picker, title_bar, tuning_window,
+    wavetable_file_combo, wavetable_file_status, Gui, Matrix, MOD_COLOR,
 };
-use crate::params::{OscillatorWave, ThreeOscParams};
+use crate::params::{LfoParams, LfoTriggerParam, OscillatorWave, ThreeOscParams};
 use crate::synth::modulation::ModSource;
 
 const BACKGROUND: Color32 = Color32::from_rgb(5, 8, 6);
@@ -49,9 +49,9 @@ const CELL: f32 = 44.0;
 const CHIP_HEIGHT: f32 = 16.0;
 const TABS_HEIGHT: f32 = 22.0;
 const DISPLAY_MIN: f32 = 150.0;
-/// The width of an LFO's section, which has its wave's combo box beside its knob, and of the
+/// The width of an LFO's section, which has its sync and trigger beside its knobs, and of the
 /// MIDI sources' one, which has two rows of chips.
-const LFO_WIDTH: f32 = 154.0;
+const LFO_WIDTH: f32 = 184.0;
 const MIDI_WIDTH: f32 = 300.0;
 /// The widths of the combo boxes, which fit their longest choices.
 const OSC_WAVE_WIDTH: f32 = 110.0;
@@ -60,6 +60,8 @@ const FILTER_MODEL_WIDTH: f32 = 76.0;
 const FILTER_TYPE_WIDTH: f32 = 84.0;
 const POLYPHONY_WIDTH: f32 = 98.0;
 const LFO_WAVE_WIDTH: f32 = 104.0;
+/// The width of an LFO's sync and trigger buttons.
+const TOGGLE_WIDTH: f32 = 46.0;
 
 const KNOBS: knob::Style = knob::Style {
     font_size: 10.0,
@@ -267,7 +269,7 @@ impl Section {
             Self::Amp => (catalog::envelope(&params.vol_env).to_vec(), 4),
             Self::Voice => (catalog::voice(&params.global).to_vec(), 5),
             Self::Envelope(index) => (catalog::envelope(&params.mod_envs[index].envelope).to_vec(), 4),
-            Self::Lfo(index) => (vec![catalog::lfo_rate(&params.lfos[index], index)], 1),
+            Self::Lfo(index) => (catalog::lfo(&params.lfos[index], index).to_vec(), 3),
             Self::Midi => (Vec::new(), 1),
             Self::Distortion => (catalog::distortion(&fx.distortion).to_vec(), 2),
             Self::Chorus => (catalog::chorus(&fx.chorus).to_vec(), 3),
@@ -374,9 +376,13 @@ fn section_box(ui: &mut Ui, section: Section, params: &ThreeOscParams, controls:
         match section {
             Section::Lfo(index) => {
                 ui.horizontal(|ui| {
-                    knobs[0].show(ui, CELL, controls);
-                    let wave = &params.lfos[index].wave;
-                    combo_cell(ui, wave, index, LFO_WAVE_WIDTH, help::LFO_WAVE, controls.setter);
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    catalog::show_all(ui, &knobs, CELL, controls);
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        lfo_toggles(ui, &params.lfos[index], controls.setter);
+                    });
                 });
             }
             Section::Midi => {
@@ -435,6 +441,11 @@ fn title(ui: &mut Ui, section: Section, params: &ThreeOscParams, controls: &Cont
             combo_cell(ui, &params.filter.filter_type, 0, FILTER_TYPE_WIDTH, help::FILTER_TYPE, setter);
         }
         Section::Voice => combo_cell(ui, &params.global.polyphony, 0, POLYPHONY_WIDTH, help::POLYPHONY, setter),
+        Section::Lfo(index) => {
+            // (Beside a chip that grows with its count of routes)
+            let width = ui.available_width().min(LFO_WAVE_WIDTH);
+            short_combo_cell(ui, &params.lfos[index].wave, index, width, help::LFO_WAVE, setter);
+        }
         Section::Distortion => switch(ui, &fx.distortion.enabled, help::DISTORTION),
         Section::Chorus => switch(ui, &fx.chorus.enabled, help::CHORUS),
         Section::Delay => {
@@ -445,6 +456,30 @@ fn title(ui: &mut Ui, section: Section, params: &ThreeOscParams, controls: &Cont
         }
         Section::Reverb => switch(ui, &fx.reverb.enabled, help::REVERB),
         _ => {}
+    }
+}
+
+/// An LFO's sync, and its trigger (which a click moves on to the next), as small buttons.
+fn lfo_toggles(ui: &mut Ui, lfo: &LfoParams, setter: &ParamSetter) {
+    ui.spacing_mut().item_spacing.y = 4.0;
+    // (With less padding than other buttons, so that six letters fit on one line)
+    ui.spacing_mut().button_padding.x = 2.0;
+    let toggle = |ui: &mut Ui, text: &str, lit: bool, about: &str| {
+        let text = RichText::new(text).size(10.0).color(if lit { BACKGROUND } else { TEXT });
+        let button = egui::Button::new(text)
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .fill(if lit { MOD_COLOR } else { WIDGET });
+        ui.add_sized(egui::vec2(TOGGLE_WIDTH, 16.0), button).on_hover_text(about)
+    };
+    let synced = lfo.sync.value();
+    if toggle(ui, "SYNC", synced, help::LFO_SYNC).clicked() {
+        set_param(setter, &lfo.sync, !synced);
+    }
+    let trigger = lfo.trigger.value();
+    let name = ["RETRIG", "FREE", "1-SHOT"][trigger.to_index()];
+    if toggle(ui, name, trigger != LfoTriggerParam::Retrigger, help::LFO_TRIGGER).clicked() {
+        let next = LfoTriggerParam::from_index((trigger.to_index() + 1) % LfoTriggerParam::variants().len());
+        set_param(setter, &lfo.trigger, next);
     }
 }
 
