@@ -183,13 +183,14 @@ pub fn lfo(ui: &mut Ui, lfo: &Lfo, color: Color32, newest: Option<(LfoVoice, f32
     let (response, painter, rect) = frame(ui, height);
     let random = lfo.wave.is_random();
     let one_shot = lfo.trigger == LfoTrigger::OneShot;
-    response.on_hover_text(if random {
+    response.on_hover_text(if one_shot {
+        "The cycle the LFO runs through once at the start of each note, from -100% to 100%, \
+         holding its end (for a random wave, each note draws its own values: these are the \
+         newest one's while notes play). The dot is where the newest note's copy of it is."
+    } else if random {
         "Four cycles of the LFO's random values, from -100% to 100%. Each note draws its own: \
          while notes play, these are the newest one's, from the start of the cycle it's in, and \
          the dot is where it is."
-    } else if one_shot {
-        "The cycle the LFO runs through once at the start of each note, from -100% to 100%, \
-         holding its end. The dot is where the newest note's copy of it is."
     } else {
         "One cycle of the LFO, from -100% to 100%, from where its notes start it. The dot is where \
          the newest note's copy of it is."
@@ -205,10 +206,10 @@ pub fn lfo(ui: &mut Ui, lfo: &Lfo, color: Color32, newest: Option<(LfoVoice, f32
     // How many cycles the width shows, from the start phase (or for a note's random values that
     // go on cycle after cycle, from the start of the cycle it's in)
     let start = if random && newest.is_some() && !one_shot { 0.0 } else { lfo.phase };
-    let span = if random {
-        4.0
-    } else if one_shot {
+    let span = if one_shot {
         (1.0 - start).max(0.01)
+    } else if random {
+        4.0
     } else {
         1.0
     };
