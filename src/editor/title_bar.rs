@@ -30,7 +30,7 @@ pub struct PresetBrowser {
     /// What the current preset sets the parameters to (and the preset's name), to tell when
     /// they have been changed.
     targets: Option<(String, Targets)>,
-    /// When the last preset was loaded, in the GUI's time.
+    /// When the last preset was loaded, by the editor's clock (see [`super::clock()`]).
     loaded_at: f64,
     /// The name being typed in to save a preset as.
     save_name: String,
@@ -173,7 +173,8 @@ pub fn title_bar(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui
 
 /// The preset browser: arrows to step through the presets, a list of them, and saving.
 pub fn presets(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui) {
-    let time = ui.input(|input| input.time);
+    // (By the editor's clock, which goes on across its windows)
+    let time = super::clock();
     let browser = &mut gui.state.presets;
     if !browser.scanned {
         browser.rescan();

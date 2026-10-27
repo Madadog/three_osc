@@ -154,9 +154,9 @@ struct Spectrogram {
     scratch: Vec<Complex32>,
     /// The newest windows' levels per bin in dB, oldest first, waiting to be drawn.
     columns: Vec<Vec<f32>>,
-    /// The image, one column per window, the newest at the right, and its texture.
+    /// The image, one column per window, the newest at the right. Its texture is kept in the
+    /// egui context it's drawn in (see [`Spectrogram::texture()`]).
     image: ColorImage,
-    texture: Option<TextureHandle>,
     /// For each row of the image (from the top), the bins it covers.
     rows: Vec<RowBins>,
     palette: [Color32; 256],
@@ -191,7 +191,6 @@ impl Spectrogram {
             scratch,
             columns: Vec::new(),
             image: ColorImage::new([0, 0], Color32::BLACK),
-            texture: None,
             rows: Vec::new(),
             palette: std::array::from_fn(|i| heat(i as f32 / 255.0)),
         }
@@ -262,9 +261,14 @@ impl Spectrogram {
     }
 
     /// Draws the new columns into the image, which is resized to `width` by `height` pixels
-    /// (and cleared) when the display changes size, and returns its texture.
-    fn texture(&mut self, ctx: &egui::Context, width: usize, height: usize) -> &TextureHandle {
-        if self.image.size != [width, height] {
+    /// (and cleared) when the display changes size, and returns its texture in `ctx`.
+    ///
+    /// The texture belongs to the context rather than to the spectrogram, which outlives the
+    /// editor's windows: each time the editor opens it has a new context and a new painter,
+    /// which know nothing of the textures of the windows before.
+    fn texture(&mut self, ctx: &egui::Context, width: usize, height: usize) -> TextureHandle {
+        let resized = self.image.size != [width, height];
+        if resized {
             self.image = ColorImage::new([width, height], self.palette[0]);
             self.layout_rows(height);
         }
@@ -282,17 +286,20 @@ impl Spectrogram {
                 }
             }
         }
-        match &mut self.texture {
-            Some(texture) => {
-                if new > 0 {
+        let id = egui::Id::new("spectrogram texture");
+        match ctx.data(|data| data.get_temp::<TextureHandle>(id)) {
+            Some(mut texture) => {
+                if new > 0 || resized {
                     texture.set(self.image.clone(), TextureOptions::NEAREST);
                 }
+                texture
             }
             None => {
-                self.texture = Some(ctx.load_texture("spectrogram", self.image.clone(), TextureOptions::NEAREST));
+                let texture = ctx.load_texture("spectrogram", self.image.clone(), TextureOptions::NEAREST);
+                ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+                texture
             }
         }
-        self.texture.as_ref().unwrap()
     }
 
     /// The frequency at a fraction of the way down the display.
@@ -322,7 +329,8 @@ fn heat(level: f32) -> Color32 {
 /// Draws the spectrogram and the meters into an area `width` wide and `height` tall, after
 /// reading what the synth has played since the last frame.
 pub fn output(ui: &mut Ui, analyser: &mut Analyser, tap: &OutputTap, sample_rate: f32, width: f32, height: f32) {
-    let (time, dt) = ui.input(|input| (input.time, input.stable_dt.min(0.25)));
+    // (The meters' peaks are held by the editor's clock, which goes on across its windows)
+    let (time, dt) = (super::clock(), ui.input(|input| input.stable_dt.min(0.25)));
     analyser.update(tap, sample_rate, time, dt);
     // The meters take two rows and their scale under the spectrogram
     let meter_height = 46.0;

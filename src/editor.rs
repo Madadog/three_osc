@@ -21,6 +21,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -57,6 +59,7 @@ mod title_bar;
 mod tuning_window;
 mod vintage;
 mod widgets;
+mod window_thread;
 
 /// The window's default size, in logical pixels.
 pub const DEFAULT_WIDTH: u32 = 1400;
@@ -89,9 +92,6 @@ pub struct EditorState {
     tuning: tuning_window::TuningWindow,
     /// The output section's spectrogram and meters.
     analyser: analyser::Analyser,
-    /// The theme the window's look was last set for, or `None` when a newly opened window still
-    /// needs it set.
-    styled: Option<Theme>,
     /// Why the theme last picked couldn't be saved, if it couldn't.
     theme_problem: Option<String>,
     /// Whether the settings window is open (see [`widgets::settings_window()`]), and the routes
@@ -121,7 +121,6 @@ impl EditorState {
             presets: title_bar::PresetBrowser::new(),
             tuning: tuning_window::TuningWindow::new(),
             analyser: analyser::Analyser::new(),
-            styled: None,
             theme_problem: None,
             settings_open: false,
             routes_open: false,
@@ -184,16 +183,21 @@ pub fn create(
     async_executor: AsyncExecutor<ThreeOscPlugin>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
-    create_egui_editor(
+    let threads = Arc::new(window_thread::WindowThreads::default());
+    let opened = threads.clone();
+    let editor = create_egui_editor(
         egui_state.clone(),
         EditorState::new(),
-        // Each time the window opens it has a new context, which needs the theme's look
-        |_, state| state.styled = None,
+        // (On the window's thread, as each window opens)
+        move |_, _| opened.opened(),
         move |egui_ctx, setter, state| {
+            window_thread::end_if_orphaned();
+            // Each window has an egui context of its own, which needs the theme's look set
             let theme = theme::current();
-            if state.styled != Some(theme) {
+            let styled = egui::Id::new("styled theme");
+            if egui_ctx.data(|data| data.get_temp::<Theme>(styled)) != Some(theme) {
                 theme::apply(egui_ctx, theme);
-                state.styled = Some(theme);
+                egui_ctx.data_mut(|data| data.insert_temp(styled, theme));
             }
             ResizableWindow::new("three-osc-window")
                 .min_size(egui::vec2(320.0, 240.0))
@@ -215,7 +219,15 @@ pub fn create(
                         });
                 });
         },
-    )
+    );
+    editor.map(|editor| Box::new(window_thread::WindowedEditor::new(editor, threads)) as Box<dyn Editor>)
+}
+
+/// Seconds since the editor first opened, for what's timed across frames: unlike the clock of
+/// a window's egui context, it doesn't start again each time the editor opens.
+fn clock() -> f64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
 fn draw(ui: &mut Ui, params: &ThreeOscParams, setter: &ParamSetter, gui: &mut Gui, theme: Theme) {

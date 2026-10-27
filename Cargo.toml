@@ -40,6 +40,10 @@ serde_json = "1.0"
 # Portable SIMD for the unison voice loop
 wide = "1.7"
 
+# Watching the host's window from the editor's window thread on X11 (baseview already uses it)
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = "0.13"
+
 # The wavetables are generated with thousands of FFTs when the synth is created, which is painfully
 # slow with an unoptimised rustfft (debug builds and tests).
 [profile.dev.package.rustfft]
